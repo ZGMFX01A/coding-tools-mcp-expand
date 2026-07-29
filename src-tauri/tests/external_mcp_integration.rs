@@ -1,8 +1,8 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use coding_tools_mcp_desktop_lib::external_mcp::config::ExternalMcpConfig;
 use coding_tools_mcp_desktop_lib::external_mcp::detection::detect_fast_context_env;
@@ -13,6 +13,54 @@ use coding_tools_mcp_desktop_lib::mcp::server::{handle_request, SharedState};
 use coding_tools_mcp_desktop_lib::tools::context::ToolContext;
 use common::*;
 use serde_json::json;
+
+fn create_mock_fast_context_script(dir: &Path) -> PathBuf {
+    let script_path = dir.join("mock_fast_context.js");
+    let script_code = r#"
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  try {
+    const req = JSON.parse(line);
+    if (!req.id) return;
+    if (req.method === 'initialize') {
+      console.log(JSON.stringify({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'mock-fast-context', version: '1.3.0' }
+        }
+      }));
+    } else if (req.method === 'tools/list') {
+      console.log(JSON.stringify({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          tools: [
+            { name: 'fast_context_search', description: 'search code', inputSchema: { type: 'object' } },
+            { name: 'extract_windsurf_key', description: 'extract key', inputSchema: { type: 'object' } }
+          ]
+        }
+      }));
+    } else if (req.method === 'tools/call') {
+      console.log(JSON.stringify({
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          content: [{ type: 'text', text: 'mock search result' }]
+        }
+      }));
+    }
+  } catch (e) {}
+});
+"#;
+    std::fs::write(&script_path, script_code).expect("write mock_fast_context.js");
+    script_path
+}
 
 #[tokio::test]
 async fn test_detection_and_validation_rules() {
@@ -39,14 +87,14 @@ async fn test_detection_and_validation_rules() {
 #[tokio::test]
 async fn test_connection_handshake_with_fast_context() {
     let fx = tiny_js_fixture();
+    let script_path = create_mock_fast_context_script(&fx.root);
 
-    let npx_cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let cfg = ExternalMcpConfig {
         id: "mcp-fc-test".to_string(),
         name: "fast-context".to_string(),
         enabled: true,
-        command: npx_cmd.to_string(),
-        args: vec!["-y".to_string(), "--prefer-offline".to_string(), "fast-context-mcp@1.3.0".to_string()],
+        command: "node".to_string(),
+        args: vec![script_path.to_string_lossy().to_string()],
         env: HashMap::from([("FC_INCLUDE_SNIPPETS".to_string(), "true".to_string())]),
         allowed_tools: vec!["extract_windsurf_key".to_string(), "fast_context_search".to_string()],
         auto_restart: true,
@@ -67,14 +115,14 @@ async fn test_connection_handshake_with_fast_context() {
 async fn test_public_mcp_tools_list_aggregation_and_tools_call_forwarding() {
     let fx = tiny_js_fixture();
     let ws_id = "ws-test-public-mcp";
+    let script_path = create_mock_fast_context_script(&fx.root);
 
-    let npx_cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let cfg = ExternalMcpConfig {
         id: "mcp-fc-pub".to_string(),
         name: "fast-context".to_string(),
         enabled: true,
-        command: npx_cmd.to_string(),
-        args: vec!["-y".to_string(), "--prefer-offline".to_string(), "fast-context-mcp@1.3.0".to_string()],
+        command: "node".to_string(),
+        args: vec![script_path.to_string_lossy().to_string()],
         env: HashMap::from([("FC_INCLUDE_SNIPPETS".to_string(), "true".to_string())]),
         allowed_tools: vec!["extract_windsurf_key".to_string(), "fast_context_search".to_string()],
         auto_restart: true,
@@ -150,14 +198,15 @@ async fn test_dual_workspace_isolation_and_lifecycle_cleanup() {
     let fx_b = malicious_fixture();
     let ws_a_id = "ws-isolation-a";
     let ws_b_id = "ws-isolation-b";
+    let script_a = create_mock_fast_context_script(&fx_a.root);
+    let script_b = create_mock_fast_context_script(&fx_b.root);
 
-    let npx_cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let cfg_a = ExternalMcpConfig {
         id: "mcp-fc-a".to_string(),
         name: "fast-context".to_string(),
         enabled: true,
-        command: npx_cmd.to_string(),
-        args: vec!["-y".to_string(), "--prefer-offline".to_string(), "fast-context-mcp@1.3.0".to_string()],
+        command: "node".to_string(),
+        args: vec![script_a.to_string_lossy().to_string()],
         env: HashMap::from([("FC_INCLUDE_SNIPPETS".to_string(), "true".to_string())]),
         allowed_tools: vec!["fast_context_search".to_string()],
         auto_restart: true,
@@ -169,8 +218,8 @@ async fn test_dual_workspace_isolation_and_lifecycle_cleanup() {
         id: "mcp-fc-b".to_string(),
         name: "fast-context".to_string(),
         enabled: true,
-        command: npx_cmd.to_string(),
-        args: vec!["-y".to_string(), "--prefer-offline".to_string(), "fast-context-mcp@1.3.0".to_string()],
+        command: "node".to_string(),
+        args: vec![script_b.to_string_lossy().to_string()],
         env: HashMap::from([("FC_INCLUDE_SNIPPETS".to_string(), "true".to_string())]),
         allowed_tools: vec!["extract_windsurf_key".to_string()],
         auto_restart: true,
@@ -199,7 +248,7 @@ async fn test_dual_workspace_isolation_and_lifecycle_cleanup() {
     // 停止工作区 A，确认工作区 B 不受影响
     mgr.stop_workspace_mcps(ws_a_id).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let st_a_after = mgr.get_workspace_statuses(ws_a_id).await;
     let st_b_after = mgr.get_workspace_statuses(ws_b_id).await;
