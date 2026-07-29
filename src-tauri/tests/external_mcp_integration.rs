@@ -17,46 +17,55 @@ use serde_json::json;
 fn create_mock_fast_context_script(dir: &Path) -> PathBuf {
     let script_path = dir.join("mock_fast_context.js");
     let script_code = r#"
-const readline = require('readline');
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-
-rl.on('line', (line) => {
-  if (!line.trim()) return;
-  try {
-    const req = JSON.parse(line);
-    if (!req.id) return;
-    if (req.method === 'initialize') {
-      console.log(JSON.stringify({
-        jsonrpc: '2.0',
-        id: req.id,
-        result: {
-          protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'mock-fast-context', version: '1.3.0' }
-        }
-      }));
-    } else if (req.method === 'tools/list') {
-      console.log(JSON.stringify({
-        jsonrpc: '2.0',
-        id: req.id,
-        result: {
-          tools: [
-            { name: 'fast_context_search', description: 'search code', inputSchema: { type: 'object' } },
-            { name: 'extract_windsurf_key', description: 'extract key', inputSchema: { type: 'object' } }
-          ]
-        }
-      }));
-    } else if (req.method === 'tools/call') {
-      console.log(JSON.stringify({
-        jsonrpc: '2.0',
-        id: req.id,
-        result: {
-          content: [{ type: 'text', text: 'mock search result' }]
-        }
-      }));
-    }
-  } catch (e) {}
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  let lines = buffer.split('\n');
+  buffer = lines.pop() || '';
+  for (let line of lines) {
+    line = line.trim();
+    if (!line) continue;
+    try {
+      const req = JSON.parse(line);
+      if (!req.id) continue;
+      let res = null;
+      if (req.method === 'initialize') {
+        res = {
+          jsonrpc: '2.0',
+          id: req.id,
+          result: {
+            protocolVersion: '2024-11-05',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'mock-fast-context', version: '1.3.0' }
+          }
+        };
+      } else if (req.method === 'tools/list') {
+        res = {
+          jsonrpc: '2.0',
+          id: req.id,
+          result: {
+            tools: [
+              { name: 'fast_context_search', description: 'search code', inputSchema: { type: 'object' } },
+              { name: 'extract_windsurf_key', description: 'extract key', inputSchema: { type: 'object' } }
+            ]
+          }
+        };
+      } else if (req.method === 'tools/call') {
+        res = {
+          jsonrpc: '2.0',
+          id: req.id,
+          result: {
+            content: [{ type: 'text', text: 'mock search result' }]
+          }
+        };
+      }
+      if (res) {
+        process.stdout.write(JSON.stringify(res) + '\n');
+      }
+    } catch (e) {}
+  }
 });
+process.stdin.resume();
 "#;
     std::fs::write(&script_path, script_code).expect("write mock_fast_context.js");
     script_path
