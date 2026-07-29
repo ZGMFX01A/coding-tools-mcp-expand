@@ -21,6 +21,7 @@
     type SaveTunnelOptions,
   } from "$lib/components/TunnelConfigForm.svelte";
   import WorkspaceMetaForm from "$lib/components/WorkspaceMetaForm.svelte";
+  import ExternalMcpPanel from "$lib/components/ExternalMcpPanel.svelte";
   import {
     deleteWorkspace,
     getActionsRuntimeStatus,
@@ -605,6 +606,13 @@
 
         {#if mcpSubTab === "config"}
           <div class="tx-card mt-4 grid gap-6 p-5">
+            <div>
+              <ExternalMcpPanel
+                workspaceId={workspaceId!}
+                configs={profile.externalMcps}
+                onRefreshProfile={async () => { await refreshProfile(); }}
+              />
+            </div>
             <div>
               <p class="tx-section-label">隧道</p>
               <TunnelConfigForm

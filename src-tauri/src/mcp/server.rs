@@ -23,7 +23,13 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
-            let tools = list_tools_for_profile(&state.tool_profile);
+            let mut tools = list_tools_for_profile(&state.tool_profile);
+            if let Some(ref external_mgr) = state.external_mcp {
+                let external_tools = tauri::async_runtime::block_on(
+                    external_mgr.get_aggregated_tools(&state.workspace_id)
+                );
+                tools.extend(external_tools);
+            }
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => handle_tools_call(state, &params),
@@ -61,6 +67,25 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let args = tool_arguments(name, params);
+
+    // 检查是否为外部 stdio MCP 工具
+    if let Some(ref external_mgr) = state.external_mcp {
+        let is_external = tauri::async_runtime::block_on(
+            external_mgr.find_tool_entry(&state.workspace_id, name)
+        );
+        if is_external.is_some() {
+            let res = tauri::async_runtime::block_on(
+                external_mgr.call_external_tool(&state.workspace_id, name, &args)
+            );
+            return match res {
+                Ok(val) => Ok(val),
+                Err(err_msg) => Err(serde_json::json!({
+                    "code": -32603,
+                    "message": format!("外部工具调用失败: {err_msg}")
+                })),
+            };
+        }
+    }
 
     let canonical_name = crate::tools::registry::canonical_tool_name(name);
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
@@ -105,12 +130,34 @@ pub fn new_state(
     tool_profile: String,
     permission_mode: String,
 ) -> SharedState {
-    Arc::new(ToolContext::from_workspace(
+    new_state_with_external_mcp(
         workspace,
         auth,
         policy,
         tool_profile,
         permission_mode,
+        String::new(),
+        None,
+    )
+}
+
+pub fn new_state_with_external_mcp(
+    workspace: Workspace,
+    auth: AuthConfig,
+    policy: crate::tools::policy::PolicySettings,
+    tool_profile: String,
+    permission_mode: String,
+    workspace_id: String,
+    external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+) -> SharedState {
+    Arc::new(ToolContext::from_workspace_with_external_mcp(
+        workspace,
+        auth,
+        policy,
+        tool_profile,
+        permission_mode,
+        workspace_id,
+        external_mcp,
     ))
 }
 

@@ -15,7 +15,7 @@ use crate::auth::{
     protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
-use crate::mcp::server::{handle_request, new_state, SharedState};
+use crate::mcp::server::{handle_request, SharedState};
 use crate::secret::SecretStore;
 use crate::tools::Workspace;
 use crate::tunnel::append_profile_log;
@@ -48,16 +48,19 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
+    external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
 ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
     let policy = PolicySettings::from_runtime(&runtime);
-    let mcp = new_state(
+    let mcp = crate::mcp::server::new_state_with_external_mcp(
         workspace,
         auth.clone(),
         policy,
         runtime.tool_profile.clone(),
         runtime.permission_mode.clone(),
+        workspace_id.clone(),
+        external_mcp,
     );
     let bearer_token = if auth.bearer_enabled() {
         let key = "bearer_token";

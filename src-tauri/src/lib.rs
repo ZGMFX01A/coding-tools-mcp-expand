@@ -6,9 +6,10 @@ mod auth;
 mod commands;
 mod data;
 mod error;
+pub mod external_mcp;
 pub mod harness;
 mod health;
-mod mcp;
+pub mod mcp;
 mod platform;
 mod runtime;
 mod secret;
@@ -19,15 +20,17 @@ mod workspace;
 
 use app_state::AppState;
 use commands::{
-    create_workspace, delete_frp_profile, delete_workspace, get_actions_runtime_status,
-    get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id, get_proxy,
+    create_workspace, delete_external_mcp, delete_frp_profile, delete_workspace,
+    detect_fast_context_env, get_actions_runtime_status, get_app_settings, get_download_config,
+    get_external_mcp_discovered_tools, get_frp_snippet, get_last_workspace_id, get_proxy,
     get_runtime_status, get_shared_secret, get_workspace_secret, install_software,
-    list_frp_profiles, list_software, list_workspaces, open_workspace_directory,
-    read_workspace_logs, regenerate_shared_secret, regenerate_workspace_secret,
-    restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
+    list_external_mcps, list_frp_profiles, list_software, list_workspaces,
+    open_workspace_directory, read_workspace_logs, reconnect_external_mcp,
+    regenerate_shared_secret, regenerate_workspace_secret, restart_actions_runtime,
+    restart_runtime, restart_tunnel, run_health_checks, save_external_mcp, save_frp_profile,
     set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
     start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
-    stop_tunnel, test_tunnel, uninstall_software, update_workspace,
+    stop_tunnel, test_external_mcp_connection, test_tunnel, uninstall_software, update_workspace,
 };
 use tauri::Manager;
 
@@ -112,6 +115,13 @@ pub fn run() {
             set_download_config,
             get_proxy,
             set_proxy,
+            list_external_mcps,
+            save_external_mcp,
+            delete_external_mcp,
+            test_external_mcp_connection,
+            reconnect_external_mcp,
+            get_external_mcp_discovered_tools,
+            detect_fast_context_env,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

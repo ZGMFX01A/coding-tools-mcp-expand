@@ -16,6 +16,8 @@ pub struct ToolContext {
     pub harness: Harness,
     default_cwd: Mutex<PathBuf>,
     pub sessions: SessionStore,
+    pub workspace_id: String,
+    pub external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -27,12 +29,14 @@ impl ToolContext {
             auth_type: "noauth".into(),
             ..AuthConfig::default()
         };
-        Ok(Self::from_workspace(
+        Ok(Self::from_workspace_with_external_mcp(
             workspace,
             auth,
             PolicySettings::default(),
             "full".into(),
             "trusted".into(),
+            String::new(),
+            None,
         ))
     }
 
@@ -43,14 +47,36 @@ impl ToolContext {
         tool_profile: String,
         permission_mode: String,
     ) -> Self {
+        Self::from_workspace_with_external_mcp(
+            workspace,
+            auth,
+            policy,
+            tool_profile,
+            permission_mode,
+            String::new(),
+            None,
+        )
+    }
+
+    pub fn from_workspace_with_external_mcp(
+        workspace: Workspace,
+        auth: AuthConfig,
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+        workspace_id: String,
+        external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+    ) -> Self {
         let harness_root = Harness::default_root().expect("无法初始化 Harness 数据目录");
-        Self::from_workspace_with_harness_root(
+        Self::from_workspace_with_harness_root_and_external_mcp(
             workspace,
             auth,
             policy,
             crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
             harness_root,
+            workspace_id,
+            external_mcp,
         )
     }
 
@@ -62,6 +88,28 @@ impl ToolContext {
         permission_mode: String,
         harness_root: PathBuf,
     ) -> Self {
+        Self::from_workspace_with_harness_root_and_external_mcp(
+            workspace,
+            auth,
+            policy,
+            tool_profile,
+            permission_mode,
+            harness_root,
+            String::new(),
+            None,
+        )
+    }
+
+    pub fn from_workspace_with_harness_root_and_external_mcp(
+        workspace: Workspace,
+        auth: AuthConfig,
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+        harness_root: PathBuf,
+        workspace_id: String,
+        external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+    ) -> Self {
         let root = workspace.root().to_path_buf();
         Self {
             workspace,
@@ -72,6 +120,8 @@ impl ToolContext {
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             default_cwd: Mutex::new(root),
             sessions: SessionStore::new(),
+            workspace_id,
+            external_mcp,
         }
     }
 

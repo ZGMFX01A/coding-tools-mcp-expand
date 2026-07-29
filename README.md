@@ -237,6 +237,32 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
 | 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
 | 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
+| 外部 MCP | 聚合外部 stdio MCP（如 `fast-context__fast_context_search`） |
+
+## 外部 stdio MCP 聚合 (代码语义检索 fast-context)
+
+Coding Tools MCP 负责启动和管理本机已有的 stdio MCP 服务，将其工具以命名空间形式 (`{server_name}__{tool_name}`) 合并暴露给网页端 Agent。应用不会自动下载或安装任何第三方 MCP。
+
+接入 **fast-context-mcp** 支持三种启动方式：
+
+1. **本地已全局安装 (默认推荐)**：
+   - 启动命令: `fast-context-mcp`
+   - 参数列表: `[]`
+
+2. **指定本地入口文件**：
+   - 启动命令: `node`
+   - 参数列表: `["D:/Tools/fast-context-mcp/dist/index.js"]`
+
+3. **通过 npx 运行 (兼容方式)**：
+   - 启动命令: `npx`
+   - 参数列表: `["-y", "--prefer-offline", "fast-context-mcp@1.3.0"]`
+   - *注：仅在用户主动选择 npx 兼容模式且本地无缓存时，可能产生 npm 下载等待。*
+
+配置步骤：
+1. 打开工作区，在 **MCP → 配置** 中找到“外部 stdio MCP 聚合”。
+2. 点击 **+ 导入 fast-context 模板**，根据本机环境选择上述对应的启动方式。
+3. 点击 **测试连接**（会自动检测本地命令或文件是否存在），确认无误后保存配置。
+4. 网页端 Agent 连接后将在 `tools/list` 中看到 `fast-context__fast_context_search` 工具，即可直接进行中大型代码库的自然语言语义搜索。
 
 典型开发过程：
 

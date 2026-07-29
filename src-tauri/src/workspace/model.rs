@@ -12,6 +12,8 @@ pub struct WorkspaceProfile {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub actions: ActionsConfig,
+    #[serde(alias = "external_mcps", rename = "externalMcps", default)]
+    pub external_mcps: Vec<crate::external_mcp::ExternalMcpConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +268,7 @@ impl WorkspaceProfile {
             auth: AuthConfig::default(),
             runtime: RuntimeConfig::default(),
             actions: ActionsConfig::default(),
+            external_mcps: Vec::new(),
         }
     }
 
@@ -366,6 +369,10 @@ fn computed_public_url(
     frp_profile_id: &str,
     settings: &AppSettings,
 ) -> String {
+    let trimmed_public_url = public_url.trim().trim_end_matches('/');
+    if !trimmed_public_url.is_empty() {
+        return trimmed_public_url.to_string();
+    }
     if tunnel_type == "frp" {
         let server = settings
             .find_frp_profile(frp_profile_id)
@@ -375,5 +382,40 @@ fn computed_public_url(
             return format!("https://{frp_subdomain}.{server}");
         }
     }
-    public_url.trim_end_matches('/').to_string()
+    String::new()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computed_public_url_prefers_custom_public_url() {
+        let settings = AppSettings::default();
+        let custom_url = "https://custom.domain.com";
+        let result = computed_public_url(
+            "frp",
+            "frp.example.com",
+            "sub",
+            custom_url,
+            "",
+            &settings,
+        );
+        assert_eq!(result, "https://custom.domain.com");
+    }
+
+    #[test]
+    fn computed_public_url_falls_back_to_frp_domain() {
+        let settings = AppSettings::default();
+        let result = computed_public_url(
+            "frp",
+            "frp.example.com",
+            "sub",
+            "",
+            "",
+            &settings,
+        );
+        assert_eq!(result, "https://sub.frp.example.com");
+    }
+}
+

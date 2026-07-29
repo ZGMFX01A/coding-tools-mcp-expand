@@ -1,3 +1,4 @@
+mod external_mcp;
 mod frp_profiles;
 mod health;
 mod logs;
@@ -7,6 +8,10 @@ mod software;
 mod tunnel;
 mod workspace;
 
+pub use external_mcp::{
+    delete_external_mcp, detect_fast_context_env, get_external_mcp_discovered_tools,
+    list_external_mcps, reconnect_external_mcp, save_external_mcp, test_external_mcp_connection,
+};
 pub use frp_profiles::{
     delete_frp_profile, get_app_settings, get_last_workspace_id, get_proxy, list_frp_profiles,
     save_frp_profile, set_last_workspace, set_proxy,

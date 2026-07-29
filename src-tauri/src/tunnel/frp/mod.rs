@@ -65,6 +65,13 @@ pub fn frp_public_url(
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> String {
+    let custom_url = match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.public_url.trim(),
+        TunnelServiceKind::Actions => profile.actions.public_url.trim(),
+    };
+    if !custom_url.is_empty() {
+        return custom_url.trim_end_matches('/').to_string();
+    }
     let config = frp_server_config(profile, kind, settings, None);
     if config.server_addr.is_empty() || config.proxy.subdomain.trim().is_empty() {
         return String::new();
@@ -463,5 +470,17 @@ mod tests {
         crate::secret::SecretStore::set_app("frp_profile_token", "p1", "shared-token").unwrap();
         let config = frp_server_config(&profile, TunnelServiceKind::Mcp, &settings, None);
         assert_eq!(config.token.as_deref(), Some("shared-token"));
+    }
+
+    #[test]
+    fn frp_public_url_prefers_custom_public_url() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
+        profile.tunnel.frp_server = "frp.example.com".into();
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.public_url = "https://custom.mcp.com".into();
+        let settings = AppSettings::default();
+
+        let url = frp_public_url(&profile, TunnelServiceKind::Mcp, &settings);
+        assert_eq!(url, "https://custom.mcp.com");
     }
 }

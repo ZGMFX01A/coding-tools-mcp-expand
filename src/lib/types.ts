@@ -51,6 +51,54 @@ export interface ActionsConfig {
   use_shared_secrets?: boolean;
 }
 
+export interface ExternalMcpConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  allowedTools: string[];
+  autoRestart: boolean;
+  initializeTimeoutSeconds: number;
+  callTimeoutSeconds: number;
+}
+
+export interface ExternalMcpStatus {
+  configId: string;
+  name: string;
+  enabled: boolean;
+  state: string;
+  pid: number | null;
+  discoveredToolsCount: number;
+  errorMessage: string | null;
+}
+
+export interface McpTool {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, any>;
+}
+
+export interface TestConnectionResult {
+  success: boolean;
+  durationMs: number;
+  protocolVersion: string | null;
+  discoveredTools: McpTool[];
+  errorKind?: string | null;
+  errorMessage: string | null;
+  resolvedCommandDisplay?: string;
+}
+
+export interface FastContextDetectionResult {
+  detected: boolean;
+  mode: "local_cmd" | "local_file" | null;
+  command: string | null;
+  args: string[];
+  entryPath: string | null;
+  message: string;
+}
+
 export interface WorkspaceProfile {
   id: string;
   name: string;
@@ -59,6 +107,7 @@ export interface WorkspaceProfile {
   auth: AuthConfig;
   runtime: RuntimeConfig;
   actions?: ActionsConfig;
+  externalMcps?: ExternalMcpConfig[];
 }
 
 export interface RuntimeStatus {
@@ -117,12 +166,16 @@ export function frpPublicUrl(
   profiles: FrpProfileSummary[],
   publicUrl = "",
 ): string {
+  const trimmedPublicUrl = publicUrl.trim();
+  if (trimmedPublicUrl) {
+    return trimmedPublicUrl.replace(/\/$/, "");
+  }
   if (tunnelType !== "frp" || !frpSubdomain) {
-    return publicUrl.replace(/\/$/, "");
+    return "";
   }
   const server =
     profiles.find((profile) => profile.id === frpProfileId)?.server ?? frpServer;
-  if (!server) return publicUrl.replace(/\/$/, "");
+  if (!server) return "";
   return `https://${frpSubdomain}.${server}`;
 }
 

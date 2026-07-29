@@ -41,9 +41,18 @@ struct RuntimeEntry {
     missing_port_checks: u8,
 }
 
-#[derive(Default)]
 pub struct RuntimeSupervisor {
     entries: HashMap<(String, ServiceKind), RuntimeEntry>,
+    pub external_mcp: crate::external_mcp::SharedExternalMcpManager,
+}
+
+impl Default for RuntimeSupervisor {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            external_mcp: std::sync::Arc::new(crate::external_mcp::ExternalMcpManager::new()),
+        }
+    }
 }
 
 impl RuntimeSupervisor {
@@ -112,6 +121,13 @@ impl RuntimeSupervisor {
 
     pub fn begin_stop(&mut self, workspace_id: &str, kind: ServiceKind) -> Option<JoinHandle<()>> {
         let key = (workspace_id.to_string(), kind);
+        if kind == ServiceKind::Mcp {
+            let mgr = self.external_mcp.clone();
+            let id = workspace_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                mgr.stop_workspace_mcps(&id).await;
+            });
+        }
         let entry = self.entries.get_mut(&key)?;
 
         entry.phase = RuntimePhase::Stopping;
@@ -247,6 +263,14 @@ impl RuntimeSupervisor {
 
         let spawn_result = match kind {
             ServiceKind::Mcp => {
+                let mgr = self.external_mcp.clone();
+                let ws_id = profile.id.clone();
+                let ws_path = PathBuf::from(&profile.path);
+                let ext_configs = profile.external_mcps.clone();
+                tauri::async_runtime::spawn(async move {
+                    mgr.start_workspace_mcps(&ws_id, &ws_path, &ext_configs).await;
+                });
+
                 let use_shared = profile.auth.use_shared_secrets;
                 let mut auth = profile.auth.clone();
                 if use_shared {
@@ -277,6 +301,7 @@ impl RuntimeSupervisor {
                     oauth_password,
                     oauth_token_secret,
                     profile.runtime.clone(),
+                    Some(self.external_mcp.clone()),
                 )
             }
             ServiceKind::Actions => {
