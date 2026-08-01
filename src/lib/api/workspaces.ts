@@ -16,6 +16,14 @@ export async function updateWorkspace(profile: WorkspaceProfile): Promise<void> 
   return invoke("update_workspace", { profile });
 }
 
+/** 修改工作区 ID，返回迁移后的 profile（调用方需先停止 MCP 与 Actions 服务） */
+export async function updateWorkspaceId(
+  currentId: string,
+  newId: string,
+): Promise<WorkspaceProfile> {
+  return invoke<WorkspaceProfile>("update_workspace_id", { currentId, newId });
+}
+
 export async function openWorkspaceDirectory(path: string): Promise<void> {
   return invoke("open_workspace_directory", { path });
 }

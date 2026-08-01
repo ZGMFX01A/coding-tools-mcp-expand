@@ -31,6 +31,7 @@ use commands::{
     set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
     start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
     stop_tunnel, test_external_mcp_connection, test_tunnel, uninstall_software, update_workspace,
+    update_workspace_id,
 };
 use tauri::Manager;
 
@@ -79,6 +80,7 @@ pub fn run() {
             list_workspaces,
             create_workspace,
             update_workspace,
+            update_workspace_id,
             open_workspace_directory,
             delete_workspace,
             start_runtime,

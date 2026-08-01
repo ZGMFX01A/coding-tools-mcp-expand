@@ -14,6 +14,7 @@
   import ChatGptSessionPrompt from "$lib/components/ChatGptSessionPrompt.svelte";
   import ServicePanel from "$lib/components/ServicePanel.svelte";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
+  import CopyFieldRow from "$lib/components/CopyFieldRow.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
   import Tabs from "$lib/components/Tabs.svelte";
   import TunnelConfigForm, {
@@ -34,6 +35,7 @@
     stopActionsRuntime,
     stopRuntime,
     updateWorkspace,
+    updateWorkspaceId,
   } from "$lib/api/workspaces";
   import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "$lib/api/settings";
   import { confirm } from "@tauri-apps/plugin-dialog";
@@ -487,6 +489,30 @@
     await promptServiceRestart(actionsStatus === "running", "Actions 服务");
   }
 
+  async function saveWorkspaceId(newId: string) {
+    if (!profile || !workspaceId || profile.id === newId) return;
+    const confirmed = await confirm(
+      `确定将工作区 ID 从「${profile.id}」修改为「${newId}」？\n\n修改后会改变工作区访问地址，且需要先停止 MCP 和 Actions 服务。`,
+      {
+        title: "修改工作区 ID",
+        kind: "warning",
+        okLabel: "确认修改",
+        cancelLabel: "取消",
+      },
+    );
+    if (!confirmed) return;
+    try {
+      const next = await updateWorkspaceId(workspaceId, newId);
+      workspaces.update((items) =>
+        items.map((item) => (item.id === next.id ? next : item)),
+      );
+      showToast("工作区 ID 已更新", { kind: "success" });
+      await goto(`/workspace/${next.id}`);
+    } catch (error) {
+      showToast(String(error), { kind: "error", title: "无法修改工作区 ID" });
+    }
+  }
+
   async function removeWorkspace() {
     if (!profile || !workspaceId) return;
     const confirmed = await confirm(`确定删除工作区「${profile.name}」？此操作不可撤销。`, {
@@ -530,12 +556,22 @@
         </button>
       </div>
 
+      <div class="mt-4 max-w-md">
+        <CopyFieldRow
+          label="工作区 ID"
+          value={profile.id}
+          hint="用于工作区访问地址与数据关联的稳定标识，可在下方修改。"
+        />
+      </div>
+
       <div class="mt-4">
         <WorkspaceMetaForm
+          id={profile.id}
           name={profile.name}
           path={profile.path}
           onSave={saveWorkspaceName}
           onUpdatePath={saveWorkspacePath}
+          onSaveId={saveWorkspaceId}
         />
       </div>
 
