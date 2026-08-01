@@ -305,10 +305,13 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         storage::write_index(&history_dir, &storage::rebuild_index(&refreshed))?;
     }
     if redacted {
-        warnings.push("检测到疑似敏感信息，归档内容已脱敏。");
+        warnings.push("检测到疑似敏感信息，归档内容已脱敏。".to_string());
     }
     if host_session_key_mismatch {
-        warnings.push("宿主会话标识已变化；本次仍使用 bootstrap 返回的稳定目标，未切换历史文件。");
+        warnings.push(
+            "宿主会话标识已变化；本次仍使用 bootstrap 返回的稳定目标，未切换历史文件。"
+                .to_string(),
+        );
     }
     Ok(tool_ok(json!({
         "session_number": document.number,
