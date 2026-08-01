@@ -231,7 +231,7 @@ fn bootstrap_requires_a_stable_session_id() {
 }
 
 #[test]
-fn workspace_root_accepts_dot_and_current_absolute_path_but_rejects_outside() {
+fn workspace_root_mismatch_is_a_warning_and_still_uses_configured_root() {
     let (workspace, _harness, ctx) = test_context();
     let relative = invoke(
         &ctx,
@@ -250,18 +250,52 @@ fn workspace_root_accepts_dot_and_current_absolute_path_but_rejects_outside() {
     );
     assert_eq!(assert_ok(&absolute)["current_number"], 2);
 
+    // workspace_root 指向工作区外（跨设备 / 旧路径场景）：不应锁死历史流程，
+    // 而是告警并忽略客户端值，始终写入当前工作区根目录
     let outside = invoke(
         &ctx,
-        "history_session_validate",
+        "history_session_bootstrap",
         json!({
             "workspace_root": workspace.path().parent().unwrap().to_string_lossy(),
-            "repair": false
+            "session_key": "outside-root"
         }),
     );
-    assert_eq!(
-        assert_err(&outside)["error"]["code"],
-        "PATH_OUTSIDE_WORKSPACE"
+    let outside = assert_ok(&outside);
+    assert_eq!(outside["current_number"], 3);
+    let warnings = outside["warnings"].as_array().unwrap();
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.as_str().unwrap_or("").contains("workspace_root")));
+    // 会话仍落在当前工作区根目录内
+    assert!(workspace.path().join("docs/history-session/3.md").is_file());
+}
+
+#[test]
+fn checkpoint_without_workspace_root_uses_the_configured_workspace_root() {
+    // 回归保护：即使客户端完全不传 workspace_root（只传 session_key 与
+    // expected_path），checkpoint 也必须基于当前工作区根目录正常写入，
+    // 不得返回 PATH_OUTSIDE_WORKSPACE。
+    let (workspace, _harness, ctx) = test_context();
+    let boot = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "cross-device-key"}),
     );
+    let boot = assert_ok(&boot);
+    let checkpoint = invoke(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "turn_id": "turn-0001",
+            "user_intent": "跨设备继续"
+        }),
+    );
+    let checkpoint = assert_ok(&checkpoint);
+    assert_eq!(checkpoint["expected_path"], boot["current_path"]);
+    assert!(checkpoint["warnings"].as_array().unwrap().is_empty());
+    assert!(workspace.path().join("docs/history-session/1.md").is_file());
 }
 
 #[test]

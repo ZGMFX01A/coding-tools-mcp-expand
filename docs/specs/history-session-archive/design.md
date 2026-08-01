@@ -35,7 +35,7 @@ ChatGPT tools/call
   -> wrap_mcp_tool_result 保持现有结果 envelope
 ```
 
-历史工具不读取客户端传入的任意 `workspace_root` 作为权限根。当前 MCP Runtime 的 `Workspace` 是唯一可信边界；兼容字段 `workspace_root` 存在时必须与已绑定工作区规范路径相同。
+历史工具不读取客户端传入的任意 `workspace_root` 作为权限根。当前 MCP Runtime 的 `Workspace` 是唯一可信边界；兼容字段 `workspace_root` 只用于一致性提示：与已绑定工作区规范路径不一致（例如跨设备沿用旧路径）时，忽略客户端值并在 `warnings` 中给出提示，始终使用当前 MCP Runtime 已绑定的工作区根目录。真正越界（`history_dir` 含父级穿越 / 绝对路径 / 符号链接逃逸）仍返回 `PATH_OUTSIDE_WORKSPACE`，且 `details` 附带 `workspace_root`、`candidate` 与排查提示，便于定位 junction/旧根目录。
 
 ---
 

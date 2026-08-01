@@ -247,6 +247,15 @@ async fn run_command(
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
 
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW (0x08000000)：子进程若为控制台程序则不创建新控制台窗口，
+        // 避免调用 cmd / powershell 等命令时弹出置顶的 conhost 窗口
+        command
+            .as_std_mut()
+            .creation_flags(0x08000000);
+    }
+
     let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
         code: "COMMAND_SPAWN_FAILED",
         message: format!("Failed to start command: {e}"),

@@ -16,7 +16,8 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let host_session_key_mismatch = host_session_key(args)
         .map(|host| host != session_key.as_str())
         .unwrap_or(false);
-    let history_dir = resolve_dir(ctx, args)?;
+    let mut warnings = Vec::<String>::new();
+    let history_dir = resolve_dir(ctx, args, &mut warnings)?;
     storage::ensure_directory(&history_dir)?;
     let _lock = storage::lock_directory(&history_dir)?;
     let report = storage::scan(&ctx.workspace, &history_dir)?;
@@ -31,7 +32,6 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         ));
     }
 
-    let mut warnings = Vec::<String>::new();
     if host_session_key_mismatch {
         warnings.push(
             "宿主会话标识与显式 session_key 不一致，已使用显式 session_key 保持会话连续。".into(),
@@ -226,7 +226,8 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let host_session_key_mismatch = host_session_key(args)
         .map(|host| host != session_key.as_str())
         .unwrap_or(false);
-    let history_dir = resolve_dir(ctx, args)?;
+    let mut warnings = Vec::<String>::new();
+    let history_dir = resolve_dir(ctx, args, &mut warnings)?;
     if !history_dir.exists() {
         return Err(session_not_bootstrapped());
     }
@@ -303,7 +304,6 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         let refreshed = storage::scan(&ctx.workspace, &history_dir)?;
         storage::write_index(&history_dir, &storage::rebuild_index(&refreshed))?;
     }
-    let mut warnings = Vec::new();
     if redacted {
         warnings.push("检测到疑似敏感信息，归档内容已脱敏。");
     }
@@ -326,7 +326,8 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
 }
 
 pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
-    let history_dir = resolve_dir(ctx, args)?;
+    let mut warnings = Vec::<String>::new();
+    let history_dir = resolve_dir(ctx, args, &mut warnings)?;
     let repair = args.get("repair").and_then(Value::as_bool).unwrap_or(false);
     if repair {
         storage::ensure_directory(&history_dir)?;
@@ -340,7 +341,6 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         };
     }
     let report = storage::scan(&ctx.workspace, &history_dir)?;
-    let mut warnings = Vec::<String>::new();
     if !report.duplicate_session_keys.is_empty() {
         warnings.push("存在重复 session_key，相关映射未写入索引。".into());
     }
@@ -375,11 +375,16 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     })))
 }
 
-fn resolve_dir(ctx: &ToolContext, args: &Value) -> WorkspaceResult<std::path::PathBuf> {
+fn resolve_dir(
+    ctx: &ToolContext,
+    args: &Value,
+    warnings: &mut Vec<String>,
+) -> WorkspaceResult<std::path::PathBuf> {
     storage::resolve_history_dir(
         &ctx.workspace,
         args.get("workspace_root").and_then(Value::as_str),
         args.get("history_dir").and_then(Value::as_str),
+        warnings,
     )
 }
 

@@ -27,7 +27,11 @@ pub fn resolve_history_dir(
     workspace: &Workspace,
     workspace_root: Option<&str>,
     history_dir: Option<&str>,
+    warnings: &mut Vec<String>,
 ) -> WorkspaceResult<PathBuf> {
+    // workspace_root 仅为兼容字段：不参与权限判定，也不作为写入根。
+    // 传入值与当前工作区根目录不一致（例如跨设备沿用旧路径）时，
+    // 忽略客户端值并始终使用 app 配置的工作区根目录，避免旧路径锁死整个历史流程。
     if let Some(requested_root) = workspace_root {
         let requested_path = Path::new(requested_root.trim());
         let candidate = if requested_path.is_absolute() {
@@ -35,11 +39,22 @@ pub fn resolve_history_dir(
         } else {
             workspace.root().join(requested_path)
         };
-        let requested = candidate
-            .canonicalize()
-            .map_err(|_| WorkspaceError::invalid_argument("workspace_root does not exist"))?;
-        if requested != workspace.root() {
-            return Err(WorkspaceError::path_outside_workspace());
+        match candidate.canonicalize() {
+            Ok(resolved) if resolved != workspace.root() => {
+                warnings.push(format!(
+                    "客户端传入的 workspace_root 与当前工作区根目录不一致，已忽略并使用当前工作区根目录：{}；传入值：{}",
+                    workspace.root_display(),
+                    requested_root
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                warnings.push(format!(
+                    "客户端传入的 workspace_root 无法解析（可能来自旧设备或旧路径），已忽略并使用当前工作区根目录：{}；传入值：{}",
+                    workspace.root_display(),
+                    requested_root
+                ));
+            }
         }
     }
 
@@ -63,9 +78,9 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
     if candidate.exists() || candidate.is_symlink() {
         let resolved = candidate
             .canonicalize()
-            .map_err(|_| WorkspaceError::path_outside_workspace())?;
+            .map_err(|_| path_outside_workspace_detailed(workspace, candidate))?;
         if !resolved.starts_with(workspace.root()) {
-            return Err(WorkspaceError::path_outside_workspace());
+            return Err(path_outside_workspace_detailed(workspace, &resolved));
         }
         return Ok(());
     }
@@ -74,15 +89,32 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
         if path.exists() || path.is_symlink() {
             let resolved = path
                 .canonicalize()
-                .map_err(|_| WorkspaceError::path_outside_workspace())?;
+                .map_err(|_| path_outside_workspace_detailed(workspace, path))?;
             if !resolved.starts_with(workspace.root()) {
-                return Err(WorkspaceError::path_outside_workspace());
+                return Err(path_outside_workspace_detailed(workspace, &resolved));
             }
             return Ok(());
         }
         ancestor = path.parent();
     }
-    Err(WorkspaceError::path_outside_workspace())
+    Err(path_outside_workspace_detailed(workspace, candidate))
+}
+
+/// 构造带诊断信息的 PATH_OUTSIDE_WORKSPACE 错误。
+/// details 返回工作区根目录、越界候选路径与排查提示，便于区分是
+/// junction/符号链接逃逸，还是 MCP 运行时加载了旧工作区根目录。
+fn path_outside_workspace_detailed(workspace: &Workspace, path: &Path) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "PATH_OUTSIDE_WORKSPACE",
+        message: "Path escapes the configured workspace.".into(),
+        category: "security",
+        retryable: false,
+        details: serde_json::json!({
+            "workspace_root": workspace.root_display(),
+            "candidate": path.to_string_lossy(),
+            "hint": "检查候选路径或其上级目录是否存在指向工作区外的符号链接 / 目录联接（junction）；若工作区路径刚修改过，请先停止并重启该工作区的 MCP 服务，确保运行时加载的是当前配置的根目录。"
+        }),
+    }
 }
 
 pub fn ensure_directory(path: &Path) -> WorkspaceResult<()> {
