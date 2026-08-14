@@ -6,7 +6,10 @@ mod runtime;
 mod secrets;
 mod software;
 mod tunnel;
+pub mod ui_memory;
 mod workspace;
+
+pub use ui_memory::{get_webview_memory_sample, recreate_ui_webview};
 
 pub use external_mcp::{
     delete_external_mcp, detect_fast_context_env, get_external_mcp_discovered_tools,

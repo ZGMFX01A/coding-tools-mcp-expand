@@ -16,6 +16,7 @@
   import { getLastWorkspaceId } from "$lib/api/settings";
   import { actionsRuntimeStates, mcpRuntimeStates, workspaces } from "$lib/stores/app";
   import { showToast } from "$lib/stores/toast";
+  import { startUiMemoryGuard } from "$lib/ui-memory-guard";
   import type { RuntimeState } from "$lib/types";
 
   let { children } = $props();
@@ -81,17 +82,23 @@
     goto("/settings/keys");
   }
 
-  onMount(async () => {
-    await refreshWorkspaces();
-    const path = $page.url.pathname;
-    if (path === "/") {
-      const lastId = await getLastWorkspaceId();
-      if (lastId && $workspaces.some((item) => item.id === lastId)) {
-        goto(`/workspace/${lastId}`);
-      } else if ($workspaces.length > 0) {
-        goto(`/workspace/${$workspaces[0].id}`);
+  onMount(() => {
+    const stopGuard = startUiMemoryGuard();
+    void (async () => {
+      await refreshWorkspaces();
+      const path = $page.url.pathname;
+      if (path === "/") {
+        const lastId = await getLastWorkspaceId();
+        if (lastId && $workspaces.some((item) => item.id === lastId)) {
+          goto(`/workspace/${lastId}`);
+        } else if ($workspaces.length > 0) {
+          goto(`/workspace/${$workspaces[0].id}`);
+        }
       }
-    }
+    })();
+    return () => {
+      stopGuard();
+    };
   });
 </script>
 

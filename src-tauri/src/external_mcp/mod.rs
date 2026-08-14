@@ -19,7 +19,6 @@ mod tests {
     use serde_json::json;
 
     use super::config::ExternalMcpConfig;
-    use super::namespace::{make_public_tool_name, normalize_server_name};
     use super::protocol::McpTool;
     use super::tool_registry::ExternalToolRegistry;
     use super::transport_stdio::sanitize_env_for_log;

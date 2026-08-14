@@ -23,9 +23,9 @@ use commands::{
     create_workspace, delete_external_mcp, delete_frp_profile, delete_workspace,
     detect_fast_context_env, get_actions_runtime_status, get_app_settings, get_download_config,
     get_external_mcp_discovered_tools, get_frp_snippet, get_last_workspace_id, get_proxy,
-    get_runtime_status, get_shared_secret, get_workspace_secret, install_software,
-    list_external_mcps, list_frp_profiles, list_software, list_workspaces,
-    open_workspace_directory, read_workspace_logs, reconnect_external_mcp,
+    get_runtime_status, get_shared_secret, get_webview_memory_sample, get_workspace_secret,
+    install_software, list_external_mcps, list_frp_profiles, list_software, list_workspaces,
+    open_workspace_directory, read_workspace_logs, reconnect_external_mcp, recreate_ui_webview,
     regenerate_shared_secret, regenerate_workspace_secret, restart_actions_runtime,
     restart_runtime, restart_tunnel, run_health_checks, save_external_mcp, save_frp_profile,
     set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
@@ -117,6 +117,8 @@ pub fn run() {
             set_download_config,
             get_proxy,
             set_proxy,
+            get_webview_memory_sample,
+            recreate_ui_webview,
             list_external_mcps,
             save_external_mcp,
             delete_external_mcp,
@@ -125,6 +127,14 @@ pub fn run() {
             get_external_mcp_discovered_tools,
             detect_fast_context_env,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if commands::ui_memory::should_prevent_exit() {
+                    api.prevent_exit();
+                }
+            }
+            _ => {}
+        });
 }

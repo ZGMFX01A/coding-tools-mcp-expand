@@ -201,3 +201,58 @@ fn terminate_pid(pid: u32) -> AppResult<()> {
         Ok(())
     }
 }
+
+/// Working-set sample for the desktop process tree (main + WebView2 children).
+#[derive(Debug, Clone, Default)]
+pub struct ProcessTreeMemory {
+    pub main_bytes: u64,
+    pub webview_bytes: u64,
+    pub webview_process_count: u32,
+}
+
+pub fn sample_process_tree_memory() -> AppResult<ProcessTreeMemory> {
+    let root = std::process::id();
+    let descendants = collect_child_pids(root)?;
+    let mut sample = ProcessTreeMemory::default();
+    sample.main_bytes = working_set_bytes(root).unwrap_or(0);
+
+    for pid in descendants {
+        let Some(path) = process_image_path(pid)? else {
+            continue;
+        };
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name != "msedgewebview2.exe" {
+            continue;
+        }
+        if let Some(bytes) = working_set_bytes(pid) {
+            sample.webview_bytes = sample.webview_bytes.saturating_add(bytes);
+            sample.webview_process_count = sample.webview_process_count.saturating_add(1);
+        }
+    }
+    Ok(sample)
+}
+
+fn working_set_bytes(pid: u32) -> Option<u64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        counters.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = GetProcessMemoryInfo(handle, &mut counters, counters.cb).is_ok();
+        let _ = CloseHandle(handle);
+        if ok {
+            Some(counters.WorkingSetSize as u64)
+        } else {
+            None
+        }
+    }
+}
+
