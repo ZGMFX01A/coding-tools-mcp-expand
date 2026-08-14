@@ -1,5 +1,7 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 use std::time::SystemTime;
 
 use regex::Regex;
@@ -7,6 +9,10 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceError};
+
+/// Default per-file cap for `search_text` to avoid loading multi-GB assets.
+const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const BINARY_PEEK_BYTES: usize = 8192;
 
 pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args
@@ -222,6 +228,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .get("max_preview_bytes")
         .and_then(Value::as_u64)
         .unwrap_or(512) as usize;
+    let max_file_bytes = args
+        .get("max_file_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_SEARCH_MAX_FILE_BYTES);
 
     let (include_globs, exclude_globs) = search_globs(args);
     let context_lines = args
@@ -230,78 +240,251 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .unwrap_or(0) as usize;
     let matcher = build_matcher(query, use_regex, case_sensitive)?;
 
-    let file_paths: Vec<PathBuf> = if resolved.path.is_file() {
-        vec![resolved.path.clone()]
+    let mut matches = Vec::new();
+    let mut warnings = Vec::new();
+    let mut skipped_large = 0usize;
+    let mut skipped_binary = 0usize;
+    let mut truncated = false;
+
+    let mut consider_file = |p: &Path| -> bool {
+        if !ws.is_safe_read_path(p) {
+            return true;
+        }
+        if ws.is_ignored_path(p, false, false) {
+            return true;
+        }
+        let rel = relative_display(ws.root(), p);
+        if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
+            return true;
+        }
+        let meta = match p.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => return true,
+        };
+        if meta.len() > max_file_bytes {
+            skipped_large += 1;
+            return true;
+        }
+        match file_text_eligibility(p) {
+            FileEligibility::Binary => {
+                skipped_binary += 1;
+                return true;
+            }
+            FileEligibility::Unreadable => return true,
+            FileEligibility::Text => {}
+        }
+        let stop = search_file_streaming(
+            p,
+            &rel,
+            &matcher,
+            context_lines,
+            max_preview,
+            max_results,
+            &mut matches,
+        );
+        if stop {
+            truncated = true;
+            return false;
+        }
+        true
+    };
+
+    if resolved.path.is_file() {
+        let _ = consider_file(&resolved.path);
     } else {
-        WalkDir::new(&resolved.path)
+        for entry in WalkDir::new(&resolved.path)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.path().to_path_buf())
-            .collect()
-    };
-
-    let mut matches = Vec::new();
-    let mut total = 0usize;
-    for p in file_paths {
-        if !ws.is_safe_read_path(&p) {
-            continue;
-        }
-        if ws.is_ignored_path(&p, false, false) {
-            continue;
-        }
-        let rel = relative_display(ws.root(), &p);
-        if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
-            continue;
-        }
-        let content = match fs::read_to_string(&p) {
-            Ok(s) if !s.contains('\0') => s,
-            _ => continue,
-        };
-        let lines: Vec<String> = content.lines().map(str::to_string).collect();
-        for (idx, line) in lines.iter().enumerate() {
-            if !matcher.is_match(line) {
+        {
+            if !entry.file_type().is_file() {
                 continue;
             }
-            total += 1;
-            if matches.len() >= max_results {
-                continue;
+            if !consider_file(entry.path()) {
+                break;
             }
-            let preview = if line.len() > max_preview {
-                format!("{}...", &line[..max_preview])
-            } else {
-                line.clone()
-            };
-            let mut item = json!({
-                "path": rel,
-                "line": idx + 1,
-                "column": 1,
-                "preview": preview
-            });
-            if context_lines > 0 {
-                let start = idx.saturating_sub(context_lines);
-                let end = (idx + 1 + context_lines).min(lines.len());
-                item["before"] = json!(lines[start..idx]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>());
-                item["after"] = json!(lines[idx + 1..end]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>());
-            }
-            matches.push(item);
         }
     }
+
+    if truncated {
+        warnings.push("result limit reached; scan stopped early".to_string());
+    }
+    if skipped_large > 0 {
+        warnings.push(format!(
+            "skipped {skipped_large} file(s) larger than max_file_bytes ({max_file_bytes})"
+        ));
+    }
+    if skipped_binary > 0 {
+        warnings.push(format!(
+            "skipped {skipped_binary} binary or non-utf8 file(s)"
+        ));
+    }
+
     Ok(tool_ok(json!({
         "query": query,
         "matches": matches,
-        "total_matches": total,
-        "truncated": total > matches.len(),
-        "warnings": if total > matches.len() { vec!["result limit reached"] } else { vec![] }
+        "total_matches": matches.len(),
+        "truncated": truncated,
+        "max_file_bytes": max_file_bytes,
+        "skipped_large_files": skipped_large,
+        "skipped_binary_files": skipped_binary,
+        "warnings": warnings
     })))
 }
+
+enum FileEligibility {
+    Text,
+    Binary,
+    Unreadable,
+}
+
+fn file_text_eligibility(path: &Path) -> FileEligibility {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return FileEligibility::Unreadable,
+    };
+    let mut buf = [0u8; BINARY_PEEK_BYTES];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return FileEligibility::Unreadable,
+    };
+    if buf[..n].contains(&0) {
+        return FileEligibility::Binary;
+    }
+    FileEligibility::Text
+}
+
+/// Stream a file line-by-line. Returns true when `max_results` is reached.
+fn search_file_streaming(
+    path: &Path,
+    rel: &str,
+    matcher: &Matcher,
+    context_lines: usize,
+    max_preview: usize,
+    max_results: usize,
+    matches: &mut Vec<Value>,
+) -> bool {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let reader = BufReader::new(file);
+    let mut recent: VecDeque<String> = VecDeque::with_capacity(context_lines.max(1));
+    let mut pending: Vec<PendingMatch> = Vec::new();
+    let mut line_no = 0usize;
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => {
+                // Invalid UTF-8 mid-file: drop unfinished context and stop this file.
+                flush_pending(&mut pending, matches, max_results);
+                return matches.len() >= max_results;
+            }
+        };
+        line_no += 1;
+
+        // Feed "after" context for earlier hits.
+        if context_lines > 0 {
+            for pend in &mut pending {
+                if pend.after.len() < context_lines {
+                    pend.after.push(line.clone());
+                }
+            }
+            while pending
+                .first()
+                .is_some_and(|front| front.after.len() >= context_lines)
+            {
+                let done = pending.remove(0);
+                matches.push(done.into_value());
+                if matches.len() >= max_results {
+                    return true;
+                }
+            }
+        }
+
+        if matcher.is_match(&line) {
+            let preview = preview_line(&line, max_preview);
+            if context_lines == 0 {
+                matches.push(json!({
+                    "path": rel,
+                    "line": line_no,
+                    "column": 1,
+                    "preview": preview
+                }));
+                if matches.len() >= max_results {
+                    return true;
+                }
+            } else {
+                pending.push(PendingMatch {
+                    path: rel.to_string(),
+                    line: line_no,
+                    preview,
+                    before: recent.iter().cloned().collect(),
+                    after: Vec::new(),
+                });
+            }
+        }
+
+        if context_lines > 0 {
+            recent.push_back(line);
+            while recent.len() > context_lines {
+                recent.pop_front();
+            }
+        }
+    }
+
+    // EOF: emit remaining pending with partial after context.
+    for pend in pending {
+        matches.push(pend.into_value());
+        if matches.len() >= max_results {
+            return true;
+        }
+    }
+    false
+}
+
+struct PendingMatch {
+    path: String,
+    line: usize,
+    preview: String,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+impl PendingMatch {
+    fn into_value(self) -> Value {
+        json!({
+            "path": self.path,
+            "line": self.line,
+            "column": 1,
+            "preview": self.preview,
+            "before": self.before,
+            "after": self.after
+        })
+    }
+}
+
+fn preview_line(line: &str, max_preview: usize) -> String {
+    if line.len() <= max_preview {
+        return line.to_string();
+    }
+    let mut end = max_preview;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
+}
+
+fn flush_pending(pending: &mut Vec<PendingMatch>, matches: &mut Vec<Value>, max_results: usize) {
+    for pend in pending.drain(..) {
+        if matches.len() >= max_results {
+            break;
+        }
+        matches.push(pend.into_value());
+    }
+}
+
 
 fn build_matcher(
     query: &str,

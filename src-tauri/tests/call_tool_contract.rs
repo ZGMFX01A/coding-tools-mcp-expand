@@ -413,6 +413,72 @@ fn search_text_filters_by_glob() {
 }
 
 #[test]
+fn search_text_skips_binary_and_oversized_files() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    // Fixture materializes assets/raw.bin with NUL bytes; must not match or thrash.
+    let binary = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "binary", "glob": "assets/**", "max_results": 10}),
+    );
+    let binary_payload = assert_ok(&binary);
+    assert_eq!(binary_payload["total_matches"].as_u64().unwrap_or(1), 0);
+    assert!(binary_payload["skipped_binary_files"].as_u64().unwrap_or(0) >= 1);
+
+    // Oversized text file is skipped by max_file_bytes without being fully loaded.
+    let large_path = fx.root.join("search/huge.txt");
+    std::fs::write(&large_path, format!("needle {}\n", "x".repeat(4096))).expect("write huge");
+    let oversized = invoke(
+        &ctx,
+        "search_text",
+        json!({
+            "query": "needle",
+            "glob": "search/huge.txt",
+            "max_file_bytes": 64,
+            "max_results": 10
+        }),
+    );
+    let oversized_payload = assert_ok(&oversized);
+    assert_eq!(oversized_payload["total_matches"].as_u64().unwrap_or(1), 0);
+    assert!(
+        oversized_payload["skipped_large_files"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(oversized_payload["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w.as_str().unwrap_or("").contains("max_file_bytes")));
+}
+
+#[test]
+fn search_text_stops_after_max_results() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "common-token", "glob": "search/**", "max_results": 2}),
+    );
+    let payload = assert_ok(&out);
+    assert_eq!(
+        payload["matches"].as_array().map(|a| a.len()).unwrap_or(0),
+        2
+    );
+    assert!(payload["truncated"].as_bool().unwrap_or(false));
+    assert!(payload["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w.as_str().unwrap_or("").contains("result limit reached")));
+}
+
+
+#[test]
 fn grep_reuses_search_text_schema_and_behavior() {
     let schema = coding_tools_mcp_desktop_lib::tools::registry::input_schema("grep");
     assert_eq!(
