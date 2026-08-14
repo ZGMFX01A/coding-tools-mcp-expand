@@ -344,10 +344,11 @@ impl StdioTransport {
             map.insert(req_id, tx);
         }
 
-        self.stdin_tx
-            .send(json_str)
-            .await
-            .map_err(|e| format!("发送请求到 stdin 失败: {e}"))?;
+        if let Err(e) = self.stdin_tx.send(json_str).await {
+            let mut map = self.pending_requests.write().await;
+            map.remove(&req_id);
+            return Err(format!("发送请求到 stdin 失败: {e}"));
+        }
 
         match timeout(timeout_duration, rx).await {
             Ok(Ok(Ok(response))) => {
@@ -360,7 +361,11 @@ impl StdioTransport {
                 }
             }
             Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => Err("请求响应 channel 已关闭".to_string()),
+            Ok(Err(_)) => {
+                let mut map = self.pending_requests.write().await;
+                map.remove(&req_id);
+                Err("请求响应 channel 已关闭".to_string())
+            }
             Err(_) => {
                 let mut map = self.pending_requests.write().await;
                 map.remove(&req_id);
@@ -382,7 +387,11 @@ impl StdioTransport {
         if let Some(shutdown) = self.shutdown_tx.take() {
             let _ = shutdown.send(());
         }
-        if let Some(pid) = self.child_pid {
+        let mut map = self.pending_requests.write().await;
+        for (_, tx) in map.drain() {
+            let _ = tx.send(Err("MCP 传输通道已被终止 (kill)".to_string()));
+        }
+        if let Some(pid) = self.child_pid.take() {
             kill_process_tree(pid);
         }
     }
