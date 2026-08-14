@@ -158,11 +158,17 @@ impl ExecSession {
     }
 
     pub async fn kill_and_wait(&self) {
-        let status = {
+        let (pid, status) = {
             let mut child = self.child.lock().await;
+            let pid = child.id();
             let _ = child.start_kill();
-            child.wait().await.ok()
+            let status = child.wait().await.ok();
+            (pid, status)
         };
+        #[cfg(target_os = "windows")]
+        if let Some(pid) = pid {
+            let _ = crate::platform::platform().terminate_process_tree(pid);
+        }
         if let Some(status) = status {
             self.record_exit_status(status);
         }

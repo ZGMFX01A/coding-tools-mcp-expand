@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::tools::context::ToolContext;
-use crate::tools::session::ExecSession;
+use crate::tools::session::{ExecSession, SessionStore};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -274,7 +275,7 @@ async fn run_command(
 
     if yield_time.is_zero() {
         let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(session.clone(), deadline);
+        spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
         return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
     }
 
@@ -313,6 +314,8 @@ async fn run_command(
             session.refresh_status().await;
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
+            // Snapshot is embedded; schedule eviction so abandoned timeouts do not linger.
+            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
             return Err(WorkspaceError::ToolDetails {
                 code: "TIMEOUT",
                 message: "Command timed out.".into(),
@@ -328,14 +331,21 @@ async fn run_command(
         }
         if Instant::now() - start >= yield_time || tty {
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(session.clone(), deadline);
+            spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant) {
+/// How long a timed-out / background session stays readable before map eviction.
+const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn spawn_timeout_monitor(
+    sessions: Arc<SessionStore>,
+    session: Arc<ExecSession>,
+    deadline: Instant,
+) {
     tauri::async_runtime::spawn(async move {
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(remaining).await;
@@ -346,6 +356,15 @@ fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant
             session.refresh_status().await;
             session.wait_for_readers().await;
         }
+        // Keep the session briefly so clients can still read_output / probe status.
+        schedule_session_eviction(sessions, session.session_id.clone());
+    });
+}
+
+fn schedule_session_eviction(sessions: Arc<SessionStore>, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SESSION_EVICT_AFTER_TIMEOUT).await;
+        sessions.remove(&session_id);
     });
 }
 
