@@ -5,7 +5,9 @@
   import ActionsPolicyForm, {
     type ActionsPolicyDraft,
   } from "$lib/components/ActionsPolicyForm.svelte";
-  import AuthConfigForm from "$lib/components/AuthConfigForm.svelte";
+  import AuthConfigForm, {
+    type SaveAuthOptions,
+  } from "$lib/components/AuthConfigForm.svelte";
   import HealthPanel from "$lib/components/HealthPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
   import RuntimePolicyForm, {
@@ -439,12 +441,12 @@
     await promptServiceRestart(actionsStatus === "running", "Actions 服务");
   }
 
-  async function saveMcpAuth(auth: AuthConfig) {
+  async function saveMcpAuth(auth: AuthConfig, options?: SaveAuthOptions) {
     if (!profile || !workspaceId) return;
     const next: WorkspaceProfile = { ...profile, auth };
     await updateWorkspace(next);
     profile = next;
-    if (mcpStatus === "running") {
+    if (!options?.skipRuntimeRestart && mcpStatus === "running") {
       try { await restartRuntime(workspaceId); } catch { /* ignore */ }
     }
   }

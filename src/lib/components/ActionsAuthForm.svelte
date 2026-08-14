@@ -148,6 +148,8 @@
       loadedOauthClientSecret = oauthClientSecret;
       loadedOauthPassword = oauthPassword;
       loadedOauthTokenSecret = oauthTokenSecret;
+    } catch (error) {
+      await message(String(error), { title: "保存失败", kind: "error" });
     } finally {
       suppressSecretsReload = false;
       saving = false;

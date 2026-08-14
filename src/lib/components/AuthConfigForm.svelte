@@ -12,10 +12,14 @@
   } from "$lib/api/secrets";
   import type { AuthConfig } from "$lib/types";
 
+  export interface SaveAuthOptions {
+    skipRuntimeRestart?: boolean;
+  }
+
   interface Props {
     workspaceId: string;
     auth: AuthConfig;
-    onSaveProfile: (auth: AuthConfig) => void | Promise<void>;
+    onSaveProfile: (auth: AuthConfig, options?: SaveAuthOptions) => void | Promise<void>;
   }
 
   const AUTH_OPTIONS = [
@@ -105,15 +109,25 @@
     saving = true;
     suppressSecretsReload = true;
     try {
+      let sharedSecretChanged = false;
+      const clientId =
+        draft.type === "oauth" && draft.use_shared_secrets
+          ? draft.oauth_client_id.trim()
+          : "";
       if (draft.type === "oauth" && draft.use_shared_secrets) {
-        const clientId = draft.oauth_client_id.trim();
         if (!clientId) throw new Error("OAuth Client ID 不能为空");
+        sharedSecretChanged = clientId !== loadedSharedOauthClientId;
+      }
+      // Persist profile first so secret-triggered restart sees updated flags.
+      await onSaveProfile({ ...draft }, { skipRuntimeRestart: sharedSecretChanged });
+      if (sharedSecretChanged) {
         await setSharedSecret("oauth_client_id", clientId);
         loadedSharedOauthClientId = clientId;
       }
-      await onSaveProfile({ ...draft });
       // Auth save only persists profile fields; secrets are already stored by regenerate.
       loadedSecrets = { ...secrets };
+    } catch (error) {
+      await message(String(error), { title: "保存失败", kind: "error" });
     } finally {
       suppressSecretsReload = false;
       saving = false;

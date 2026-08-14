@@ -1,24 +1,24 @@
-use tauri::State;
-
+use std::sync::LazyLock;
 use std::time::Duration;
+use tauri::State;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::app_state::AppState;
-
 use crate::error::{AppError, AppResult};
-
+use crate::platform::platform;
 use crate::runtime::{
     await_listener_shutdown, port_busy_message, try_reclaim_previous_macos_app_port,
     wait_for_port_free, ServiceKind,
 };
-
-use crate::platform::platform;
-
 use crate::tunnel::{
     maybe_start_for_runtime, stop_for_runtime, sync_managed_runtime_routes, TunnelServiceKind,
 };
-
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
 use crate::workspace::RuntimeStatusDto;
+
+/// Serialize MCP/Actions restarts so secret-save and form-save cannot tear down
+/// the same listener concurrently (that race could abort the process on Windows).
+static RESTART_GATE: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
     state.with_workspaces(|store| {
@@ -54,12 +54,10 @@ fn persist_tunnel_url(
 
         match kind {
             TunnelServiceKind::Mcp => profile.tunnel.public_url = url.to_string(),
-
             TunnelServiceKind::Actions => profile.actions.public_url = url.to_string(),
         }
 
         store.update(profile)?;
-
         Ok(())
     })
 }
@@ -96,170 +94,173 @@ async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> 
     Ok(())
 }
 
-#[tauri::command]
+async fn stop_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
+    let profile = profile_by_id(state, id)?;
+    let port = profile.runtime.local_port;
+    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Mcp)))?;
+    await_listener_shutdown(handle, port).await;
+    state.with_runtime(|runtime| {
+        runtime.finish_stop(id, ServiceKind::Mcp);
+        Ok(runtime.mcp_status(&profile))
+    })?;
+    stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
+    sync_tunnel_routes_from_runtime(state).await?;
+    state.with_runtime(|runtime| Ok(runtime.mcp_status(&profile)))
+}
 
-pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Mcp)?;
-    let profile = profile_by_id(&state, &id)?;
-
+async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, WorkspaceService::Mcp)?;
+    let profile = profile_by_id(state, id)?;
     ensure_port_available(profile.runtime.local_port, "本地 MCP").await?;
-
     state.with_runtime(|runtime| runtime.start_mcp(&profile))?;
-    sync_tunnel_routes_from_runtime(&state).await?;
+    sync_tunnel_routes_from_runtime(state).await?;
 
     match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
         Ok(Some(url)) => {
-            persist_tunnel_url(&state, &id, TunnelServiceKind::Mcp, &url)?;
+            persist_tunnel_url(state, id, TunnelServiceKind::Mcp, &url)?;
         }
-
         Ok(None) => {}
-
         Err(error) => {
             eprintln!("mcp tunnel auto-start failed for {id}: {error}");
         }
     }
 
-    let profile = profile_by_id(&state, &id)?;
-
+    let profile = profile_by_id(state, id)?;
     tokio::time::sleep(Duration::from_millis(250)).await;
-
     state.with_runtime(|runtime| {
         runtime.refresh_mcp(&profile);
-
         Ok(runtime.mcp_status(&profile))
     })
 }
 
-#[tauri::command]
-
-pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-
-    let port = profile.runtime.local_port;
-
-    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(&id, ServiceKind::Mcp)))?;
-
+async fn stop_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
+    let profile = profile_by_id(state, id)?;
+    let port = profile.actions.local_port;
+    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Actions)))?;
     await_listener_shutdown(handle, port).await;
-
     state.with_runtime(|runtime| {
-        runtime.finish_stop(&id, ServiceKind::Mcp);
-
-        Ok(runtime.mcp_status(&profile))
+        runtime.finish_stop(id, ServiceKind::Actions);
+        Ok(runtime.actions_status(&profile))
     })?;
-    stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| Ok(runtime.mcp_status(&profile)))
+    stop_for_runtime(&profile, TunnelServiceKind::Actions).await?;
+    sync_tunnel_routes_from_runtime(state).await?;
+    state.with_runtime(|runtime| Ok(runtime.actions_status(&profile)))
 }
 
-#[tauri::command]
-
-pub fn get_runtime_status(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| {
-        runtime.refresh_mcp(&profile);
-
-        Ok(runtime.mcp_status(&profile))
-    })
-}
-
-#[tauri::command]
-
-pub async fn start_actions_runtime(
-    state: State<'_, AppState>,
-
-    id: String,
-) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Actions)?;
-    let profile = profile_by_id(&state, &id)?;
-
+async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, WorkspaceService::Actions)?;
+    let profile = profile_by_id(state, id)?;
     ensure_port_available(profile.actions.local_port, "本地 Actions").await?;
-
     state.with_runtime(|runtime| runtime.start_actions(&profile))?;
-    sync_tunnel_routes_from_runtime(&state).await?;
+    sync_tunnel_routes_from_runtime(state).await?;
 
     match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions).await {
         Ok(Some(url)) => {
-            persist_tunnel_url(&state, &id, TunnelServiceKind::Actions, &url)?;
+            persist_tunnel_url(state, id, TunnelServiceKind::Actions, &url)?;
         }
-
         Ok(None) => {}
-
         Err(error) => {
             eprintln!("actions tunnel auto-start failed for {id}: {error}");
         }
     }
 
-    let profile = profile_by_id(&state, &id)?;
-
+    let profile = profile_by_id(state, id)?;
     tokio::time::sleep(Duration::from_millis(250)).await;
-
     state.with_runtime(|runtime| {
         runtime.refresh_actions(&profile);
-
         Ok(runtime.actions_status(&profile))
     })
 }
 
-#[tauri::command]
+/// Async stop→start for MCP. Used by the Tauri command and secret-change hooks.
+pub(crate) async fn restart_mcp_by_id(
+    state: &AppState,
+    id: &str,
+) -> AppResult<RuntimeStatusDto> {
+    let _guard = RESTART_GATE.lock().await;
+    let was_running = state.with_runtime(|runtime| {
+        Ok(runtime.is_running(id, ServiceKind::Mcp))
+    })?;
+    if was_running {
+        let _ = stop_mcp_service(state, id).await?;
+    }
+    start_mcp_service(state, id).await
+}
 
+/// Async stop→start for Actions. Used by the Tauri command and secret-change hooks.
+pub(crate) async fn restart_actions_by_id(
+    state: &AppState,
+    id: &str,
+) -> AppResult<RuntimeStatusDto> {
+    let _guard = RESTART_GATE.lock().await;
+    let was_running = state.with_runtime(|runtime| {
+        Ok(runtime.is_running(id, ServiceKind::Actions))
+    })?;
+    if was_running {
+        let _ = stop_actions_service(state, id).await?;
+    }
+    start_actions_service(state, id).await
+}
+
+#[tauri::command]
+pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+    start_mcp_service(&state, &id).await
+}
+
+#[tauri::command]
+pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+    stop_mcp_service(&state, &id).await
+}
+
+#[tauri::command]
+pub fn get_runtime_status(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+    let profile = profile_by_id(&state, &id)?;
+    state.with_runtime(|runtime| {
+        runtime.refresh_mcp(&profile);
+        Ok(runtime.mcp_status(&profile))
+    })
+}
+
+#[tauri::command]
+pub async fn start_actions_runtime(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RuntimeStatusDto> {
+    start_actions_service(&state, &id).await
+}
+
+#[tauri::command]
 pub async fn stop_actions_runtime(
     state: State<'_, AppState>,
-
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-
-    let port = profile.actions.local_port;
-
-    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(&id, ServiceKind::Actions)))?;
-
-    await_listener_shutdown(handle, port).await;
-
-    state.with_runtime(|runtime| {
-        runtime.finish_stop(&id, ServiceKind::Actions);
-
-        Ok(runtime.actions_status(&profile))
-    })?;
-    stop_for_runtime(&profile, TunnelServiceKind::Actions).await?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| Ok(runtime.actions_status(&profile)))
+    stop_actions_service(&state, &id).await
 }
 
 #[tauri::command]
-
 pub fn get_actions_runtime_status(
     state: State<'_, AppState>,
-
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(&state, &id)?;
-
     state.with_runtime(|runtime| {
         runtime.refresh_actions(&profile);
-
         Ok(runtime.actions_status(&profile))
     })
 }
 
 #[tauri::command]
-
-pub fn restart_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Mcp)?;
-    let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| runtime.restart_mcp(&profile))
+pub async fn restart_runtime(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RuntimeStatusDto> {
+    restart_mcp_by_id(&state, &id).await
 }
 
 #[tauri::command]
-
-pub fn restart_actions_runtime(
+pub async fn restart_actions_runtime(
     state: State<'_, AppState>,
-
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Actions)?;
-    let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| runtime.restart_actions(&profile))
+    restart_actions_by_id(&state, &id).await
 }
