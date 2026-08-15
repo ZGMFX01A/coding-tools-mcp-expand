@@ -847,7 +847,7 @@ mod tests {
         #[cfg(windows)]
         let cmd = "cmd /c echo SECRET=%CODING_TOOLS_TEST_SECRET%";
         #[cfg(not(windows))]
-        let cmd = "sh -c 'echo SECRET=$CODING_TOOLS_TEST_SECRET'";
+        let cmd = r#"python3 -c "import os; print('SECRET=' + os.environ.get('CODING_TOOLS_TEST_SECRET', ''))""#;
 
         let output = call_tool(&ctx, "exec_command", &json!({ "cmd": cmd, "timeout_ms": 10_000, "yield_time_ms": 10_000 }));
         assert_eq!(output["command_ok"], true, "{output}");

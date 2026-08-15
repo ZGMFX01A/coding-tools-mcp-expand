@@ -639,12 +639,23 @@ mod tests {
         assert_eq!(buf.len(), 100);
     }
 
+    fn spawn_dummy_child() -> tokio::process::Child {
+        #[cfg(windows)]
+        let mut cmd = tokio::process::Command::new("cmd");
+        #[cfg(windows)]
+        cmd.args(["/c", "exit 0"]);
+
+        #[cfg(not(windows))]
+        let mut cmd = tokio::process::Command::new("sh");
+        #[cfg(not(windows))]
+        cmd.args(["-c", "exit 0"]);
+
+        cmd.spawn().expect("dummy child")
+    }
+
     #[tokio::test]
     async fn single_stream_retained_bytes_within_budget() {
-        let dummy = tokio::process::Command::new("cmd")
-            .args(["/c", "exit 0"])
-            .spawn()
-            .expect("dummy child");
+        let dummy = spawn_dummy_child();
         let session = ExecSession::new(dummy);
 
         // 模拟写入 3MB 的 stdout 数据流
@@ -665,10 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn dual_streams_within_total_budget() {
-        let dummy = tokio::process::Command::new("cmd")
-            .args(["/c", "exit 0"])
-            .spawn()
-            .expect("dummy child");
+        let dummy = spawn_dummy_child();
         let session = ExecSession::new(dummy);
 
         let chunk = vec![b'B'; 4096];
