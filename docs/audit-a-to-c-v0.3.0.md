@@ -17,5 +17,5 @@
 | **9. 分页与延续 (Pagination)** | `processes.py` / `textutils.py`: `cursor`, `offset`, `limit`, `has_more` | `file.rs` / `git.rs` / `session.rs`: 统一提供 `has_more`, `next_start_line`/`next_skip`/`next_offset`, `continuation` | **已对齐 (A4)** | 完成核心工具机器可读延续字段补充 |
 | **10. 错误恢复契约** | `errors.py`: `ToolFailure` (code, message, category, retryable, details, recovery_hint) | `workspace.rs`: 统一 `WorkspaceError` 输出 `code`, `message`, `category`, `retryable`, `details`, `recovery_hint` | **已对齐 (A5)** | 完成标准错误恢复契约与分类，外部 MCP 响应原样透传 |
 | **11. Permission 权限模式** | safe / trusted / dangerous，控制命令与网络门禁，tools/list 始终完整暴露 | `policy.rs` + `dispatch.rs`: safe (拦截网络命令)、trusted (本地开发)、dangerous (放宽门禁，保留绝对工作区硬边界)；tools/list 不受权限模式隐藏 | **已对齐 (A6)** | 统一 permission 拒绝错误格式与 recovery_hint，保持 External MCP allowedTools 独立与实时切换能力 |
-| **12. MCP 协议多版本** | `protocol.py`: 2025-11-25 / 2025-06-18 / 2026-07-28 | `server.rs`: 2024-11-05 / 2025-06-18 | **待后续处理** | 留待后续 Phase A7 处理（本轮未执行） |
+| **12. MCP 协议多版本** | `protocol.py`: 2025-11-25 / 2025-06-18 / 2026-07-28 | `protocol.rs` + `server.rs`: 支持 2024-11-05 / 2025-06-18 / 2025-11-25 (Legacy 协商) + 2026-07-28 (Modern Discover / _meta 路由) | **已对齐 (A7)** | 完成多版本协商、server/discover 与 Modern Era 协议扩展，保持旧客户端兼容 |
 
