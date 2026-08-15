@@ -332,17 +332,26 @@ fn parse_diff_path(raw: &str) -> String {
     path.replace('\\', "/")
 }
 
+fn strip_bom(text: &str) -> (bool, &str) {
+    if let Some(stripped) = text.strip_prefix('\u{feff}') {
+        (true, stripped)
+    } else {
+        (false, text)
+    }
+}
+
 fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError> {
-    let line_ending = if original.contains("\r\n") {
+    let (has_bom, text_without_bom) = strip_bom(original);
+    let line_ending = if text_without_bom.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
-    let had_trailing_newline = original.ends_with('\n');
-    let mut lines: Vec<String> = if original.is_empty() {
+    let had_trailing_newline = text_without_bom.ends_with('\n');
+    let mut lines: Vec<String> = if text_without_bom.is_empty() {
         Vec::new()
     } else {
-        original
+        text_without_bom
             .split_terminator('\n')
             .map(|line| line.trim_end_matches('\r').to_string())
             .collect()
@@ -350,7 +359,6 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
     let mut offset: i64 = 0;
 
     for hunk in hunks {
-        let search_at = 0usize;
         let hunk_old: Vec<String> = hunk
             .lines
             .iter()
@@ -360,9 +368,36 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
             })
             .collect();
 
-        let pos = find_hunk_position(&lines, &hunk_old, search_at)
-            .ok_or_else(|| patch_failed("Hunk context did not match file content."))?;
+        let matches = find_all_hunk_positions(&lines, &hunk_old);
+        if matches.is_empty() {
+            return Err(WorkspaceError::ToolDetails {
+                code: "PATCH_CONTEXT_NOT_FOUND",
+                message: "Hunk context did not match file content.".into(),
+                category: "validation",
+                retryable: true,
+                details: json!({
+                    "match_count": 0,
+                    "retry_hint": "Read the current file and regenerate this hunk with current context."
+                }),
+            });
+        }
+        if matches.len() > 1 {
+            return Err(WorkspaceError::ToolDetails {
+                code: "PATCH_CONTEXT_AMBIGUOUS",
+                message: format!(
+                    "Patch context matched {} locations; add more context.",
+                    matches.len()
+                ),
+                category: "validation",
+                retryable: true,
+                details: json!({
+                    "match_count": matches.len(),
+                    "retry_hint": "Include additional unchanged context lines to make this hunk unique."
+                }),
+            });
+        }
 
+        let pos = matches[0];
         let mut idx = pos;
         for hl in &hunk.lines {
             match hl {
@@ -382,29 +417,29 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
         let _ = offset;
     }
     let mut output = lines.join(line_ending);
-    if !output.is_empty() && (had_trailing_newline || original.is_empty()) {
+    if !output.is_empty() && (had_trailing_newline || text_without_bom.is_empty()) {
         output.push_str(line_ending);
+    }
+    if has_bom {
+        output.insert(0, '\u{feff}');
     }
     Ok(output)
 }
 
-fn find_hunk_position(lines: &[String], pattern: &[String], start: usize) -> Option<usize> {
+fn find_all_hunk_positions(lines: &[String], pattern: &[String]) -> Vec<usize> {
     if pattern.is_empty() {
-        return Some(start);
+        return vec![0];
     }
-    if start > lines.len() || pattern.len() > lines.len().saturating_sub(start) {
-        return None;
+    if pattern.len() > lines.len() {
+        return vec![];
     }
-    for i in start..=lines.len().saturating_sub(pattern.len()) {
-        if lines[i..i + pattern.len()]
-            .iter()
-            .zip(pattern.iter())
-            .all(|(a, b)| a == b)
-        {
-            return Some(i);
+    let mut matches = Vec::new();
+    for i in 0..=lines.len() - pattern.len() {
+        if lines[i..i + pattern.len()] == *pattern {
+            matches.push(i);
         }
     }
-    None
+    matches
 }
 
 fn commit_staged(
@@ -663,4 +698,56 @@ mod tests {
             "old\n"
         );
     }
+
+    #[test]
+    fn preserves_utf8_bom() {
+        let input = "\u{feff}header\nbody\n";
+        let hunk = Hunk {
+            lines: vec![
+                HunkLine::Context("header".into()),
+                HunkLine::Remove("body".into()),
+                HunkLine::Add("updated_body".into()),
+            ],
+        };
+        let output = apply_hunks(input, &[hunk]).expect("patch with bom");
+        assert!(output.starts_with('\u{feff}'), "BOM must be preserved");
+        assert_eq!(output, "\u{feff}header\nupdated_body\n");
+    }
+
+    #[test]
+    fn multi_file_patch_success() {
+        let (workspace, _harness, context) = context_with_file();
+        std::fs::write(workspace.path().join("second.rs"), "alpha\n").expect("second");
+        let result = apply_patch(
+            &context,
+            &json!({
+                "patch": "--- a/main.rs\n+++ b/main.rs\n@@\n-old\n+new\n--- a/second.rs\n+++ b/second.rs\n@@\n-alpha\n+beta\n"
+            }),
+        )
+        .expect("multi file patch");
+        assert_eq!(result["clean"], true);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("second.rs")).unwrap(),
+            "beta\n"
+        );
+    }
+
+    #[test]
+    fn ambiguous_context_returns_error() {
+        let input = "duplicate\nmiddle\nduplicate\n";
+        let hunk = Hunk {
+            lines: vec![
+                HunkLine::Context("duplicate".into()),
+                HunkLine::Add("inserted".into()),
+            ],
+        };
+        let err = apply_hunks(input, &[hunk]).expect_err("should fail ambiguous");
+        let val = err.to_error_value();
+        assert_eq!(val["code"], "PATCH_CONTEXT_AMBIGUOUS");
+    }
 }
+
