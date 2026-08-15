@@ -74,6 +74,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(AppState::new().expect("failed to load app state"));
+            // Recover FRP clients that stay alive while the public proxy dies
+            // (common after install/restart network blips).
+            tunnel::ensure_frp_health_loop();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use std::collections::HashSet;
 
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 use crate::data::DataStore;
 use crate::error::AppResult;
@@ -15,8 +18,26 @@ use super::{TunnelServiceKind, TunnelSupervisor};
 static TUNNEL_SUPERVISOR: LazyLock<Mutex<TunnelSupervisor>> =
     LazyLock::new(|| Mutex::new(TunnelSupervisor::new()));
 
+static FRP_HEALTH_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+const FRP_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+
 pub fn supervisor() -> &'static Mutex<TunnelSupervisor> {
     &TUNNEL_SUPERVISOR
+}
+
+/// Start a background loop that restarts stuck FRP clients (process alive, proxy dead).
+pub fn ensure_frp_health_loop() {
+    if FRP_HEALTH_LOOP_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        loop {
+            sleep(FRP_HEALTH_INTERVAL).await;
+            let settings = AppSettings::load_or_default();
+            let mut guard = supervisor().lock().await;
+            let _ = guard.heal_unhealthy_frpc(&settings).await;
+        }
+    });
 }
 
 fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
