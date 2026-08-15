@@ -190,9 +190,29 @@ impl StdioTransport {
             ),
         );
 
-        let mut cmd = tokio::process::Command::new(&resolved_command);
-        cmd.args(&args)
-            .current_dir(&workspace_path)
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let lower = resolved_command.to_lowercase();
+            let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
+            if is_batch {
+                let mut c = tokio::process::Command::new("cmd.exe");
+                c.arg("/d").arg("/c").arg(&resolved_command);
+                c.args(&args);
+                c
+            } else {
+                let mut c = tokio::process::Command::new(&resolved_command);
+                c.args(&args);
+                c
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new(&resolved_command);
+            c.args(&args);
+            c
+        };
+
+        cmd.current_dir(&workspace_path)
             .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
