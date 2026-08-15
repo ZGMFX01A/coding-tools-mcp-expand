@@ -11,9 +11,10 @@ use uuid::Uuid;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
-const SESSION_BUFFER_BYTES: usize = 1_048_576;
+const SESSION_STREAM_TOTAL_BUDGET_BYTES: usize = 1_048_576;
 const SESSION_HEAD_DIVISOR: usize = 8;
-const SESSION_HEAD_BUFFER_BYTES: usize = SESSION_BUFFER_BYTES / SESSION_HEAD_DIVISOR;
+const SESSION_HEAD_BUFFER_BYTES: usize = SESSION_STREAM_TOTAL_BUDGET_BYTES / SESSION_HEAD_DIVISOR;
+const SESSION_TAIL_BUFFER_BYTES: usize = SESSION_STREAM_TOTAL_BUDGET_BYTES - SESSION_HEAD_BUFFER_BYTES;
 
 #[derive(Default)]
 pub struct SessionStore {
@@ -161,7 +162,7 @@ impl ExecSession {
                         let mut data = self.stdout.lock().expect("stdout lock");
                         data.extend_from_slice(chunk);
                         *self.stdout_total.lock().expect("stdout_total lock") += n;
-                        let dropped = trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        let dropped = trim_buffer(&mut data, SESSION_TAIL_BUFFER_BYTES);
                         if dropped > 0 {
                             *self.stdout_dropped_bytes.lock().expect("stdout_dropped lock") += dropped;
                         }
@@ -176,7 +177,7 @@ impl ExecSession {
                         let mut data = self.stderr.lock().expect("stderr lock");
                         data.extend_from_slice(chunk);
                         *self.stderr_total.lock().expect("stderr_total lock") += n;
-                        let dropped = trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        let dropped = trim_buffer(&mut data, SESSION_TAIL_BUFFER_BYTES);
                         if dropped > 0 {
                             *self.stderr_dropped_bytes.lock().expect("stderr_dropped lock") += dropped;
                         }
@@ -625,5 +626,53 @@ mod tests {
         assert_eq!(dropped, 50);
         assert_eq!(buf.len(), 100);
     }
+
+    #[tokio::test]
+    async fn single_stream_retained_bytes_within_budget() {
+        let dummy = tokio::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("dummy child");
+        let session = ExecSession::new(dummy);
+
+        // 模拟写入 3MB 的 stdout 数据流
+        let chunk = vec![b'A'; 4096];
+        for _ in 0..768 {
+            session.read_stream(&chunk[..], true).await;
+        }
+
+        let head_len = session.stdout_head.lock().unwrap().len();
+        let tail_len = session.stdout.lock().unwrap().len();
+        let total_retained = head_len + tail_len;
+
+        assert_eq!(head_len, SESSION_HEAD_BUFFER_BYTES);
+        assert_eq!(tail_len, SESSION_TAIL_BUFFER_BYTES);
+        assert_eq!(total_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES);
+        assert!(total_retained <= SESSION_STREAM_TOTAL_BUDGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn dual_streams_within_total_budget() {
+        let dummy = tokio::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("dummy child");
+        let session = ExecSession::new(dummy);
+
+        let chunk = vec![b'B'; 4096];
+        for _ in 0..768 {
+            session.read_stream(&chunk[..], true).await;
+            session.read_stream(&chunk[..], false).await;
+        }
+
+        let stdout_retained = session.stdout_head.lock().unwrap().len() + session.stdout.lock().unwrap().len();
+        let stderr_retained = session.stderr_head.lock().unwrap().len() + session.stderr.lock().unwrap().len();
+        let total_process_retained = stdout_retained + stderr_retained;
+
+        assert_eq!(stdout_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES);
+        assert_eq!(stderr_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES);
+        assert_eq!(total_process_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES * 2);
+    }
 }
+
 
