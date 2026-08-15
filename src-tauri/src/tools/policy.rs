@@ -269,34 +269,36 @@ pub fn validate_command_for_workspace(
         && !policy.network_allowed()
     {
         return Err(PolicyError(
-            "Network-looking commands are blocked in safe permission mode".into(),
+            "PERMISSION_DENIED: Network-looking commands are blocked in safe permission mode. Switch to trusted mode to enable network access.".into(),
         ));
     }
 
-    let parts =
-        shell_words::split(command).map_err(|_| PolicyError("Invalid command syntax".into()))?;
-    if parts.is_empty() {
-        return Err(PolicyError("Empty command".into()));
-    }
+    if !policy.skip_permission_gates() {
+        let parts =
+            shell_words::split(command).map_err(|_| PolicyError("Invalid command syntax".into()))?;
+        if parts.is_empty() {
+            return Err(PolicyError("Empty command".into()));
+        }
 
-    let executable = parts[0].trim_start_matches("./");
-    let base_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
-    let stem = base_name
-        .strip_suffix(".exe")
-        .or_else(|| base_name.strip_suffix(".cmd"))
-        .or_else(|| base_name.strip_suffix(".bat"))
-        .unwrap_or(base_name);
+        let executable = parts[0].trim_start_matches("./");
+        let base_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+        let stem = base_name
+            .strip_suffix(".exe")
+            .or_else(|| base_name.strip_suffix(".cmd"))
+            .or_else(|| base_name.strip_suffix(".bat"))
+            .unwrap_or(base_name);
 
-    let workspace_entry_candidate = workspace_local_entry_exists(workspace, arguments, executable)
-        || executable.contains(['/', '\\'])
-        || policy
-            .workspace_script_extensions
-            .iter()
-            .any(|extension| base_name.to_ascii_lowercase().ends_with(extension));
-    if !(policy.allowed_commands.contains(stem)
-        || (policy.workspace_local_entries && workspace_entry_candidate))
-    {
-        return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
+        let workspace_entry_candidate = workspace_local_entry_exists(workspace, arguments, executable)
+            || executable.contains(['/', '\\'])
+            || policy
+                .workspace_script_extensions
+                .iter()
+                .any(|extension| base_name.to_ascii_lowercase().ends_with(extension));
+        if !(policy.allowed_commands.contains(stem)
+            || (policy.workspace_local_entries && workspace_entry_candidate))
+        {
+            return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
+        }
     }
 
     if arguments.get("env").is_some() {

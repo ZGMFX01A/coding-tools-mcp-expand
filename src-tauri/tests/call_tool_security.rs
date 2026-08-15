@@ -382,3 +382,88 @@ fn safe_permission_mode_blocks_network_looking_command() {
     .expect_err("network command should be blocked in safe mode");
     assert!(err.0.contains("Network-looking"));
 }
+
+#[test]
+fn permission_mode_safe_trusted_dangerous_matrix() {
+    let fx = tiny_js_fixture();
+
+    // --- 1. SAFE 模式 ---
+    let mut safe_ctx = ctx_for(&fx.root);
+    safe_ctx.permission_mode = "safe".into();
+    safe_ctx.policy.permission_mode = "safe".into();
+
+    // 只读工具在 safe 模式下全部允许
+    assert_ok(&invoke(&safe_ctx, "read_file", json!({"path": "src/math.js"})));
+    assert_ok(&invoke(&safe_ctx, "search_text", json!({"query": "math"})));
+    assert_ok(&invoke(&safe_ctx, "git_status", json!({})));
+
+    // 网络命令在 safe 模式下被拒绝，并返回统一的 Error Contract
+    let net_err = invoke(
+        &safe_ctx,
+        "exec_command",
+        json!({"cmd": "curl https://example.com"}),
+    );
+    assert_eq!(net_err["ok"], false);
+    assert_eq!(net_err["error"]["code"], "PERMISSION_DENIED");
+    assert_eq!(net_err["error"]["category"], "permission");
+    assert_eq!(net_err["error"]["retryable"], false);
+    assert!(net_err["error"]["recovery_hint"]
+        .as_str()
+        .unwrap()
+        .contains("trusted"));
+
+    // --- 2. TRUSTED 模式 ---
+    let mut trusted_ctx = ctx_for(&fx.root);
+    trusted_ctx.permission_mode = "trusted".into();
+    trusted_ctx.policy.permission_mode = "trusted".into();
+
+    // apply_patch 在 trusted 模式下允许
+    let patch_out = invoke(
+        &trusted_ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Add File: src/new_file.js\n+console.log('new');\n*** End Patch\n"
+        }),
+    );
+    assert_ok(&patch_out);
+    assert!(fx.root.join("src/new_file.js").exists());
+
+    // 针对 .git 的破坏性操作在 trusted 模式下依然被硬安全边界拦截
+    let git_del = invoke(
+        &trusted_ctx,
+        "exec_command",
+        json!({"cmd": "rm -rf .git"}),
+    );
+    assert_eq!(git_del["ok"], false);
+    assert_eq!(git_del["error"]["code"], "PROTECTED_REPOSITORY_ASSET");
+
+    // --- 3. DANGEROUS 模式 ---
+    let mut dangerous_ctx = ctx_for(&fx.root);
+    dangerous_ctx.permission_mode = "dangerous".into();
+    dangerous_ctx.policy.permission_mode = "dangerous".into();
+
+    // 放宽命令白名单与权限门禁
+    assert!(dangerous_ctx.policy.skip_permission_gates());
+
+    // 硬安全边界：禁止 path traversal 越界写文件，即使在 dangerous 模式依然坚不可摧
+    let traversal_out = invoke(
+        &dangerous_ctx,
+        "apply_patch",
+        json!({"patch": TRAVERSAL_PATCH}),
+    );
+    assert_eq!(traversal_out["ok"], false);
+    assert_eq!(traversal_out["error"]["code"], "PATH_OUTSIDE_WORKSPACE");
+}
+
+#[test]
+fn tools_list_invariant_across_permission_modes() {
+    use coding_tools_mcp_desktop_lib::tools::list_tools_for_profile;
+
+    // tools/list 列表由 profile 决定，不因 safe/trusted/dangerous 权限模式而隐藏工具
+    let tools = list_tools_for_profile("core");
+    assert!(tools.iter().any(|t| t["name"] == "read_file"));
+    assert!(tools.iter().any(|t| t["name"] == "apply_patch"));
+    assert!(tools.iter().any(|t| t["name"] == "exec_command"));
+    assert!(tools.iter().any(|t| t["name"] == "history_session_read"));
+}
+
