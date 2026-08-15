@@ -113,26 +113,61 @@ impl WorkspaceError {
                 message,
                 category,
                 retryable,
-            } => json!({
-                "code": code,
-                "message": message,
-                "category": category,
-                "retryable": retryable,
-                "details": {}
-            }),
+            } => {
+                let recovery_hint = Self::default_recovery_hint(code);
+                let mut err = json!({
+                    "code": code,
+                    "message": message,
+                    "category": category,
+                    "retryable": retryable,
+                    "details": {}
+                });
+                if let Some(hint) = recovery_hint {
+                    err["recovery_hint"] = json!(hint);
+                }
+                err
+            }
             Self::ToolDetails {
                 code,
                 message,
                 category,
                 retryable,
                 details,
-            } => json!({
-                "code": code,
-                "message": message,
-                "category": category,
-                "retryable": retryable,
-                "details": details
-            }),
+            } => {
+                let recovery_hint = details
+                    .get("retry_hint")
+                    .or_else(|| details.get("recovery_hint"))
+                    .or_else(|| details.get("suggestion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Self::default_recovery_hint(code).map(str::to_string));
+                let mut err = json!({
+                    "code": code,
+                    "message": message,
+                    "category": category,
+                    "retryable": retryable,
+                    "details": details
+                });
+                if let Some(hint) = recovery_hint {
+                    err["recovery_hint"] = json!(hint);
+                }
+                err
+            }
+        }
+    }
+
+    fn default_recovery_hint(code: &str) -> Option<&'static str> {
+        match code {
+            "NOT_FOUND" => Some("Use list_files to locate the file in workspace."),
+            "IS_DIRECTORY" => Some("Specify a file path instead of a directory."),
+            "NOT_A_DIRECTORY" => Some("Specify a valid directory path."),
+            "BINARY_FILE" => Some("Binary files cannot be read with text tools; use view_image if it is an image."),
+            "UNSUPPORTED_ENCODING" => Some("File must be valid UTF-8 text."),
+            "ABSOLUTE_PATH_DENIED" | "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE" => Some("Keep target path within the configured workspace root."),
+            "PATCH_CONTEXT_NOT_FOUND" => Some("Read the current file and regenerate patch with fresh context lines."),
+            "PATCH_CONTEXT_AMBIGUOUS" => Some("Include additional unchanged surrounding lines to make the hunk unique."),
+            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION" => Some("Set confirm=true to proceed with dangerous operations."),
+            _ => None,
         }
     }
 }

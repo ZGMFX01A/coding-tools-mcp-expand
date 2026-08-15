@@ -546,3 +546,28 @@ fn structured_content_and_continuation_contract() {
     assert_eq!(search_payload["continuation"]["tool"], "search_text");
 }
 
+#[test]
+fn error_contract_and_recovery_hints() {
+    use coding_tools_mcp_desktop_lib::tools::wrap_mcp_tool_result;
+
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    // 1. not found error
+    let out = invoke(&ctx, "read_file", json!({"path": "missing.txt"}));
+    let err = assert_err(&out);
+    assert_eq!(err["error"]["code"], "NOT_FOUND");
+    assert_eq!(err["error"]["category"], "not_found");
+    assert_eq!(err["error"]["retryable"], false);
+    assert!(err["error"]["recovery_hint"].as_str().unwrap().contains("list_files"));
+
+    let wrapped = wrap_mcp_tool_result("read_file", &json!({"path": "missing.txt"}), err.clone());
+    assert_eq!(wrapped["isError"], true);
+    let text = wrapped["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("NOT_FOUND"));
+    assert!(text.contains("Category: not_found."));
+    assert!(text.contains("Retryable: no."));
+    assert!(text.contains("Retry: Use list_files to locate the file"));
+}
+
+
