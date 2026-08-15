@@ -12,6 +12,8 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
+const SESSION_HEAD_DIVISOR: usize = 8;
+const SESSION_HEAD_BUFFER_BYTES: usize = SESSION_BUFFER_BYTES / SESSION_HEAD_DIVISOR;
 
 #[derive(Default)]
 pub struct SessionStore {
@@ -62,8 +64,12 @@ pub struct ExecSession {
     interactive: bool,
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
+    stdout_head: Mutex<Vec<u8>>,
+    stderr_head: Mutex<Vec<u8>>,
     stdout_total: Mutex<usize>,
     stderr_total: Mutex<usize>,
+    stdout_dropped_bytes: Mutex<usize>,
+    stderr_dropped_bytes: Mutex<usize>,
     pub started_at: Instant,
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
@@ -88,8 +94,12 @@ impl ExecSession {
             interactive,
             stdout: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
+            stdout_head: Mutex::new(Vec::new()),
+            stderr_head: Mutex::new(Vec::new()),
             stdout_total: Mutex::new(0),
             stderr_total: Mutex::new(0),
+            stdout_dropped_bytes: Mutex::new(0),
+            stderr_dropped_bytes: Mutex::new(0),
             started_at: Instant::now(),
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
@@ -141,15 +151,35 @@ impl ExecSession {
                 Ok(n) => {
                     let chunk = &buf[..n];
                     if is_stdout {
+                        {
+                            let mut head = self.stdout_head.lock().expect("stdout_head lock");
+                            let head_cap = SESSION_HEAD_BUFFER_BYTES.saturating_sub(head.len());
+                            if head_cap > 0 {
+                                head.extend_from_slice(&chunk[..head_cap.min(chunk.len())]);
+                            }
+                        }
                         let mut data = self.stdout.lock().expect("stdout lock");
                         data.extend_from_slice(chunk);
                         *self.stdout_total.lock().expect("stdout_total lock") += n;
-                        trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        let dropped = trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        if dropped > 0 {
+                            *self.stdout_dropped_bytes.lock().expect("stdout_dropped lock") += dropped;
+                        }
                     } else {
+                        {
+                            let mut head = self.stderr_head.lock().expect("stderr_head lock");
+                            let head_cap = SESSION_HEAD_BUFFER_BYTES.saturating_sub(head.len());
+                            if head_cap > 0 {
+                                head.extend_from_slice(&chunk[..head_cap.min(chunk.len())]);
+                            }
+                        }
                         let mut data = self.stderr.lock().expect("stderr lock");
                         data.extend_from_slice(chunk);
                         *self.stderr_total.lock().expect("stderr_total lock") += n;
-                        trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        let dropped = trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        if dropped > 0 {
+                            *self.stderr_dropped_bytes.lock().expect("stderr_dropped lock") += dropped;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -224,10 +254,17 @@ impl ExecSession {
     }
 
     pub fn snapshot(&self, max_output_bytes: usize) -> Value {
-        let stdout_bytes = self.stdout.lock().expect("stdout lock").clone();
-        let stderr_bytes = self.stderr.lock().expect("stderr lock").clone();
-        let stdout = truncate_tail(&stdout_bytes, max_output_bytes);
-        let stderr = truncate_tail(&stderr_bytes, max_output_bytes);
+        let stdout_tail = self.stdout.lock().expect("stdout lock").clone();
+        let stderr_tail = self.stderr.lock().expect("stderr lock").clone();
+        let stdout_head = self.stdout_head.lock().expect("stdout_head lock").clone();
+        let stderr_head = self.stderr_head.lock().expect("stderr_head lock").clone();
+        let stdout_total = *self.stdout_total.lock().expect("stdout_total lock");
+        let stderr_total = *self.stderr_total.lock().expect("stderr_total lock");
+        let stdout_dropped = *self.stdout_dropped_bytes.lock().expect("stdout_dropped lock");
+        let stderr_dropped = *self.stderr_dropped_bytes.lock().expect("stderr_dropped lock");
+
+        let stdout = truncate_head_tail(&stdout_head, &stdout_tail, stdout_total, stdout_dropped, max_output_bytes);
+        let stderr = truncate_head_tail(&stderr_head, &stderr_tail, stderr_total, stderr_dropped, max_output_bytes);
         let exit_code = *self.exit_code.lock().expect("exit_code lock");
         let termination_reason = self
             .termination_reason
@@ -266,6 +303,10 @@ impl ExecSession {
             "stderr": stderr.content,
             "stdout_truncated": stdout.truncated,
             "stderr_truncated": stderr.truncated,
+            "stdout_dropped_bytes": stdout_dropped,
+            "stderr_dropped_bytes": stderr_dropped,
+            "stdout_total_bytes": stdout_total,
+            "stderr_total_bytes": stderr_total,
             "elapsed_ms": self.started_at.elapsed().as_millis(),
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
@@ -275,10 +316,13 @@ impl ExecSession {
     }
 }
 
-fn trim_buffer(buf: &mut Vec<u8>, limit: usize) {
+fn trim_buffer(buf: &mut Vec<u8>, limit: usize) -> usize {
     if buf.len() > limit {
         let drop = buf.len() - limit;
         buf.drain(..drop);
+        drop
+    } else {
+        0
     }
 }
 
@@ -287,12 +331,53 @@ struct Truncated {
     truncated: bool,
 }
 
-fn truncate_tail(bytes: &[u8], max_bytes: usize) -> Truncated {
-    let truncated = bytes.len() > max_bytes;
-    let take = bytes.len().min(max_bytes);
+fn truncate_head_tail(
+    head: &[u8],
+    tail: &[u8],
+    total_bytes: usize,
+    dropped_bytes: usize,
+    max_bytes: usize,
+) -> Truncated {
+    if total_bytes <= max_bytes && dropped_bytes == 0 {
+        return Truncated {
+            content: String::from_utf8_lossy(tail).into_owned(),
+            truncated: false,
+        };
+    }
+
+    if max_bytes == 0 {
+        return Truncated {
+            content: String::new(),
+            truncated: total_bytes > 0,
+        };
+    }
+
+    let head_budget = (max_bytes / SESSION_HEAD_DIVISOR).max(1).min(head.len());
+    let remaining_budget = max_bytes.saturating_sub(head_budget);
+    let tail_take = remaining_budget.min(tail.len());
+
+    if head_budget == 0 || head.is_empty() {
+        let take = tail.len().min(max_bytes);
+        return Truncated {
+            content: String::from_utf8_lossy(&tail[tail.len().saturating_sub(take)..]).into_owned(),
+            truncated: true,
+        };
+    }
+
+    let head_part = String::from_utf8_lossy(&head[..head_budget]);
+    let tail_start = tail.len().saturating_sub(tail_take);
+    let tail_part = String::from_utf8_lossy(&tail[tail_start..]);
+
+    let omitted_bytes = total_bytes.saturating_sub(head_budget + tail_take);
+    let content = if omitted_bytes > 0 {
+        format!("{head_part}\n[... omitted {omitted_bytes} bytes ...]\n{tail_part}")
+    } else {
+        format!("{head_part}{tail_part}")
+    };
+
     Truncated {
-        content: String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(take)..]).into_owned(),
-        truncated,
+        content,
+        truncated: true,
     }
 }
 
@@ -506,3 +591,39 @@ fn send_session_signal(pid: u32, signal: &str) {
 fn send_session_signal(pid: u32, _signal: &str) {
     let _ = crate::platform::platform().terminate_process_tree(pid);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_output_not_truncated() {
+        let head = b"hello";
+        let tail = b"hello";
+        let res = truncate_head_tail(head, tail, 5, 0, 100);
+        assert!(!res.truncated);
+        assert_eq!(res.content, "hello");
+    }
+
+    #[test]
+    fn large_output_preserves_head_and_tail() {
+        let head = b"HEAD_START_1234567890";
+        let tail = b"TAIL_END_0987654321";
+        let total = 1000;
+        let dropped = 900;
+        let res = truncate_head_tail(head, tail, total, dropped, 20);
+        assert!(res.truncated);
+        assert!(res.content.starts_with("HE"));
+        assert!(res.content.ends_with("0987654321") || res.content.contains("TAIL"));
+        assert!(res.content.contains("[... omitted "));
+    }
+
+    #[test]
+    fn trim_buffer_tracks_dropped_bytes() {
+        let mut buf = vec![0u8; 150];
+        let dropped = trim_buffer(&mut buf, 100);
+        assert_eq!(dropped, 50);
+        assert_eq!(buf.len(), 100);
+    }
+}
+
