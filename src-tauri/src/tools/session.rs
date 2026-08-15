@@ -426,8 +426,8 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     } else {
         None
     };
-
-    Ok(tool_ok(json!({
+    let has_more = next_offset.is_some();
+    let mut payload = json!({
         "output_ref": output_ref,
         "stream_output_ref": format!("session:{session_id}:{stream}"),
         "stream": stream,
@@ -438,13 +438,25 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         "next_offset": next_offset,
         "total_retained_bytes": data.len(),
         "total_stream_bytes": total_stream_bytes,
-        "truncated": next_offset.is_some(),
+        "truncated": has_more,
+        "has_more": has_more,
         "warnings": if ref_stream == "full" {
             vec!["legacy full output_ref defaults to stdout; use output_refs for stable stream paging"]
         } else {
             Vec::<&str>::new()
         }
-    })))
+    });
+    if let Some(next) = next_offset {
+        payload["continuation"] = json!({
+            "tool": "read_output",
+            "arguments": {
+                "output_ref": format!("session:{session_id}:{stream}"),
+                "offset": next
+            }
+        });
+    }
+
+    Ok(tool_ok(payload))
 }
 
 pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {

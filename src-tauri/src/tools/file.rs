@@ -72,7 +72,13 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
     if truncated {
         warnings.push("content truncated".to_string());
     }
-    Ok(tool_ok(json!({
+    let next_start = if truncated && actual_end < total_lines {
+        Some(actual_end + 1)
+    } else {
+        None
+    };
+    let has_more = truncated;
+    let mut payload = json!({
         "path": resolved.display,
         "content": content,
         "encoding": "utf-8",
@@ -82,9 +88,25 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         "total_bytes": text.len(),
         "bytes_read": content.len(),
         "truncated": truncated,
+        "has_more": has_more,
+        "next_start_line": next_start,
         "truncated_by": truncated_by,
         "warnings": warnings
-    })))
+    });
+    if has_more {
+        payload["next_read"] = json!({
+            "path": resolved.display,
+            "start_line": actual_end + 1
+        });
+        payload["continuation"] = json!({
+            "tool": "read_file",
+            "arguments": {
+                "path": resolved.display,
+                "start_line": actual_end + 1
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -128,12 +150,24 @@ pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         &mut truncated,
     );
     entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    Ok(tool_ok(json!({
+    let has_more = truncated;
+    let mut payload = json!({
         "path": resolved.display,
         "entries": entries,
         "truncated": truncated,
+        "has_more": has_more,
         "warnings": if truncated { vec!["entry limit reached"] } else { vec![] }
-    })))
+    });
+    if has_more {
+        payload["continuation"] = json!({
+            "tool": "list_dir",
+            "arguments": {
+                "path": resolved.display,
+                "max_entries": max_entries.saturating_mul(2)
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -200,12 +234,24 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         }
     }
     files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-    Ok(tool_ok(json!({
+    let has_more = truncated;
+    let mut payload = json!({
         "path": resolved.display,
         "files": files,
         "truncated": truncated,
+        "has_more": has_more,
         "warnings": if truncated { vec!["result limit reached"] } else { vec![] }
-    })))
+    });
+    if has_more {
+        payload["continuation"] = json!({
+            "tool": "list_files",
+            "arguments": {
+                "path": resolved.display,
+                "max_results": max_results.saturating_mul(2)
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -320,16 +366,29 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         ));
     }
 
-    Ok(tool_ok(json!({
+    let has_more = truncated;
+    let mut payload = json!({
         "query": query,
         "matches": matches,
         "total_matches": matches.len(),
         "truncated": truncated,
+        "has_more": has_more,
         "max_file_bytes": max_file_bytes,
         "skipped_large_files": skipped_large,
         "skipped_binary_files": skipped_binary,
         "warnings": warnings
-    })))
+    });
+    if has_more {
+        payload["continuation"] = json!({
+            "tool": "search_text",
+            "arguments": {
+                "query": query,
+                "path": path,
+                "max_results": max_results.saturating_mul(2)
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 enum FileEligibility {

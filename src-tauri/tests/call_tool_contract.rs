@@ -510,3 +510,39 @@ fn grep_reuses_search_text_schema_and_behavior() {
         .iter()
         .all(|item| item["path"].as_str().unwrap_or("").starts_with("src/")));
 }
+
+#[test]
+fn structured_content_and_continuation_contract() {
+    use coding_tools_mcp_desktop_lib::tools::wrap_mcp_tool_result;
+
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    // 1. read_file with small max_bytes
+    let out = invoke(&ctx, "read_file", json!({"path": "src/math.js", "max_bytes": 10}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["truncated"], true);
+    assert_eq!(payload["has_more"], true);
+    assert!(payload["next_start_line"].is_number());
+    assert!(payload["continuation"]["arguments"]["start_line"].is_number());
+
+    let wrapped = wrap_mcp_tool_result("read_file", &json!({"path": "src/math.js"}), payload.clone());
+    assert_eq!(wrapped["isError"], false);
+    assert!(wrapped["structuredContent"]["has_more"].as_bool().unwrap());
+    let text = wrapped["content"][0]["text"].as_str().unwrap();
+    // 确保 content 格式化为可读文本，而不是简单的整体 JSON 转 string
+    assert!(text.starts_with("[Showing lines "));
+    assert!(!text.starts_with("{\"bytes_read\":"));
+
+    // 2. search_text continuation
+    let search_out = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "common-token", "glob": "search/**", "max_results": 2}),
+    );
+    let search_payload = assert_ok(&search_out);
+    assert_eq!(search_payload["truncated"], true);
+    assert_eq!(search_payload["has_more"], true);
+    assert_eq!(search_payload["continuation"]["tool"], "search_text");
+}
+
