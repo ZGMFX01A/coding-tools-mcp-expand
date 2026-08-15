@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::mcp::protocol::{
+    detect_request_context, negotiate_legacy_version, shape_result, MODERN_PROTOCOL_VERSIONS,
+};
 use crate::tools::{
     call_tool, list_tools_for_profile, wrap_mcp_tool_result, SharedToolContext, ToolContext,
     Workspace,
@@ -19,14 +22,22 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
         return Value::Null;
     }
 
+    let req_ctx = detect_request_context(method, &params);
+
     let result = match method {
-        "initialize" => Ok(initialize_result()),
+        "initialize" => {
+            let req_version = params.get("protocolVersion").and_then(Value::as_str);
+            let negotiated = negotiate_legacy_version(req_version);
+            Ok(initialize_result(&negotiated))
+        }
+        "server/discover" => Ok(discover_result()),
+        "notifications/initialized" | "notifications/cancelled" => return Value::Null,
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
             let mut tools = list_tools_for_profile(&state.tool_profile);
             if let Some(ref external_mgr) = state.external_mcp {
                 let external_tools = tauri::async_runtime::block_on(
-                    external_mgr.get_aggregated_tools(&state.workspace_id)
+                    external_mgr.get_aggregated_tools(&state.workspace_id),
                 );
                 tools.extend(external_tools);
             }
@@ -40,14 +51,17 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
     };
 
     match result {
-        Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Ok(result) => {
+            let shaped = shape_result(&req_ctx, result);
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": shaped })
+        }
         Err(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
     }
 }
 
-fn initialize_result() -> Value {
+pub fn initialize_result(protocol_version: &str) -> Value {
     serde_json::json!({
-        "protocolVersion": "2025-06-18",
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": { "listChanged": false },
             "logging": {}
@@ -58,6 +72,17 @@ fn initialize_result() -> Value {
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence."
+    })
+}
+
+pub fn discover_result() -> Value {
+    serde_json::json!({
+        "supportedVersions": MODERN_PROTOCOL_VERSIONS,
+        "capabilities": {
+            "tools": { "listChanged": false },
+            "logging": {}
+        },
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input."
     })
 }
 
@@ -172,7 +197,7 @@ mod tests {
 
     #[test]
     fn initialize_instructions_define_the_history_persistence_workflow() {
-        let initialized = initialize_result();
+        let initialized = initialize_result("2025-06-18");
         let instructions = initialized["instructions"].as_str().expect("instructions");
         assert!(instructions.contains("history_session_bootstrap"));
         assert!(instructions.contains("At the start of every new ChatGPT conversation"));
@@ -195,9 +220,92 @@ mod tests {
 
     #[test]
     fn initialize_does_not_claim_tool_catalog_notifications_without_a_stream() {
-        let initialized = initialize_result();
+        let initialized = initialize_result("2025-06-18");
 
         assert_eq!(initialized["capabilities"]["tools"]["listChanged"], false);
+    }
+
+    #[test]
+    fn test_multi_version_initialize_and_discover() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        // 1. initialize 协商 2025-11-25
+        let res_1125 = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25"
+                }
+            }),
+        );
+        assert_eq!(res_1125["result"]["protocolVersion"], "2025-11-25");
+
+        // 2. initialize 协商 2025-06-18
+        let res_0618 = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18"
+                }
+            }),
+        );
+        assert_eq!(res_0618["result"]["protocolVersion"], "2025-06-18");
+
+        // 3. initialize 协商 2024-11-05
+        let res_1105 = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05"
+                }
+            }),
+        );
+        assert_eq!(res_1105["result"]["protocolVersion"], "2024-11-05");
+
+        // 4. server/discover 返回 2026-07-28
+        let res_discover = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "server/discover",
+                "params": {}
+            }),
+        );
+        assert_eq!(res_discover["result"]["resultType"], "complete");
+        assert_eq!(res_discover["result"]["supportedVersions"][0], "2026-07-28");
+        assert!(res_discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string());
+
+        // 5. modern tools/list 带有 _meta
+        let res_tools = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                    }
+                }
+            }),
+        );
+        assert_eq!(res_tools["result"]["resultType"], "complete");
+        assert!(res_tools["result"]["tools"].is_array());
     }
 
     #[test]

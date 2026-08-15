@@ -242,11 +242,11 @@ async fn run_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    #[cfg(windows)]
-    command
-        .env("PYTHONUTF8", "1")
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONLEGACYWINDOWSSTDIO", "0");
+    let env_map = build_child_env(ShellEnvPolicy::default(), None);
+    command.env_clear();
+    for (k, v) in env_map {
+        command.env(k, v);
+    }
 
     #[cfg(windows)]
     {
@@ -835,6 +835,25 @@ mod tests {
             "{output}"
         );
     }
+
+    #[test]
+    fn exec_command_scrubs_sensitive_env_at_runtime() {
+        std::env::set_var("CODING_TOOLS_TEST_SECRET", "should_not_leak");
+        std::env::set_var("MY_OPENAI_KEY", "sk-12345678901234567890");
+        let parent = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx = ToolContext::for_test(parent.path().to_path_buf(), harness.path().to_path_buf()).expect("context");
+
+        #[cfg(windows)]
+        let cmd = "cmd /c echo SECRET=%CODING_TOOLS_TEST_SECRET%";
+        #[cfg(not(windows))]
+        let cmd = "sh -c 'echo SECRET=$CODING_TOOLS_TEST_SECRET'";
+
+        let output = call_tool(&ctx, "exec_command", &json!({ "cmd": cmd, "timeout_ms": 10_000, "yield_time_ms": 10_000 }));
+        assert_eq!(output["command_ok"], true, "{output}");
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        assert!(!stdout.contains("should_not_leak"), "Secret must be scrubbed: {stdout}");
+    }
 }
 
 fn command_for_program(program: &str, args: &[String]) -> Command {
@@ -909,3 +928,244 @@ fn platform_command_path(path: &Path) -> std::path::PathBuf {
 fn windows_command_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InheritMode {
+    Core,
+    All,
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellEnvPolicy {
+    pub inherit: InheritMode,
+}
+
+impl Default for ShellEnvPolicy {
+    fn default() -> Self {
+        Self {
+            inherit: InheritMode::Core,
+        }
+    }
+}
+
+pub fn build_child_env(
+    policy: ShellEnvPolicy,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) -> std::collections::HashMap<String, String> {
+    let mut result = std::collections::HashMap::new();
+
+    match policy.inherit {
+        InheritMode::None => {
+            for (key, val) in std::env::vars() {
+                let upper = key.to_ascii_uppercase();
+                if matches!(upper.as_str(), "PATH" | "SYSTEMROOT" | "WINDIR" | "COMSPEC") {
+                    result.insert(key, val);
+                }
+            }
+        }
+        InheritMode::Core => {
+            for (key, val) in std::env::vars() {
+                if is_sensitive_env_name(&key)
+                    || is_risky_env_name(&key)
+                    || is_sensitive_value(&val)
+                {
+                    continue;
+                }
+                if is_core_env_name(&key) {
+                    result.insert(key, val);
+                }
+            }
+        }
+        InheritMode::All => {
+            for (key, val) in std::env::vars() {
+                if is_sensitive_env_name(&key)
+                    || is_risky_env_name(&key)
+                    || is_sensitive_value(&val)
+                {
+                    continue;
+                }
+                result.insert(key, val);
+            }
+        }
+    }
+
+    if let Some(extra) = extra_env {
+        for (key, val) in extra {
+            if !is_sensitive_env_name(key)
+                && !is_risky_env_name(key)
+                && !is_sensitive_value(val)
+            {
+                result.insert(key.clone(), val.clone());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        result.insert("PYTHONUTF8".into(), "1".into());
+        result.insert("PYTHONIOENCODING".into(), "utf-8".into());
+        result.insert("PYTHONLEGACYWINDOWSSTDIO".into(), "0".into());
+    }
+
+    result
+}
+
+fn is_sensitive_env_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("auth")
+        || lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("access_key")
+        || lower.contains("private_key")
+        || lower.contains("private")
+}
+
+fn is_risky_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "BASH_ENV"
+            | "ENV"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "NODE_OPTIONS"
+            | "PERL5LIB"
+            | "PERL5OPT"
+            | "RUBYOPT"
+            | "RUBYLIB"
+    )
+}
+
+fn is_sensitive_value(value: &str) -> bool {
+    value.contains("COMPLIANCE_SHOULD_NOT_LEAK")
+        || value.contains("-----BEGIN")
+        || value.starts_with("ghp_")
+        || value.starts_with("gho_")
+        || value.starts_with("ghu_")
+        || value.starts_with("ghs_")
+        || value.starts_with("ghr_")
+        || value.starts_with("sk-")
+        || (value.starts_with("AKIA") && value.len() >= 16)
+}
+
+fn is_core_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    #[cfg(windows)]
+    {
+        matches!(
+            upper.as_str(),
+            "PATH"
+                | "PATHEXT"
+                | "SYSTEMROOT"
+                | "WINDIR"
+                | "COMSPEC"
+                | "SYSTEMDRIVE"
+                | "TEMP"
+                | "TMP"
+                | "USERPROFILE"
+                | "HOME"
+                | "HOMEDRIVE"
+                | "HOMEPATH"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+                | "PROGRAMDATA"
+                | "PROGRAMFILES"
+                | "PROGRAMFILES(X86)"
+                | "PROGRAMW6432"
+                | "COMMONPROGRAMFILES"
+                | "COMMONPROGRAMFILES(X86)"
+                | "ALLUSERSPROFILE"
+                | "PUBLIC"
+                | "PSMODULEPATH"
+                | "NUMBER_OF_PROCESSORS"
+                | "PROCESSOR_ARCHITECTURE"
+                | "PROCESSOR_IDENTIFIER"
+                | "PROCESSOR_LEVEL"
+                | "PROCESSOR_REVISION"
+                | "OS"
+                | "JAVA_HOME"
+                | "RUSTUP_HOME"
+                | "CARGO_HOME"
+                | "NODE_PATH"
+                | "GOROOT"
+                | "GOPATH"
+                | "GRADLE_HOME"
+                | "M2_HOME"
+                | "MAVEN_HOME"
+                | "GIT_CONFIG_GLOBAL"
+                | "TERM"
+                | "LANG"
+                | "LC_ALL"
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(
+            upper.as_str(),
+            "PATH"
+                | "LANG"
+                | "LC_ALL"
+                | "TERM"
+                | "HOME"
+                | "USER"
+                | "LOGNAME"
+                | "SHELL"
+                | "TMPDIR"
+                | "GIT_CONFIG_GLOBAL"
+                | "JAVA_HOME"
+                | "RUSTUP_HOME"
+                | "CARGO_HOME"
+                | "NODE_PATH"
+                | "GOROOT"
+                | "GOPATH"
+                | "GRADLE_HOME"
+                | "M2_HOME"
+                | "MAVEN_HOME"
+        )
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_and_risky_env_names_filtered() {
+        assert!(is_sensitive_env_name("CODING_TOOLS_TEST_SECRET"));
+        assert!(is_sensitive_env_name("OPENAI_API_KEY"));
+        assert!(is_sensitive_env_name("DB_PASSWORD"));
+        assert!(is_sensitive_env_name("AUTH_TOKEN"));
+        assert!(is_sensitive_env_name("AWS_ACCESS_KEY_ID"));
+        assert!(is_sensitive_env_name("ID_RSA_PRIVATE_KEY"));
+
+        assert!(is_risky_env_name("LD_PRELOAD"));
+        assert!(is_risky_env_name("NODE_OPTIONS"));
+        assert!(is_risky_env_name("PYTHONPATH"));
+
+        assert!(!is_sensitive_env_name("PATH"));
+        assert!(!is_sensitive_env_name("SYSTEMROOT"));
+        assert!(!is_sensitive_env_name("USERPROFILE"));
+    }
+
+    #[test]
+    fn core_env_names_allowed() {
+        assert!(is_core_env_name("PATH"));
+        #[cfg(windows)]
+        {
+            assert!(is_core_env_name("SYSTEMROOT"));
+            assert!(is_core_env_name("COMSPEC"));
+            assert!(is_core_env_name("USERPROFILE"));
+        }
+    }
+}
+

@@ -12,39 +12,64 @@ fn policy_tool_err(err: PolicyError) -> Value {
         .0
         .strip_prefix("DANGEROUS_OPERATION_REQUIRES_CONFIRMATION: ");
     let protected = err.0.strip_prefix("PROTECTED_REPOSITORY_ASSET: ");
+    let permission = err.0.strip_prefix("PERMISSION_DENIED: ");
     let code = if protected.is_some() {
         "PROTECTED_REPOSITORY_ASSET"
     } else if dangerous.is_some() {
         "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION"
+    } else if permission.is_some() {
+        "PERMISSION_DENIED"
     } else {
         "POLICY_REJECTED"
     };
-    let message = protected.or(dangerous).unwrap_or(&err.0).to_string();
-    let (reason, suggestion) = if dangerous.is_some() {
+    let message = protected
+        .or(dangerous)
+        .or(permission)
+        .unwrap_or(&err.0)
+        .to_string();
+
+    let (category, reason, suggestion) = if dangerous.is_some() {
         (
+            "permission",
             "confirmation_required",
             "为危险操作补充 confirm=true，确认后再重试",
         )
+    } else if permission.is_some() || message.contains("safe permission mode") {
+        (
+            "permission",
+            "permission_denied",
+            "切换工作区为 trusted 或 dangerous 模式后再执行此网络/敏感命令",
+        )
     } else if message.contains("allowlisted") {
-        ("command_rejected", "改用允许的命令，或调整工作区命令白名单")
+        (
+            "policy",
+            "command_rejected",
+            "改用允许的命令，或调整工作区命令白名单",
+        )
     } else if message.contains("Shell chaining") {
         (
+            "policy",
             "shell_syntax_rejected",
             "移除未加引号的 shell 操作符；引号内的程序参数可以保留",
         )
     } else {
-        ("policy_rejected", "根据错误信息修正参数后重试")
+        (
+            "policy",
+            "policy_rejected",
+            "根据错误信息修正参数后重试",
+        )
     };
     tool_err(WorkspaceError::ToolDetails {
         code,
         message,
-        category: "policy",
+        category,
         retryable: false,
         details: json!({
             "stage": "policy",
             "reason": reason,
             "recoverable": reason != "confirmation_required",
-            "suggestion": suggestion
+            "suggestion": suggestion,
+            "recovery_hint": suggestion
         }),
     })
 }

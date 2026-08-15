@@ -150,12 +150,23 @@ pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         combined
     };
     let files = parse_diff_files(&diff_text);
-    Ok(tool_ok(json!({
+    let has_more = truncated;
+    let mut payload = json!({
         "diff": diff_text,
         "files": files,
         "truncated": truncated,
+        "has_more": has_more,
         "warnings": if truncated { vec!["diff truncated"] } else { vec![] }
-    })))
+    });
+    if has_more {
+        payload["continuation"] = json!({
+            "tool": "git_diff",
+            "arguments": {
+                "max_bytes": max_bytes.saturating_mul(2)
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
@@ -178,6 +189,7 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
             "is_repo": false,
             "commits": [],
             "truncated": false,
+            "has_more": false,
             "warnings": []
         })));
     }
@@ -229,14 +241,30 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         }));
     }
     let truncated = commits.len() > max_count;
-    Ok(tool_ok(json!({
+    let has_more = truncated;
+    let next_skip = if has_more { Some(skip + max_count) } else { None };
+    let mut payload = json!({
         "is_repo": true,
         "ref": ref_name,
         "path": path_filter,
         "commits": commits.into_iter().take(max_count).collect::<Vec<_>>(),
         "truncated": truncated,
+        "has_more": has_more,
+        "next_skip": next_skip,
         "warnings": if truncated { vec!["commit limit reached"] } else { Vec::<&str>::new() }
-    })))
+    });
+    if has_more {
+        payload["continuation"] = json!({
+            "tool": "git_log",
+            "arguments": {
+                "path": path_filter,
+                "ref": ref_name,
+                "skip": skip + max_count,
+                "max_count": max_count
+            }
+        });
+    }
+    Ok(tool_ok(payload))
 }
 
 pub fn git_show(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {

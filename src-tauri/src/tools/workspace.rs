@@ -113,26 +113,61 @@ impl WorkspaceError {
                 message,
                 category,
                 retryable,
-            } => json!({
-                "code": code,
-                "message": message,
-                "category": category,
-                "retryable": retryable,
-                "details": {}
-            }),
+            } => {
+                let recovery_hint = Self::default_recovery_hint(code);
+                let mut err = json!({
+                    "code": code,
+                    "message": message,
+                    "category": category,
+                    "retryable": retryable,
+                    "details": {}
+                });
+                if let Some(hint) = recovery_hint {
+                    err["recovery_hint"] = json!(hint);
+                }
+                err
+            }
             Self::ToolDetails {
                 code,
                 message,
                 category,
                 retryable,
                 details,
-            } => json!({
-                "code": code,
-                "message": message,
-                "category": category,
-                "retryable": retryable,
-                "details": details
-            }),
+            } => {
+                let recovery_hint = details
+                    .get("retry_hint")
+                    .or_else(|| details.get("recovery_hint"))
+                    .or_else(|| details.get("suggestion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Self::default_recovery_hint(code).map(str::to_string));
+                let mut err = json!({
+                    "code": code,
+                    "message": message,
+                    "category": category,
+                    "retryable": retryable,
+                    "details": details
+                });
+                if let Some(hint) = recovery_hint {
+                    err["recovery_hint"] = json!(hint);
+                }
+                err
+            }
+        }
+    }
+
+    fn default_recovery_hint(code: &str) -> Option<&'static str> {
+        match code {
+            "NOT_FOUND" => Some("Use list_files to locate the file in workspace."),
+            "IS_DIRECTORY" => Some("Specify a file path instead of a directory."),
+            "NOT_A_DIRECTORY" => Some("Specify a valid directory path."),
+            "BINARY_FILE" => Some("Binary files cannot be read with text tools; use view_image if it is an image."),
+            "UNSUPPORTED_ENCODING" => Some("File must be valid UTF-8 text."),
+            "ABSOLUTE_PATH_DENIED" | "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE" => Some("Keep target path within the configured workspace root."),
+            "PATCH_CONTEXT_NOT_FOUND" => Some("Read the current file and regenerate patch with fresh context lines."),
+            "PATCH_CONTEXT_AMBIGUOUS" => Some("Include additional unchanged surrounding lines to make the hunk unique."),
+            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION" => Some("Set confirm=true to proceed with dangerous operations."),
+            _ => None,
         }
     }
 }
@@ -485,7 +520,7 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
     } else {
         vec![json!({
             "type": "text",
-            "text": structured.to_string()
+            "text": render_tool_text(tool_name, args, &structured)
         })]
     };
     json!({
@@ -494,3 +529,249 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
         "isError": is_error
     })
 }
+
+pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> String {
+    let is_error = payload.get("ok").and_then(Value::as_bool) == Some(false);
+    if is_error {
+        return render_tool_error(payload);
+    }
+
+    match tool_name {
+        "read_file" => {
+            let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
+            if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+                let start_line = payload.get("start_line").and_then(Value::as_u64).unwrap_or(1);
+                let end_line = payload.get("end_line").and_then(Value::as_u64).unwrap_or(0);
+                let total_lines = payload.get("total_lines").and_then(Value::as_u64).unwrap_or(0);
+                let next_start = payload.get("next_start_line").and_then(Value::as_u64);
+                let hint = if let Some(ns) = next_start {
+                    format!("; continue with read_file(start_line={ns})")
+                } else {
+                    "; content truncated".to_string()
+                };
+                format!("[Showing lines {start_line}-{end_line} of {total_lines}{hint}]\n{content}")
+            } else {
+                content.to_string()
+            }
+        }
+        "list_dir" | "list_files" => {
+            let entries = payload.get("entries").or_else(|| payload.get("files"));
+            if let Some(arr) = entries.and_then(Value::as_array) {
+                if arr.is_empty() {
+                    "No entries found.".to_string()
+                } else {
+                    let mut lines = Vec::new();
+                    for item in arr.iter().take(200) {
+                        let path = item
+                            .get("path")
+                            .or_else(|| item.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let kind = item.get("type").and_then(Value::as_str);
+                        if let Some(k) = kind {
+                            lines.push(format!("{path} [{k}]"));
+                        } else {
+                            lines.push(path.to_string());
+                        }
+                    }
+                    if payload.get("truncated").and_then(Value::as_bool) == Some(true) || arr.len() > 200 {
+                        lines.push(format!(
+                            "... results truncated (showing {} of {} items); use continuation to fetch more.",
+                            lines.len().min(arr.len()),
+                            arr.len()
+                        ));
+                    }
+                    lines.join("\n")
+                }
+            } else {
+                "No entries found.".to_string()
+            }
+        }
+        "search_text" | "grep_text" | "grep" => {
+            if let Some(matches) = payload.get("matches").and_then(Value::as_array) {
+                if matches.is_empty() {
+                    "No matches found.".to_string()
+                } else {
+                    let mut lines = Vec::new();
+                    for m in matches.iter().take(100) {
+                        let p = m.get("path").and_then(Value::as_str).unwrap_or("");
+                        let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+                        let preview = m.get("preview").and_then(Value::as_str).unwrap_or("");
+                        lines.push(format!("{p}:{line}: {preview}"));
+                    }
+                    if payload.get("truncated").and_then(Value::as_bool) == Some(true) || matches.len() > 100 {
+                        let total = payload
+                            .get("total_matches")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(matches.len() as u64);
+                        lines.push(format!(
+                            "... showing {} of {} matches; narrow query or raise max_results.",
+                            lines.len().min(matches.len()),
+                            total
+                        ));
+                    }
+                    lines.join("\n")
+                }
+            } else {
+                "No matches found.".to_string()
+            }
+        }
+        "apply_patch" | "patch_check" => {
+            let dry_run = payload.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            let prefix = if dry_run {
+                "Patch validated"
+            } else {
+                "Patch applied"
+            };
+            let affected = payload
+                .get("affected_files")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let summary = payload.get("summary").and_then(Value::as_str).unwrap_or("").trim();
+            if summary.is_empty() {
+                format!("{prefix} to {affected} file(s).")
+            } else {
+                format!("{prefix} to {affected} file(s).\n{summary}")
+            }
+        }
+        "exec_command" => {
+            let status = payload.get("status").and_then(Value::as_str).unwrap_or("unknown");
+            let mut header = vec![format!("Status: {status}")];
+            if let Some(code) = payload.get("exit_code").and_then(Value::as_i64) {
+                header.push(format!("exit code {code}"));
+            }
+            if let Some(ms) = payload.get("elapsed_ms").and_then(Value::as_u64) {
+                header.push(format!("{ms} ms"));
+            }
+            let mut sections = vec![header.join(" | ")];
+            let stdout = payload.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = payload.get("stderr").and_then(Value::as_str).unwrap_or("");
+            if !stdout.is_empty() {
+                sections.push(stdout.to_string());
+            }
+            if !stderr.is_empty() {
+                sections.push(format!("stderr:\n{stderr}"));
+            }
+            if payload.get("status").and_then(Value::as_str) == Some("running") {
+                if let Some(id) = payload
+                    .get("session_id")
+                    .or_else(|| payload.get("command_id"))
+                    .and_then(Value::as_str)
+                {
+                    sections.push(format!(
+                        "Command still running; poll with read_output(output_ref=\"session:{id}:stdout\")."
+                    ));
+                }
+            }
+            sections.join("\n")
+        }
+        "read_output" => {
+            let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
+            if let Some(next_offset) = payload.get("next_offset").and_then(Value::as_u64) {
+                let ref_id = payload
+                    .get("stream_output_ref")
+                    .or_else(|| payload.get("output_ref"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{content}\n[more: read_output(output_ref=\"{ref_id}\", offset={next_offset})]")
+            } else {
+                content.to_string()
+            }
+        }
+        "git_status" => {
+            let branch = payload.get("branch").and_then(Value::as_str).unwrap_or("detached");
+            let mut lines = vec![format!("## {branch}")];
+            if let Some(entries) = payload.get("entries").and_then(Value::as_array) {
+                if entries.is_empty() {
+                    lines.push("Working tree clean.".to_string());
+                } else {
+                    for entry in entries {
+                        let idx = entry.get("index_status").and_then(Value::as_str).unwrap_or(" ");
+                        let wt = entry.get("worktree_status").and_then(Value::as_str).unwrap_or(" ");
+                        let p = entry.get("path").and_then(Value::as_str).unwrap_or("");
+                        lines.push(format!("{idx}{wt} {p}"));
+                    }
+                }
+            }
+            lines.join("\n")
+        }
+        "git_diff" => {
+            payload.get("diff").and_then(Value::as_str).unwrap_or("No diff.").to_string()
+        }
+        "git_log" => {
+            if let Some(commits) = payload.get("commits").and_then(Value::as_array) {
+                if commits.is_empty() {
+                    "No commits found.".to_string()
+                } else {
+                    let mut lines = Vec::new();
+                    for c in commits {
+                        let h = c.get("short_hash").and_then(Value::as_str).unwrap_or("");
+                        let s = c.get("subject").and_then(Value::as_str).unwrap_or("");
+                        lines.push(format!("{h} {s}"));
+                    }
+                    lines.join("\n")
+                }
+            } else {
+                "No commits found.".to_string()
+            }
+        }
+        "git_show" => {
+            payload.get("content").and_then(Value::as_str).unwrap_or("No output.").to_string()
+        }
+        _ => {
+            if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
+                summary.to_string()
+            } else if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                message.to_string()
+            } else {
+                format!("{tool_name}: completed.")
+            }
+        }
+    }
+}
+
+fn render_tool_error(payload: &Value) -> String {
+    let error = payload.get("error");
+    let code = error
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("TOOL_ERROR");
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("summary").and_then(Value::as_str))
+        .unwrap_or("Tool call failed.");
+    let mut lines = vec![format!("{code}: {message}")];
+
+    if let Some(e) = error {
+        let category = e.get("category").and_then(Value::as_str);
+        let retryable = e.get("retryable").and_then(Value::as_bool);
+        let mut facts = Vec::new();
+        if let Some(cat) = category {
+            facts.push(format!("Category: {cat}."));
+        }
+        if let Some(ret) = retryable {
+            facts.push(format!("Retryable: {}.", if ret { "yes" } else { "no" }));
+            if !ret {
+                facts.push("Do not repeat this call unchanged.".to_string());
+            }
+        }
+        if !facts.is_empty() {
+            lines.push(facts.join(" "));
+        }
+
+        if let Some(hint) = e
+            .get("recovery_hint")
+            .or_else(|| e.get("details").and_then(|d| d.get("retry_hint")))
+            .and_then(Value::as_str)
+        {
+            lines.push(format!("Retry: {hint}"));
+        } else if let Some(sug) = e.get("details").and_then(|d| d.get("suggestion")).and_then(Value::as_str) {
+            lines.push(format!("Suggested action: {sug}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
