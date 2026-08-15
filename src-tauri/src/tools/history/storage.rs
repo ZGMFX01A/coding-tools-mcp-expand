@@ -9,9 +9,16 @@ use sha2::{Digest, Sha256};
 use crate::tools::workspace::{relative_display, Workspace, WorkspaceError, WorkspaceResult};
 
 use super::markdown;
-use super::model::{HistoryDocument, HistoryIndex, IndexEntry, ScanReport};
+use super::model::{
+    HistoryDocument, HistoryIndex, IndexEntry, ManifestEntry, MemoryManifest, MemoryReference,
+    MemoryState, ScanReport,
+};
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
+const STATE_ITEM_LIMIT: usize = 12;
+const STATE_TEXT_LIMIT: usize = 512;
+const STATE_FOCUS_LIMIT: usize = 2_048;
+const STATE_REFERENCE_LIMIT: usize = 8;
 
 pub struct HistoryLock {
     file: File,
@@ -27,11 +34,7 @@ pub fn resolve_history_dir(
     workspace: &Workspace,
     workspace_root: Option<&str>,
     history_dir: Option<&str>,
-    warnings: &mut Vec<String>,
 ) -> WorkspaceResult<PathBuf> {
-    // workspace_root 仅为兼容字段：不参与权限判定，也不作为写入根。
-    // 传入值与当前工作区根目录不一致（例如跨设备沿用旧路径）时，
-    // 忽略客户端值并始终使用 app 配置的工作区根目录，避免旧路径锁死整个历史流程。
     if let Some(requested_root) = workspace_root {
         let requested_path = Path::new(requested_root.trim());
         let candidate = if requested_path.is_absolute() {
@@ -39,22 +42,11 @@ pub fn resolve_history_dir(
         } else {
             workspace.root().join(requested_path)
         };
-        match candidate.canonicalize() {
-            Ok(resolved) if resolved != workspace.root() => {
-                warnings.push(format!(
-                    "客户端传入的 workspace_root 与当前工作区根目录不一致，已忽略并使用当前工作区根目录：{}；传入值：{}",
-                    workspace.root_display(),
-                    requested_root
-                ));
-            }
-            Ok(_) => {}
-            Err(_) => {
-                warnings.push(format!(
-                    "客户端传入的 workspace_root 无法解析（可能来自旧设备或旧路径），已忽略并使用当前工作区根目录：{}；传入值：{}",
-                    workspace.root_display(),
-                    requested_root
-                ));
-            }
+        let requested = candidate
+            .canonicalize()
+            .map_err(|_| WorkspaceError::invalid_argument("workspace_root does not exist"))?;
+        if requested != workspace.root() {
+            return Err(WorkspaceError::path_outside_workspace());
         }
     }
 
@@ -78,9 +70,9 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
     if candidate.exists() || candidate.is_symlink() {
         let resolved = candidate
             .canonicalize()
-            .map_err(|_| path_outside_workspace_detailed(workspace, candidate))?;
+            .map_err(|_| WorkspaceError::path_outside_workspace())?;
         if !resolved.starts_with(workspace.root()) {
-            return Err(path_outside_workspace_detailed(workspace, &resolved));
+            return Err(WorkspaceError::path_outside_workspace());
         }
         return Ok(());
     }
@@ -89,32 +81,15 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
         if path.exists() || path.is_symlink() {
             let resolved = path
                 .canonicalize()
-                .map_err(|_| path_outside_workspace_detailed(workspace, path))?;
+                .map_err(|_| WorkspaceError::path_outside_workspace())?;
             if !resolved.starts_with(workspace.root()) {
-                return Err(path_outside_workspace_detailed(workspace, &resolved));
+                return Err(WorkspaceError::path_outside_workspace());
             }
             return Ok(());
         }
         ancestor = path.parent();
     }
-    Err(path_outside_workspace_detailed(workspace, candidate))
-}
-
-/// 构造带诊断信息的 PATH_OUTSIDE_WORKSPACE 错误。
-/// details 返回工作区根目录、越界候选路径与排查提示，便于区分是
-/// junction/符号链接逃逸，还是 MCP 运行时加载了旧工作区根目录。
-fn path_outside_workspace_detailed(workspace: &Workspace, path: &Path) -> WorkspaceError {
-    WorkspaceError::ToolDetails {
-        code: "PATH_OUTSIDE_WORKSPACE",
-        message: "Path escapes the configured workspace.".into(),
-        category: "security",
-        retryable: false,
-        details: serde_json::json!({
-            "workspace_root": workspace.root_display(),
-            "candidate": path.to_string_lossy(),
-            "hint": "检查候选路径或其上级目录是否存在指向工作区外的符号链接 / 目录联接（junction）；若工作区路径刚修改过，请先停止并重启该工作区的 MCP 服务，确保运行时加载的是当前配置的根目录。"
-        }),
-    }
+    Err(WorkspaceError::path_outside_workspace())
 }
 
 pub fn ensure_directory(path: &Path) -> WorkspaceResult<()> {
@@ -253,33 +228,240 @@ pub fn rebuild_index(report: &ScanReport) -> HistoryIndex {
 }
 
 pub fn read_index(history_dir: &Path) -> WorkspaceResult<Option<HistoryIndex>> {
-    let path = history_dir.join("index.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content =
-        fs::read_to_string(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|error| WorkspaceError::ToolDetails {
-            code: "HISTORY_INDEX_INVALID",
-            message: "History index is not valid JSON.".into(),
-            category: "validation",
-            retryable: true,
-            details: serde_json::json!({"error": error.to_string()}),
-        })
+    read_json(
+        &history_dir.join("index.json"),
+        "HISTORY_INDEX_INVALID",
+        "History index",
+    )
 }
 
 pub fn write_index(history_dir: &Path, index: &HistoryIndex) -> WorkspaceResult<()> {
-    let content =
-        serde_json::to_vec_pretty(index).map_err(|error| WorkspaceError::ToolDetails {
-            code: "HISTORY_WRITE_FAILED",
-            message: "Unable to serialize history index.".into(),
-            category: "internal",
-            retryable: true,
-            details: serde_json::json!({"error": error.to_string()}),
-        })?;
-    atomic_write(&history_dir.join("index.json"), &content)
+    write_json(&history_dir.join("index.json"), index, "history index")
+}
+
+pub fn memory_dir(history_dir: &Path) -> PathBuf {
+    history_dir.join("memory")
+}
+
+pub fn read_manifest(history_dir: &Path) -> WorkspaceResult<Option<MemoryManifest>> {
+    read_json(
+        &memory_dir(history_dir).join("manifest.json"),
+        "HISTORY_MANIFEST_INVALID",
+        "History manifest",
+    )
+}
+
+pub fn write_manifest(history_dir: &Path, manifest: &MemoryManifest) -> WorkspaceResult<()> {
+    write_json(
+        &memory_dir(history_dir).join("manifest.json"),
+        manifest,
+        "history manifest",
+    )
+}
+
+pub fn read_state(history_dir: &Path) -> WorkspaceResult<Option<MemoryState>> {
+    read_json(
+        &memory_dir(history_dir).join("state.json"),
+        "HISTORY_STATE_INVALID",
+        "History state",
+    )
+}
+
+pub fn write_state(history_dir: &Path, state: &MemoryState) -> WorkspaceResult<()> {
+    write_json(
+        &memory_dir(history_dir).join("state.json"),
+        state,
+        "history state",
+    )
+}
+
+pub fn build_manifest(report: &ScanReport) -> MemoryManifest {
+    let entries = report
+        .documents
+        .iter()
+        .map(|document| ManifestEntry {
+            number: document.number,
+            path: document.path.clone(),
+            title: markdown::document_title(&document.content, document.number),
+            created_at: document.created_at.clone().unwrap_or_default(),
+            updated_at: document.updated_at.clone().unwrap_or_default(),
+            bytes: document.content.len() as u64,
+            sha256: sha256(document.content.as_bytes()),
+            keywords: keywords(document),
+        })
+        .collect::<Vec<_>>();
+    let mut digest = Sha256::new();
+    for entry in &entries {
+        digest.update(entry.number.to_le_bytes());
+        digest.update(entry.sha256.as_bytes());
+    }
+    MemoryManifest {
+        version: 2,
+        archive_revision: format!("sha256:{:x}", digest.finalize()),
+        entries,
+    }
+}
+
+pub fn build_state(
+    report: &ScanReport,
+    manifest: &MemoryManifest,
+    current_number: Option<u64>,
+    timestamp: &str,
+    state_revision: u64,
+) -> MemoryState {
+    let current_document = current_number.and_then(|number| {
+        report
+            .documents
+            .iter()
+            .find(|document| document.number == number)
+    });
+    let current_focus = current_document
+        .and_then(|document| latest_user_focus(&document.content))
+        .or_else(|| {
+            current_document
+                .map(|document| markdown::document_title(&document.content, document.number))
+        })
+        .unwrap_or_else(|| "尚未记录当前焦点".to_string());
+    let mut recent_changes = Vec::new();
+    let mut open_items = Vec::new();
+    for document in report.documents.iter().rev() {
+        let records = markdown::parse_checkpoint_records(&document.content);
+        for record in latest_revisions(&records).into_iter().rev() {
+            push_bounded(
+                &mut recent_changes,
+                record.files_changed.iter().map(String::as_str),
+            );
+            push_bounded(
+                &mut recent_changes,
+                record.decisions.iter().map(String::as_str),
+            );
+            push_bounded(
+                &mut open_items,
+                record.remaining_issues.iter().map(String::as_str),
+            );
+            push_bounded(
+                &mut open_items,
+                record.next_actions.iter().map(String::as_str),
+            );
+        }
+    }
+    let references = manifest
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| Some(entry.number) != current_number)
+        .take(STATE_REFERENCE_LIMIT)
+        .map(|entry| MemoryReference {
+            number: entry.number,
+            path: entry.path.clone(),
+            reason: "最近历史档案；可按需读取原文".into(),
+        })
+        .collect();
+    MemoryState {
+        version: 2,
+        state_revision,
+        archive_revision: manifest.archive_revision.clone(),
+        generated_at: timestamp.to_string(),
+        current_session: current_number.and_then(|number| {
+            manifest
+                .entries
+                .iter()
+                .find(|entry| entry.number == number)
+                .map(|entry| MemoryReference {
+                    number: entry.number,
+                    path: entry.path.clone(),
+                    reason: "当前 ChatGPT 会话档案".into(),
+                })
+        }),
+        current_focus: truncate_text(&current_focus, STATE_FOCUS_LIMIT),
+        recent_changes,
+        open_items,
+        references,
+    }
+}
+
+fn latest_user_focus(content: &str) -> Option<String> {
+    markdown::parse_checkpoint_records(content)
+        .into_iter()
+        .max_by_key(|record| record.revision)
+        .and_then(|record| {
+            if record.raw_user_input.trim().is_empty() {
+                (!record.user_intent.trim().is_empty()).then_some(record.user_intent)
+            } else {
+                Some(record.raw_user_input)
+            }
+        })
+        .or_else(|| {
+            markdown::parse_initial_input_records(content)
+                .into_iter()
+                .max_by_key(|record| record.revision)
+                .map(|record| record.raw_user_input)
+        })
+}
+
+fn latest_revisions(
+    records: &[super::model::CheckpointRecord],
+) -> Vec<&super::model::CheckpointRecord> {
+    let mut latest = BTreeMap::new();
+    for record in records {
+        let should_replace = latest
+            .get(record.turn_id.as_str())
+            .map(|existing: &&super::model::CheckpointRecord| record.revision >= existing.revision)
+            .unwrap_or(true);
+        if should_replace {
+            latest.insert(record.turn_id.as_str(), record);
+        }
+    }
+    latest.into_values().collect()
+}
+
+fn push_bounded<'a>(target: &mut Vec<String>, values: impl Iterator<Item = &'a str>) {
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || target.iter().any(|existing| existing == value) {
+            continue;
+        }
+        if target.len() >= STATE_ITEM_LIMIT {
+            return;
+        }
+        target.push(truncate_text(value, STATE_TEXT_LIMIT));
+    }
+}
+
+fn keywords(document: &HistoryDocument) -> Vec<String> {
+    let mut values = Vec::new();
+    values.push(markdown::document_title(&document.content, document.number));
+    values.extend(
+        markdown::parse_initial_input_records(&document.content)
+            .into_iter()
+            .map(|record| record.raw_user_input),
+    );
+    values.extend(
+        markdown::parse_checkpoint_records(&document.content)
+            .into_iter()
+            .flat_map(|record| [record.user_intent, record.raw_user_input]),
+    );
+    tokenize(&values.join(" ")).into_iter().take(32).collect()
+}
+
+pub fn tokenize(value: &str) -> Vec<String> {
+    let mut tokens = value
+        .split(|character: char| !character.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| token.chars().count() >= 2)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+pub fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut text = value.chars().take(max_chars).collect::<String>();
+    text.push_str("...");
+    text
 }
 
 pub fn write_markdown(path: &Path, content: &str) -> WorkspaceResult<()> {
@@ -288,6 +470,38 @@ pub fn write_markdown(path: &Path, content: &str) -> WorkspaceResult<()> {
 
 pub fn sha256(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
+}
+
+fn read_json<T>(path: &Path, invalid_code: &'static str, label: &str) -> WorkspaceResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| WorkspaceError::ToolDetails {
+            code: invalid_code,
+            message: format!("{label} is not valid JSON."),
+            category: "validation",
+            retryable: true,
+            details: serde_json::json!({"error": error.to_string()}),
+        })
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T, label: &str) -> WorkspaceResult<()> {
+    let content =
+        serde_json::to_vec_pretty(value).map_err(|error| WorkspaceError::ToolDetails {
+            code: "HISTORY_WRITE_FAILED",
+            message: format!("Unable to serialize {label}."),
+            category: "internal",
+            retryable: true,
+            details: serde_json::json!({"error": error.to_string()}),
+        })?;
+    atomic_write(path, &content)
 }
 
 fn atomic_write(target: &Path, content: &[u8]) -> WorkspaceResult<()> {

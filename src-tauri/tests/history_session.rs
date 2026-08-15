@@ -1,12 +1,22 @@
 mod common;
 
+use std::collections::BTreeMap;
+use std::env;
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 
 use coding_tools_mcp_desktop_lib::tools::{list_tools_for_profile, ToolContext};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use common::{assert_err, assert_ok, invoke};
+
+fn invoke_ok(ctx: &ToolContext, name: &str, args: Value) -> Value {
+    let result = invoke(ctx, name, args);
+    assert_ok(&result);
+    result
+}
 
 fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -17,59 +27,490 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
 }
 
 #[test]
-fn checkpoint_keeps_bootstrap_target_when_host_session_metadata_changes() {
+fn bootstrap_prefers_host_session_and_preserves_initial_input() {
     let (workspace, _harness, ctx) = test_context();
+    let first_request = "修复 bootstrap，首轮输入必须完整保存";
     let boot = invoke(
         &ctx,
         "history_session_bootstrap",
         json!({
-            "session_key": "stable-bootstrap-key",
-            "_host_session_key": "host-before"
+            "session_key": "explicit-but-lower-priority",
+            "_host_session_key": "chatgpt-session",
+            "initial_user_input": first_request
         }),
     );
     let boot = assert_ok(&boot);
-    assert_eq!(boot["session_key"], "stable-bootstrap-key");
+    assert_eq!(boot["session_key"], "chatgpt-session");
+    assert_eq!(boot["session_key_source"], "platform_conversation_id");
     assert_eq!(boot["current_path"], "docs/history-session/1.md");
-    assert_eq!(boot["host_session_key_mismatch"], true);
+    assert_eq!(boot["initial_input_captured"], true);
+    assert!(boot.get("all_history_summary").is_none());
+    assert!(boot.get("latest_handoff").is_none());
+    assert!(boot.get("session_summaries").is_none());
+    assert_eq!(
+        boot["history_read_mode"],
+        "bounded_state_with_on_demand_search_and_read"
+    );
+    assert!(boot["assistant_instructions"]
+        .as_str()
+        .unwrap_or("")
+        .contains("raw_user_input"));
 
-    let checkpoint = invoke(
+    let archive = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+        .expect("read archive");
+    assert!(archive.contains(first_request));
+    assert!(!archive.contains("继承的历史摘要"));
+    assert!(workspace
+        .path()
+        .join("docs/history-session/memory/state.json")
+        .is_file());
+    assert!(workspace
+        .path()
+        .join("docs/history-session/memory/manifest.json")
+        .is_file());
+}
+
+#[test]
+fn bootstrap_reports_missing_initial_input_without_claiming_capture() {
+    let (_workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "missing-input"}),
+    );
+    assert_eq!(boot["initial_input_captured"], false);
+    assert!(boot["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap_or("")
+            .contains("initial_user_input")));
+}
+
+#[test]
+fn bootstrap_retry_keeps_old_initial_input_and_appends_a_revision() {
+    let (workspace, _harness, ctx) = test_context();
+    assert_ok(&invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "initial-revision", "initial_user_input": "原始首轮请求"}),
+    ));
+    let retry = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "initial-revision", "initial_user_input": "补充后的首轮请求"}),
+    );
+    assert_eq!(retry["current_number"], 1);
+    let archive = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+        .expect("read archive");
+    assert!(archive.contains("原始首轮请求"));
+    assert!(archive.contains("补充后的首轮请求"));
+    assert!(archive.contains("initial-input revision-2"));
+}
+
+#[test]
+fn checkpoint_preserves_raw_input_and_superseding_revision_evidence() {
+    let (workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "checkpoint-chat", "initial_user_input": "第一个需求"}),
+    );
+    let args = json!({
+        "session_key": boot["session_key"],
+        "expected_path": boot["current_path"],
+        "turn_id": "turn-0001",
+        "raw_user_input": "把历史按需读取，password=hunter2",
+        "user_intent": "实现按需读取",
+        "decisions": ["使用 Bearer super-secret-token"],
+        "files_changed": ["src/history.rs"],
+        "next_actions": ["运行测试"]
+    });
+    let first = invoke_ok(&ctx, "history_session_checkpoint", args.clone());
+    assert_eq!(first["user_input_captured"], true);
+    assert_eq!(first["revision"], 1);
+    assert!(!first["warnings"].as_array().expect("warnings").is_empty());
+
+    let duplicate = invoke_ok(&ctx, "history_session_checkpoint", args.clone());
+    assert_eq!(duplicate["duplicate_ignored"], true);
+
+    let mut changed = args;
+    changed["raw_user_input"] = json!("把历史按需读取，并保留同 turn 修订证据");
+    changed["next_actions"] = json!(["运行完整回归"]);
+    let revision = invoke_ok(&ctx, "history_session_checkpoint", changed);
+    assert_eq!(revision["duplicate_ignored"], false);
+    assert_eq!(revision["revision"], 2);
+    assert_eq!(revision["supersedes"], "turn-0001 revision-1");
+
+    let archive = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+        .expect("read checkpoint archive");
+    assert!(archive.contains("[REDACTED]"));
+    assert!(!archive.contains("hunter2"));
+    assert!(!archive.contains("super-secret-token"));
+    assert!(archive.contains("turn-0001 revision-1"));
+    assert!(archive.contains("turn-0001 revision-2"));
+    assert!(archive.contains("运行完整回归"));
+}
+
+#[test]
+fn checkpoint_reports_missing_raw_user_input() {
+    let (_workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "missing-turn-input", "initial_user_input": "开始"}),
+    );
+    let checkpoint = invoke_ok(
         &ctx,
         "history_session_checkpoint",
         json!({
             "session_key": boot["session_key"],
             "expected_path": boot["current_path"],
-            "_host_session_key": "host-after",
-            "turn_id": "stable-turn",
-            "user_intent": "不能串写"
+            "turn_id": "missing-raw"
         }),
     );
-    let checkpoint = assert_ok(&checkpoint);
-    assert_eq!(checkpoint["path"], boot["current_path"]);
-    assert_eq!(checkpoint["session_key"], boot["session_key"]);
-    assert_eq!(checkpoint["host_session_key_mismatch"], true);
-    assert!(!workspace.path().join("docs/history-session/2.md").exists());
+    assert_eq!(checkpoint["user_input_captured"], false);
+    assert!(checkpoint["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning.as_str().unwrap_or("").contains("raw_user_input")));
+}
+
+#[test]
+fn search_and_read_return_precise_lossless_archive_pages() {
+    let (workspace, _harness, ctx) = test_context();
+    prepare_history(workspace.path());
+    let search = invoke_ok(
+        &ctx,
+        "history_session_search",
+        json!({"query": "精确记忆", "limit": 1}),
+    );
+    assert_eq!(search["total_matches"], 1);
+    let hit = &search["results"][0];
+    assert_eq!(hit["number"], 2);
+    assert_eq!(hit["path"], "docs/history-session/2.md");
+    assert!(hit["snippet"].as_str().unwrap_or("").contains("精确记忆"));
+
+    let first_page = invoke_ok(
+        &ctx,
+        "history_session_read",
+        json!({"number": 2, "max_bytes": 17}),
+    );
+    let cursor = first_page["next_cursor"].as_u64().expect("next cursor");
+    let second_page = invoke_ok(
+        &ctx,
+        "history_session_read",
+        json!({
+            "path": hit["path"],
+            "cursor": cursor,
+            "max_bytes": 65536,
+            "expected_hash": first_page["content_hash"]
+        }),
+    );
+    let reconstructed = format!(
+        "{}{}",
+        first_page["content"].as_str().unwrap_or(""),
+        second_page["content"].as_str().unwrap_or("")
+    );
+    let original = fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+        .expect("read original");
+    assert_eq!(reconstructed, original);
+    assert_eq!(second_page["next_cursor"], Value::Null);
+    assert_eq!(
+        assert_err(&invoke(
+            &ctx,
+            "history_session_read",
+            json!({"path": "docs/history-session/README.md"}),
+        ))["error"]["code"],
+        "HISTORY_READ_NOT_FOUND"
+    );
+}
+
+#[test]
+fn read_without_max_bytes_uses_bounded_lossless_pages() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("create history");
+    fs::write(
+        dir.join("1.md"),
+        history_file(
+            1,
+            "large-history",
+            &format!("精确上下文 {}", "x".repeat(80_000)),
+        ),
+    )
+    .expect("write archive");
+
+    let original = fs::read_to_string(dir.join("1.md")).expect("read original archive");
+    let mut reconstructed = String::new();
+    let mut cursor = 0;
+    let mut expected_hash = None::<String>;
+    let mut page_count = 0;
+
+    loop {
+        let mut args = json!({"number": 1, "cursor": cursor});
+        if let Some(hash) = &expected_hash {
+            args["expected_hash"] = json!(hash);
+        }
+        let page = invoke_ok(&ctx, "history_session_read", args);
+        let content = page["content"].as_str().expect("page content");
+        assert!(content.len() <= 32 * 1024, "default page exceeded 32 KiB");
+        reconstructed.push_str(content);
+        page_count += 1;
+        expected_hash = Some(
+            page["content_hash"]
+                .as_str()
+                .expect("content hash")
+                .to_string(),
+        );
+        match page["next_cursor"].as_u64() {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+
+    assert!(page_count > 1);
+    assert_eq!(reconstructed, original);
+    assert_eq!(
+        assert_err(&invoke(
+            &ctx,
+            "history_session_read",
+            json!({"number": 1, "max_bytes": 65537}),
+        ))["error"]["code"],
+        "HISTORY_CURSOR_INVALID"
+    );
+}
+
+#[test]
+fn search_snippet_handles_unicode_case_expansion_without_invalid_utf8_slicing() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("create history");
+    fs::write(
+        dir.join("1.md"),
+        history_file(
+            1,
+            "unicode-search",
+            &format!("İ{} 精确记忆", "x".repeat(100)),
+        ),
+    )
+    .expect("write unicode archive");
+
+    let search = invoke_ok(&ctx, "history_session_search", json!({"query": "精确记忆"}));
+    let snippet = search["results"][0]["snippet"].as_str().expect("snippet");
+    assert!(snippet.contains("精确记忆"));
+}
+
+#[test]
+fn rebuilds_derived_files_without_changing_existing_archives() {
+    let (workspace, _harness, ctx) = test_context();
+    prepare_history(workspace.path());
+    let before = archive_hashes(workspace.path());
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "new-chat", "initial_user_input": "创建新会话"}),
+    );
+    assert_eq!(boot["current_number"], 3);
+    assert_existing_archives_unchanged(workspace.path(), &before);
+
+    let memory = workspace.path().join("docs/history-session/memory");
+    fs::remove_file(memory.join("state.json")).expect("remove state");
+    fs::write(memory.join("manifest.json"), "{broken-json").expect("break manifest");
+    let validate = invoke_ok(&ctx, "history_session_validate", json!({"repair": true}));
+    assert_eq!(validate["repaired"], true);
+    assert_existing_archives_unchanged(workspace.path(), &before);
+    assert!(memory.join("state.json").is_file());
+    assert!(memory.join("manifest.json").is_file());
+}
+
+#[test]
+fn bootstrap_response_stays_bounded_for_many_large_archives() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("create history");
+    let marker = "x".repeat(80_000);
+    for number in 1..=40 {
+        fs::write(
+            dir.join(format!("{number}.md")),
+            history_file(
+                number,
+                &format!("old-{number}"),
+                &format!("精确记忆 {number} {marker}"),
+            ),
+        )
+        .expect("write archive");
+    }
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "large-new", "initial_user_input": "新会话"}),
+    );
+    assert!(serde_json::to_vec(&boot).expect("serialize boot").len() < 64 * 1024);
+    assert_eq!(boot["history_count"], 41);
+    assert!(boot.get("latest_handoff").is_none());
+    assert!(boot.get("all_history_summary").is_none());
+}
+
+#[test]
+fn real_history_fixture_preserves_archives_when_opted_in() {
+    let Ok(source) = env::var("HISTORY_SESSION_REAL_FIXTURE") else {
+        return;
+    };
+    let source = Path::new(&source);
+    assert!(source.is_dir(), "real fixture directory is missing");
+
+    let (workspace, _harness, ctx) = test_context();
+    let target = workspace.path().join("docs/history-session");
+    copy_directory(source, &target);
+    let before = archive_hashes(workspace.path());
+    assert_eq!(before.len(), 40, "expected the 40-archive real fixture");
+
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "real-fixture-new-session",
+            "initial_user_input": "验证大规模历史档案不会膨胀 bootstrap 响应"
+        }),
+    );
+    assert_eq!(boot["history_count"], 41);
+    assert!(
+        serde_json::to_vec(&boot)
+            .expect("serialize bootstrap")
+            .len()
+            < 64 * 1024
+    );
+    assert_existing_archives_unchanged(workspace.path(), &before);
+
+    let memory = target.join("memory");
+    fs::remove_file(memory.join("state.json")).expect("remove derived state");
+    fs::write(memory.join("manifest.json"), "{broken-json").expect("break manifest");
+    let validate = invoke_ok(&ctx, "history_session_validate", json!({"repair": true}));
+    assert_eq!(validate["repaired"], true);
+    assert_existing_archives_unchanged(workspace.path(), &before);
+
+    let search = invoke_ok(
+        &ctx,
+        "history_session_search",
+        json!({"query": "all_history_summary", "limit": 50}),
+    );
+    assert!(search["results"]
+        .as_array()
+        .expect("search results")
+        .iter()
+        .any(|hit| hit["number"] == 40));
+
+    let original = fs::read_to_string(target.join("40.md")).expect("read copied archive");
+    let mut reconstructed = String::new();
+    let mut cursor = 0;
+    let mut expected_hash = None::<String>;
+    loop {
+        let mut args = json!({"number": 40, "cursor": cursor, "max_bytes": 8192});
+        if let Some(hash) = &expected_hash {
+            args["expected_hash"] = json!(hash);
+        }
+        let page = invoke_ok(&ctx, "history_session_read", args);
+        expected_hash = Some(
+            page["content_hash"]
+                .as_str()
+                .expect("content hash")
+                .to_string(),
+        );
+        reconstructed.push_str(page["content"].as_str().expect("page content"));
+        match page["next_cursor"].as_u64() {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assert_eq!(reconstructed, original);
+}
+
+#[test]
+fn history_tools_are_exposed_with_public_schemas() {
+    let tools = list_tools_for_profile("core");
+    for name in [
+        "history_session_bootstrap",
+        "history_session_checkpoint",
+        "history_session_validate",
+        "history_session_search",
+        "history_session_read",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool: {name}"));
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert!(tool["inputSchema"]["properties"]
+            .get("_host_session_key")
+            .is_none());
+    }
+    let bootstrap = tools
+        .iter()
+        .find(|tool| tool["name"] == "history_session_bootstrap")
+        .expect("bootstrap descriptor");
+    assert!(bootstrap["description"]
+        .as_str()
+        .unwrap_or("")
+        .contains("initial_user_input"));
+    let checkpoint = tools
+        .iter()
+        .find(|tool| tool["name"] == "history_session_checkpoint")
+        .expect("checkpoint schema");
+    assert_eq!(
+        checkpoint["inputSchema"]["required"],
+        json!(["session_key", "expected_path"])
+    );
+    assert!(checkpoint["inputSchema"]["properties"]
+        .get("raw_user_input")
+        .is_some());
+    let read = tools
+        .iter()
+        .find(|tool| tool["name"] == "history_session_read")
+        .expect("read schema");
+    assert_eq!(
+        read["inputSchema"]["properties"]["max_bytes"]["default"],
+        32768
+    );
+    assert_eq!(
+        read["inputSchema"]["properties"]["max_bytes"]["maximum"],
+        65536
+    );
+}
+
+#[test]
+fn bootstrap_requires_a_stable_session_id() {
+    let (_workspace, _harness, ctx) = test_context();
+    let result = invoke(&ctx, "history_session_bootstrap", json!({}));
+    assert_eq!(
+        assert_err(&result)["error"]["code"],
+        "SESSION_ID_UNAVAILABLE"
+    );
 }
 
 #[test]
 fn checkpoint_rejects_a_path_from_another_session() {
     let (_workspace, _harness, ctx) = test_context();
-    assert_ok(&invoke(
+    let first = invoke_ok(
         &ctx,
         "history_session_bootstrap",
-        json!({"session_key": "session-a"}),
-    ));
-    assert_ok(&invoke(
+        json!({"session_key": "session-a", "initial_user_input": "a"}),
+    );
+    let second = invoke_ok(
         &ctx,
         "history_session_bootstrap",
-        json!({"session_key": "session-b"}),
-    ));
-
+        json!({"session_key": "session-b", "initial_user_input": "b"}),
+    );
     let result = invoke(
         &ctx,
         "history_session_checkpoint",
         json!({
-            "session_key": "session-a",
-            "expected_path": "docs/history-session/2.md",
+            "session_key": first["session_key"],
+            "expected_path": second["current_path"],
             "turn_id": "wrong-target"
         }),
     );
@@ -80,65 +521,66 @@ fn checkpoint_rejects_a_path_from_another_session() {
 }
 
 #[test]
-fn inherited_summary_is_preserved_without_recursive_growth() {
+fn workspace_root_and_history_paths_cannot_escape_workspace() {
     let (workspace, _harness, ctx) = test_context();
-    prepare_history(workspace.path());
-    let boot = invoke(
+    let relative = invoke_ok(
         &ctx,
         "history_session_bootstrap",
-        json!({"session_key": "summary-session"}),
+        json!({"workspace_root": ".", "session_key": "relative-root", "initial_user_input": "x"}),
     );
-    let boot = assert_ok(&boot);
-    assert_ok(&invoke(
+    assert_eq!(relative["current_number"], 1);
+    let outside = invoke(
         &ctx,
-        "history_session_checkpoint",
+        "history_session_validate",
         json!({
-            "session_key": boot["session_key"],
-            "expected_path": boot["current_path"],
-            "turn_id": "summary-turn",
-            "user_intent": "继续实现"
+            "workspace_root": workspace.path().parent().unwrap().to_string_lossy(),
+            "repair": false
         }),
-    ));
-    let content = fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
-        .expect("read preserved inherited summary");
-    assert_eq!(content.matches("## 继承的历史摘要").count(), 1);
-    assert!(content.contains("目标-第一阶段"));
-    assert!(content.contains("继续实现"));
-
-    let next = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "next-summary-session"}),
     );
-    assert_ok(&next);
-    let next_content = fs::read_to_string(workspace.path().join("docs/history-session/4.md"))
-        .expect("read next inherited summary");
-    assert_eq!(next_content.matches("## 继承的历史摘要").count(), 1);
-    assert!(next_content.contains("### 会话 3（docs/history-session/3.md）"));
+    assert_eq!(
+        assert_err(&outside)["error"]["code"],
+        "PATH_OUTSIDE_WORKSPACE"
+    );
+    let traversal = invoke(
+        &ctx,
+        "history_session_read",
+        json!({"history_dir": "../outside", "number": 1}),
+    );
+    assert_eq!(
+        assert_err(&traversal)["error"]["code"],
+        "PATH_OUTSIDE_WORKSPACE"
+    );
 }
 
 #[test]
-fn inherited_summary_is_bounded_and_reports_omitted_sessions() {
-    let (workspace, _harness, ctx) = test_context();
-    let dir = workspace.path().join("docs/history-session");
-    fs::create_dir_all(&dir).expect("create history dir");
-    let large_marker = "X".repeat(4_000);
-    for number in 1..=12 {
-        fs::write(
-            dir.join(format!("{number}.md")),
-            history_file(number, &format!("session-{number}"), &large_marker),
-        )
-        .expect("write large history");
-    }
-    let boot = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "bounded-summary"}),
-    );
-    assert_ok(&boot);
-    let content = fs::read_to_string(dir.join("13.md")).expect("read bounded summary");
-    assert!(content.contains("个较早会话未展开"));
-    assert!(content.chars().count() < 20_000);
+fn concurrent_bootstrap_allocates_distinct_numbers() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let barrier = Arc::new(Barrier::new(2));
+    let root = workspace.path().to_path_buf();
+    let handles = ["parallel-a", "parallel-b"].map(|session_key| {
+        let root = root.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let harness = tempfile::tempdir().expect("harness tempdir");
+            let ctx = ToolContext::for_test(root, harness.path().to_path_buf())
+                .expect("parallel context");
+            barrier.wait();
+            let result = invoke(
+                &ctx,
+                "history_session_bootstrap",
+                json!({"session_key": session_key, "initial_user_input": session_key}),
+            );
+            assert_ok(&result)["current_number"]
+                .as_u64()
+                .expect("current number")
+        })
+    });
+    let mut numbers = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("bootstrap thread"))
+        .collect::<Vec<_>>();
+    numbers.sort_unstable();
+    assert_eq!(numbers, vec![1, 2]);
 }
 
 fn history_file(number: u64, session_key: &str, marker: &str) -> String {
@@ -148,14 +590,8 @@ fn history_file(number: u64, session_key: &str, marker: &str) -> String {
 **Created:** 2026-07-17T08:00:00+08:00\n\
 **Updated:** 2026-07-17T09:00:00+08:00\n\
 **Status:** completed\n\n\
-## 用户核心目标\n\n目标-{marker}\n\n\
+## 用户核心目标\n\n{marker}\n\n\
 ## 已确认事实\n\n事实-{marker}\n\n\
-## 已完成修改\n\n修改-{marker}\n\n\
-## 关键设计决定\n\n决定-{marker}\n\n\
-## 测试结果\n\n测试-{marker}\n\n\
-## 当前运行状态\n\n运行-{marker}\n\n\
-## 剩余问题\n\n问题-{marker}\n\n\
-## 下一步\n\n下一步-{marker}\n\n\
 ## 本轮检查点\n"
     )
 }
@@ -171,456 +607,46 @@ fn prepare_history(root: &std::path::Path) {
     .expect("write 1.md");
     fs::write(
         dir.join("2.md"),
-        history_file(2, "old-session-2", "第二阶段"),
+        history_file(2, "old-session-2", "第二阶段 精确记忆"),
     )
     .expect("write 2.md");
 }
 
-#[test]
-fn history_tools_are_exposed_with_public_schemas() {
-    let tools = list_tools_for_profile("core");
-    for name in [
-        "history_session_bootstrap",
-        "history_session_checkpoint",
-        "history_session_validate",
-    ] {
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap_or_else(|| panic!("missing tool: {name}"));
-        assert_eq!(tool["inputSchema"]["type"], "object");
-        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
-        assert!(tool["inputSchema"]["properties"]
-            .get("_host_session_key")
-            .is_none());
-    }
-
-    let bootstrap = tools
-        .iter()
-        .find(|tool| tool["name"] == "history_session_bootstrap")
-        .expect("bootstrap descriptor");
-    assert!(bootstrap["description"]
-        .as_str()
-        .unwrap_or("")
-        .contains("restore"));
-    let checkpoint_description = tools
-        .iter()
-        .find(|tool| tool["name"] == "history_session_checkpoint")
-        .expect("checkpoint descriptor")["description"]
-        .as_str()
-        .unwrap_or("");
-    assert!(!checkpoint_description.contains("before every final response"));
-    assert!(!checkpoint_description.contains("ChatGPT"));
-
-    let checkpoint = tools
-        .iter()
-        .find(|tool| tool["name"] == "history_session_checkpoint")
-        .expect("checkpoint schema");
-    assert_eq!(
-        checkpoint["inputSchema"]["required"],
-        json!(["session_key", "expected_path"])
-    );
-}
-
-#[test]
-fn bootstrap_requires_a_stable_session_id() {
-    let (_workspace, _harness, ctx) = test_context();
-    let result = invoke(&ctx, "history_session_bootstrap", json!({}));
-    let payload = assert_err(&result);
-    assert_eq!(payload["error"]["code"], "SESSION_ID_UNAVAILABLE");
-}
-
-#[test]
-fn workspace_root_mismatch_is_a_warning_and_still_uses_configured_root() {
-    let (workspace, _harness, ctx) = test_context();
-    let relative = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"workspace_root": ".", "session_key": "relative-root"}),
-    );
-    assert_eq!(assert_ok(&relative)["current_number"], 1);
-
-    let absolute = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({
-            "workspace_root": workspace.path().to_string_lossy(),
-            "session_key": "absolute-root"
-        }),
-    );
-    assert_eq!(assert_ok(&absolute)["current_number"], 2);
-
-    // workspace_root 指向工作区外（跨设备 / 旧路径场景）：不应锁死历史流程，
-    // 而是告警并忽略客户端值，始终写入当前工作区根目录
-    let outside = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({
-            "workspace_root": workspace.path().parent().unwrap().to_string_lossy(),
-            "session_key": "outside-root"
-        }),
-    );
-    let outside = assert_ok(&outside);
-    assert_eq!(outside["current_number"], 3);
-    let warnings = outside["warnings"].as_array().unwrap();
-    assert!(warnings
-        .iter()
-        .any(|warning| warning.as_str().unwrap_or("").contains("workspace_root")));
-    // 会话仍落在当前工作区根目录内
-    assert!(workspace.path().join("docs/history-session/3.md").is_file());
-}
-
-#[test]
-fn checkpoint_without_workspace_root_uses_the_configured_workspace_root() {
-    // 回归保护：即使客户端完全不传 workspace_root（只传 session_key 与
-    // expected_path），checkpoint 也必须基于当前工作区根目录正常写入，
-    // 不得返回 PATH_OUTSIDE_WORKSPACE。
-    let (workspace, _harness, ctx) = test_context();
-    let boot = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "cross-device-key"}),
-    );
-    let boot = assert_ok(&boot);
-    let checkpoint = invoke(
-        &ctx,
-        "history_session_checkpoint",
-        json!({
-            "session_key": boot["session_key"],
-            "expected_path": boot["current_path"],
-            "turn_id": "turn-0001",
-            "user_intent": "跨设备继续"
-        }),
-    );
-    let checkpoint = assert_ok(&checkpoint);
-    assert_eq!(checkpoint["expected_path"], boot["current_path"]);
-    assert!(checkpoint["warnings"].as_array().unwrap().is_empty());
-    assert!(workspace.path().join("docs/history-session/1.md").is_file());
-}
-
-#[test]
-fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
-    let (workspace, _harness, ctx) = test_context();
-    prepare_history(workspace.path());
-
-    let first = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "current-chat", "title": "继续开发"}),
-    );
-    let first = assert_ok(&first);
-    assert_eq!(first["is_new_session"], true);
-    assert_eq!(first["session_key"], "current-chat");
-    assert_eq!(first["session_key_source"], "explicit_session_key");
-    assert_eq!(first["history_numbers"], json!([1, 2]));
-    assert_eq!(first["history_count"], 2);
-    assert_eq!(first["latest_completed_number"], 2);
-    assert_eq!(first["latest_completed_path"], "docs/history-session/2.md");
-    assert_eq!(first["current_number"], 3);
-    assert_eq!(first["current_path"], "docs/history-session/3.md");
-    assert_eq!(first["created"], true);
-    assert_eq!(first["resumed"], false);
-    assert_eq!(first["sequence_valid"], true);
-    assert_eq!(first["history_read_mode"], "all_summaries_plus_latest_full");
-    assert_eq!(first["full_history_included"], false);
-    assert!(first["total_history_bytes"].as_u64().unwrap_or(0) > 0);
-    assert_eq!(first["history_digest"].as_str().unwrap_or("").len(), 64);
-    assert_eq!(first["persistence_mode"], "model_mediated_tool_calls");
-    assert!(first["assistant_instructions"]
-        .as_str()
-        .unwrap_or("")
-        .contains("history_session_checkpoint"));
-    assert!(first["assistant_instructions"]
-        .as_str()
-        .unwrap_or("")
-        .contains("After completing each user-requested task"));
-    assert!(first["assistant_instructions"]
-        .as_str()
-        .unwrap_or("")
-        .contains("before the final response"));
-    assert!(first["assistant_instructions"]
-        .as_str()
-        .unwrap_or("")
-        .contains("checkpoint returns ok=true"));
-    assert_eq!(
-        first["checkpoint_policy"]["required_before_final_response"],
-        true
-    );
-    assert_eq!(
-        first["checkpoint_policy"]["tool"],
-        "history_session_checkpoint"
-    );
-    assert_eq!(first["checkpoint_policy"]["session_key"], "current-chat");
-    assert_eq!(
-        first["checkpoint_policy"]["expected_path"],
-        "docs/history-session/3.md"
-    );
-    assert_eq!(first["checkpoint_policy"]["stable_target_required"], true);
-    assert_eq!(
-        first["required_next_actions"],
-        json!([
-            "read_all_history_summary",
-            "read_latest_handoff",
-            "verify_workspace_state",
-            "execute_user_task",
-            "checkpoint_after_each_completed_task"
-        ])
-    );
-    assert_eq!(first["session_summaries"].as_array().unwrap().len(), 2);
-    assert_eq!(first["session_summaries"][0]["number"], 1);
-    assert_eq!(first["session_summaries"][1]["number"], 2);
-    assert!(first["session_summaries"][0]["summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("目标-第一阶段"));
-    assert!(first["all_history_summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("决定-第一阶段"));
-    assert_eq!(
-        first["latest_handoff"],
-        history_file(2, "old-session-2", "第二阶段")
-    );
-    assert!(workspace.path().join("docs/history-session/3.md").is_file());
-    let inherited = fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
-        .expect("read inherited summary");
-    assert!(inherited.contains("## 继承的历史摘要"));
-    assert!(inherited.contains("### 会话 1（docs/history-session/1.md）"));
-    assert!(inherited.contains("### 会话 2（docs/history-session/2.md）"));
-    assert!(first["inherited_summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("目标-第一阶段"));
-
-    let second = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "current-chat", "title": "标题变化也不新建"}),
-    );
-    let second = assert_ok(&second);
-    assert_eq!(second["current_number"], 3);
-    assert_eq!(second["created"], false);
-    assert_eq!(second["resumed"], true);
-    assert!(!workspace.path().join("docs/history-session/4.md").exists());
-}
-
-#[test]
-fn checkpoint_is_idempotent_updates_changed_turn_and_redacts_secrets() {
-    let (workspace, _harness, ctx) = test_context();
-    let boot = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "checkpoint-chat"}),
-    );
-    assert_ok(&boot);
-
-    let args = json!({
-        "session_key": "checkpoint-chat",
-        "expected_path": "docs/history-session/1.md",
-        "turn_id": "turn-0001",
-        "timestamp": "2026-07-17T11:00:00+08:00",
-        "user_intent": "实现归档",
-        "findings": ["接口已确认"],
-        "decisions": ["使用 Bearer super-secret-token"],
-        "files_changed": ["src/history.rs"],
-        "tests": ["cargo test 通过"],
-        "runtime_state": ["服务运行中"],
-        "remaining_issues": ["无"],
-        "next_actions": ["继续验证"],
-        "notes": "password=hunter2"
-    });
-    let first = invoke(&ctx, "history_session_checkpoint", args.clone());
-    let first = assert_ok(&first);
-    assert_eq!(first["session_number"], 1);
-    assert_eq!(first["path"], "docs/history-session/1.md");
-    assert_eq!(first["session_key"], "checkpoint-chat");
-    assert_eq!(first["expected_path"], "docs/history-session/1.md");
-    assert_eq!(first["turn_id"], "turn-0001");
-    assert_eq!(first["duplicate_ignored"], false);
-    assert_eq!(first["content_hash"].as_str().unwrap_or("").len(), 64);
-    assert!(!first["warnings"].as_array().unwrap().is_empty());
-
-    let content = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
-        .expect("read checkpoint");
-    assert!(content.contains("[REDACTED]"));
-    assert!(!content.contains("super-secret-token"));
-    assert!(!content.contains("hunter2"));
-
-    let duplicate = invoke(&ctx, "history_session_checkpoint", args.clone());
-    let duplicate = assert_ok(&duplicate);
-    assert_eq!(duplicate["duplicate_ignored"], true);
-    let duplicate_content = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
-        .expect("read duplicate checkpoint");
-    assert_eq!(duplicate_content.matches("### turn-0001").count(), 1);
-
-    let mut changed = args;
-    changed["next_actions"] = json!(["运行完整回归"]);
-    let updated = invoke(&ctx, "history_session_checkpoint", changed);
-    let updated = assert_ok(&updated);
-    assert_eq!(updated["duplicate_ignored"], false);
-    assert_eq!(updated["updated"], true);
-    let updated_content = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
-        .expect("read updated checkpoint");
-    assert_eq!(updated_content.matches("### turn-0001").count(), 1);
-    let second_turn = invoke(
-        &ctx,
-        "history_session_checkpoint",
-        json!({
-            "session_key": "checkpoint-chat",
-            "expected_path": "docs/history-session/1.md",
-            "turn_id": "turn-0002",
-            "user_intent": "second turn",
-            "next_actions": ["deliver"]
-        }),
-    );
-    assert_ok(&second_turn);
-    let ordered = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
-        .expect("read ordered checkpoints");
-    assert!(ordered.find("### turn-0001").unwrap() < ordered.find("### turn-0002").unwrap());
-    assert!(updated_content.contains("运行完整回归"));
-    assert!(!updated_content.contains("继续验证"));
-}
-
-#[test]
-fn checkpoint_rejects_sessions_that_were_not_bootstrapped() {
-    let (_workspace, _harness, ctx) = test_context();
-    let result = invoke(
-        &ctx,
-        "history_session_checkpoint",
-        json!({
-            "session_key": "unknown-chat",
-            "expected_path": "docs/history-session/99.md",
-            "turn_id": "turn-1"
-        }),
-    );
-    let payload = assert_err(&result);
-    assert_eq!(payload["error"]["code"], "SESSION_NOT_BOOTSTRAPPED");
-}
-
-#[test]
-fn checkpoint_generates_a_stable_turn_id_when_the_client_omits_it() {
-    let (_workspace, _harness, ctx) = test_context();
-    let boot = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({"session_key": "automatic-turn-id"}),
-    );
-    assert_ok(&boot);
-
-    let args = json!({
-        "session_key": "automatic-turn-id",
-        "expected_path": "docs/history-session/1.md",
-        "user_intent": "保存当前进度",
-        "findings": ["工具目录缓存已确认"],
-        "next_actions": ["重新配置连接后新开会话"]
-    });
-    let first_result = invoke(&ctx, "history_session_checkpoint", args.clone());
-    let first = assert_ok(&first_result);
-    let turn_id = first["turn_id"].as_str().expect("generated turn id");
-    assert!(turn_id.starts_with("auto-"));
-
-    let duplicate_result = invoke(&ctx, "history_session_checkpoint", args);
-    let duplicate = assert_ok(&duplicate_result);
-    assert_eq!(duplicate["turn_id"], turn_id);
-    assert_eq!(duplicate["duplicate_ignored"], true);
-}
-
-#[test]
-fn validate_reports_gaps_and_can_rebuild_a_missing_index() {
-    let (workspace, _harness, ctx) = test_context();
-    let dir = workspace.path().join("docs/history-session");
-    fs::create_dir_all(&dir).expect("create history dir");
-    fs::write(dir.join("1.md"), history_file(1, "gap-one", "一")).expect("write 1.md");
-    fs::write(dir.join("3.md"), history_file(3, "gap-three", "三")).expect("write 3.md");
-    fs::write(dir.join("bad.md"), "invalid").expect("write invalid file");
-    fs::write(dir.join("4.md"), "").expect("write empty file");
-
-    let readonly = invoke(&ctx, "history_session_validate", json!({"repair": false}));
-    let readonly = assert_ok(&readonly);
-    assert_eq!(readonly["sequence_valid"], false);
-    assert_eq!(readonly["numbers"], json!([1, 3, 4]));
-    assert_eq!(readonly["missing_numbers"], json!([2]));
-    assert!(readonly["invalid_files"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("bad.md")));
-    assert!(readonly["empty_files"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("4.md")));
-    assert_eq!(readonly["latest_number"], 4);
-    assert_eq!(readonly["latest_path"], "docs/history-session/4.md");
-    assert!(!dir.join("index.json").exists());
-    assert!(!dir.join("2.md").exists());
-    fs::write(dir.join("index.json"), "{broken-json").expect("write broken index");
-
-    let repaired = invoke(&ctx, "history_session_validate", json!({"repair": true}));
-    let repaired = assert_ok(&repaired);
-    assert_eq!(repaired["repaired"], true);
-    assert_eq!(repaired["index_status"], "invalid");
-    assert!(dir.join("index.json").is_file());
-    assert!(!dir.join("2.md").exists());
-    let index: Value = serde_json::from_str(
-        &fs::read_to_string(dir.join("index.json")).expect("read rebuilt index"),
-    )
-    .expect("valid index json");
-    assert_eq!(index["sessions"]["gap-one"]["number"], 1);
-    assert_eq!(index["sessions"]["gap-three"]["number"], 3);
-}
-
-#[test]
-fn history_dir_cannot_escape_the_workspace() {
-    let (workspace, _harness, ctx) = test_context();
-    let result = invoke(
-        &ctx,
-        "history_session_validate",
-        json!({"history_dir": "../outside", "repair": false}),
-    );
-    let payload = assert_err(&result);
-    assert_eq!(payload["error"]["code"], "PATH_OUTSIDE_WORKSPACE");
-    let absolute = invoke(
-        &ctx,
-        "history_session_validate",
-        json!({
-            "history_dir": workspace.path().parent().unwrap().to_string_lossy(),
-            "repair": false
-        }),
-    );
-    let absolute = assert_err(&absolute);
-    assert_eq!(absolute["error"]["code"], "PATH_OUTSIDE_WORKSPACE");
-}
-
-#[test]
-fn concurrent_bootstrap_allocates_distinct_numbers() {
-    let workspace = tempfile::tempdir().expect("workspace tempdir");
-    let barrier = Arc::new(Barrier::new(2));
-    let root = workspace.path().to_path_buf();
-
-    let handles = ["parallel-a", "parallel-b"].map(|session_key| {
-        let root = root.clone();
-        let barrier = Arc::clone(&barrier);
-        std::thread::spawn(move || {
-            let harness = tempfile::tempdir().expect("harness tempdir");
-            let ctx = ToolContext::for_test(root, harness.path().to_path_buf())
-                .expect("parallel context");
-            barrier.wait();
-            let result = invoke(
-                &ctx,
-                "history_session_bootstrap",
-                json!({"session_key": session_key}),
-            );
-            assert_ok(&result)["current_number"]
-                .as_u64()
-                .expect("current number")
+fn archive_hashes(root: &std::path::Path) -> BTreeMap<String, String> {
+    let dir = root.join("docs/history-session");
+    fs::read_dir(dir)
+        .expect("list archives")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let numeric_markdown = name
+                .strip_suffix(".md")
+                .and_then(|stem| stem.parse::<u64>().ok())
+                .is_some();
+            numeric_markdown.then(|| {
+                let content = fs::read(entry.path()).expect("read archive");
+                (name, format!("{:x}", Sha256::digest(content)))
+            })
         })
-    });
+        .collect()
+}
 
-    let mut numbers = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("bootstrap thread"))
-        .collect::<Vec<_>>();
-    numbers.sort_unstable();
-    assert_eq!(numbers, vec![1, 2]);
-    assert!(workspace.path().join("docs/history-session/1.md").is_file());
-    assert!(workspace.path().join("docs/history-session/2.md").is_file());
+fn assert_existing_archives_unchanged(root: &std::path::Path, before: &BTreeMap<String, String>) {
+    let after = archive_hashes(root);
+    for (path, hash) in before {
+        assert_eq!(after.get(path), Some(hash), "archive changed: {path}");
+    }
+}
+
+fn copy_directory(source: &Path, target: &Path) {
+    fs::create_dir_all(target).expect("create copied history directory");
+    for entry in fs::read_dir(source).expect("read fixture directory") {
+        let entry = entry.expect("fixture entry");
+        let destination = target.join(entry.file_name());
+        if entry.file_type().expect("fixture entry type").is_dir() {
+            copy_directory(&entry.path(), &destination);
+        } else {
+            fs::copy(entry.path(), destination).expect("copy fixture file");
+        }
+    }
 }

@@ -114,6 +114,8 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
+        "history_session_search" => history::search(ctx, &effective_args),
+        "history_session_read" => history::read(ctx, &effective_args),
         "server_info" => server_info(ctx),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),

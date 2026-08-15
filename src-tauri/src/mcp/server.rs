@@ -57,7 +57,7 @@ fn initialize_result() -> Value {
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence."
     })
 }
 
@@ -130,15 +130,13 @@ pub fn new_state(
     tool_profile: String,
     permission_mode: String,
 ) -> SharedState {
-    new_state_with_external_mcp(
+    Arc::new(ToolContext::from_workspace(
         workspace,
         auth,
         policy,
         tool_profile,
         permission_mode,
-        String::new(),
-        None,
-    )
+    ))
 }
 
 pub fn new_state_with_external_mcp(
@@ -148,7 +146,7 @@ pub fn new_state_with_external_mcp(
     tool_profile: String,
     permission_mode: String,
     workspace_id: String,
-    external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+    external_manager: Option<std::sync::Arc<crate::external_mcp::ExternalMcpManager>>,
 ) -> SharedState {
     Arc::new(ToolContext::from_workspace_with_external_mcp(
         workspace,
@@ -157,7 +155,7 @@ pub fn new_state_with_external_mcp(
         tool_profile,
         permission_mode,
         workspace_id,
-        external_mcp,
+        external_manager,
     ))
 }
 
@@ -179,10 +177,14 @@ mod tests {
         assert!(instructions.contains("history_session_bootstrap"));
         assert!(instructions.contains("At the start of every new ChatGPT conversation"));
         assert!(instructions.contains("before answering the user's first request"));
-        assert!(instructions.contains("even if the user did not explicitly ask"));
         assert!(instructions.contains("required conversation initialization"));
+        assert!(instructions.contains("initial_user_input"));
         assert!(instructions.contains("must not create duplicates"));
         assert!(instructions.contains("history_session_checkpoint"));
+        assert!(instructions.contains("raw_user_input"));
+        assert!(instructions.contains("history_session_search"));
+        assert!(instructions.contains("history_session_read"));
+        assert!(instructions.contains("follow next_cursor"));
         assert!(instructions.contains("session_key and current_path returned by bootstrap"));
         assert!(instructions.contains("session_key and expected_path"));
         assert!(instructions.contains("After completing each user-requested task"));
@@ -205,7 +207,9 @@ mod tests {
         assert!(component.contains("ChatGPT 新会话启动提示词"));
         assert!(component.contains("请初始化或恢复当前项目会话"));
         assert!(component.contains("如果没有历史记录"));
-        assert!(component.contains("all_history_summary"));
+        assert!(component.contains("initial_user_input"));
+        assert!(component.contains("raw_user_input"));
+        assert!(component.contains("history_session_search"));
         assert!(component.contains("history_session_checkpoint"));
         assert!(!component.contains("打开连接器设置"));
     }
@@ -226,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_session_key_prevents_changed_chatgpt_metadata_from_redirecting_history() {
+    fn host_session_key_takes_precedence_over_explicit_session_key() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");
         let state = Arc::new(
@@ -241,20 +245,23 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "history_session_bootstrap",
-                    "arguments": {"session_key": "explicit-session"},
+                    "arguments": {
+                        "session_key": "explicit-session",
+                        "initial_user_input": "保存首轮原文"
+                    },
                     "_meta": {"openai/session": "chatgpt-session"}
                 }
             }),
         );
         let structured = &response["result"]["structuredContent"];
         assert_eq!(structured["ok"], true);
-        assert_eq!(structured["session_key_source"], "explicit_session_key");
-        assert_eq!(structured["session_key"], "explicit-session");
-        assert_eq!(structured["host_session_key_mismatch"], true);
+        assert_eq!(structured["session_key_source"], "platform_conversation_id");
+        assert_eq!(structured["session_key"], "chatgpt-session");
+        assert_eq!(structured["initial_input_captured"], true);
         let content = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
             .expect("read history file");
-        assert!(content.contains("**Session key:** explicit-session"));
-        assert!(!content.contains("**Session key:** chatgpt-session"));
+        assert!(content.contains("**Session key:** chatgpt-session"));
+        assert!(!content.contains("**Session key:** explicit-session"));
     }
 
     #[test]

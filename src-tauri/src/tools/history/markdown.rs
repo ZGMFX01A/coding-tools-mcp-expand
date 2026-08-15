@@ -4,10 +4,10 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::model::CheckpointRecord;
+use super::model::{CheckpointRecord, InitialInputRecord};
 
 const CHECKPOINT_HEADING: &str = "## 本轮检查点";
-const INHERITED_SUMMARY_HEADING: &str = "继承的历史摘要";
+const INITIAL_INPUT_HEADING: &str = "## 首次用户输入";
 
 pub fn metadata(content: &str, label: &str) -> Option<String> {
     let prefix = format!("**{label}:**");
@@ -38,9 +38,7 @@ pub fn render_document(
     title: &str,
     session_key: &str,
     created_at: &str,
-    updated_at: &str,
-    status: &str,
-    records: &[CheckpointRecord],
+    initial_input: Option<&InitialInputRecord>,
 ) -> String {
     let title = if title.trim().is_empty() {
         "开发会话"
@@ -51,139 +49,109 @@ pub fn render_document(
         "# 会话 {number}：{title}\n\n\
 **Session key:** {session_key}\n\
 **Created:** {created_at}\n\
-**Updated:** {updated_at}\n\
-**Status:** {status}\n\n"
+**Updated:** {created_at}\n\
+**Status:** active\n\n\
+{INITIAL_INPUT_HEADING}\n\n"
     );
-    push_section(
-        &mut output,
-        "用户核心目标",
-        records
-            .iter()
-            .map(|record| record.user_intent.as_str())
-            .filter(|value| !value.is_empty()),
-    );
-    push_section(
-        &mut output,
-        "已确认事实",
-        records
-            .iter()
-            .flat_map(|record| record.findings.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "已完成修改",
-        records
-            .iter()
-            .flat_map(|record| record.files_changed.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "关键设计决定",
-        records
-            .iter()
-            .flat_map(|record| record.decisions.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "测试结果",
-        records
-            .iter()
-            .flat_map(|record| record.tests.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "当前运行状态",
-        records
-            .iter()
-            .flat_map(|record| record.runtime_state.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "剩余问题",
-        records
-            .iter()
-            .flat_map(|record| record.remaining_issues.iter().map(String::as_str)),
-    );
-    push_section(
-        &mut output,
-        "下一步",
-        records
-            .iter()
-            .flat_map(|record| record.next_actions.iter().map(String::as_str)),
-    );
+    if let Some(input) = initial_input {
+        push_json_block(&mut output, "initial-input revision-1", input);
+    } else {
+        output.push_str("未提供首次用户输入；服务端无法读取未作为工具参数传入的聊天内容。\n\n");
+    }
     output.push_str(CHECKPOINT_HEADING);
     output.push_str("\n\n");
-    for record in records {
-        output.push_str("### ");
-        output.push_str(&record.turn_id);
-        output.push_str("\n\n```json\n");
-        output.push_str(
-            &serde_json::to_string_pretty(record).expect("checkpoint record is serializable"),
-        );
-        output.push_str("\n```\n\n");
-    }
     output
 }
 
-pub fn attach_inherited_summary(mut content: String, summary: &str) -> String {
-    let summary = summary.trim();
-    if summary.is_empty() {
-        return content;
-    }
-    let Some(status_start) = content.find("**Status:**") else {
-        return content;
-    };
-    let Some(relative_end) = content[status_start..].find("\n\n") else {
-        return content;
-    };
-    let insert_at = status_start + relative_end + 2;
-    content.insert_str(
-        insert_at,
-        &format!("## {INHERITED_SUMMARY_HEADING}\n\n{summary}\n\n"),
+pub fn parse_initial_input_records(content: &str) -> Vec<InitialInputRecord> {
+    section_body(content, INITIAL_INPUT_HEADING)
+        .map(parse_json_blocks)
+        .unwrap_or_default()
+}
+
+pub fn append_initial_input_revision(content: &str, record: &InitialInputRecord) -> String {
+    let mut updated = content.to_string();
+    let block = json_block(
+        &format!("initial-input revision-{}", record.revision),
+        record,
     );
-    content
-}
-
-pub fn inherited_summary(content: &str) -> Option<String> {
-    section_body(content, INHERITED_SUMMARY_HEADING)
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .map(str::to_string)
-}
-
-fn push_section<'a>(output: &mut String, heading: &str, values: impl Iterator<Item = &'a str>) {
-    output.push_str("## ");
-    output.push_str(heading);
-    output.push_str("\n\n");
-    let mut seen = Vec::<String>::new();
-    for value in values.map(str::trim).filter(|value| !value.is_empty()) {
-        if !seen.iter().any(|existing| existing == value) {
-            output.push_str("- ");
-            output.push_str(value);
-            output.push('\n');
-            seen.push(value.to_string());
-        }
+    if let Some(start) = updated.find(INITIAL_INPUT_HEADING) {
+        let tail = &updated[start + INITIAL_INPUT_HEADING.len()..];
+        let end = tail
+            .find("\n## ")
+            .map(|offset| start + INITIAL_INPUT_HEADING.len() + offset);
+        let insert_at = end.unwrap_or(updated.len());
+        updated.insert_str(insert_at, &format!("\n\n{block}"));
+    } else if let Some(checkpoint_start) = updated.find(CHECKPOINT_HEADING) {
+        updated.insert_str(
+            checkpoint_start,
+            &format!("{INITIAL_INPUT_HEADING}\n\n{block}\n\n"),
+        );
+    } else {
+        updated.push_str(&format!("\n{INITIAL_INPUT_HEADING}\n\n{block}\n"));
     }
-    output.push('\n');
+    updated
 }
 
 pub fn parse_checkpoint_records(content: &str) -> Vec<CheckpointRecord> {
-    let Some((_, checkpoint_text)) = content.split_once(CHECKPOINT_HEADING) else {
-        return Vec::new();
+    section_body(content, CHECKPOINT_HEADING)
+        .map(parse_json_blocks)
+        .unwrap_or_default()
+}
+
+pub fn append_checkpoint_record(content: &str, record: &CheckpointRecord) -> String {
+    let mut updated = content.to_string();
+    if !updated.contains(CHECKPOINT_HEADING) {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&format!("\n{CHECKPOINT_HEADING}\n"));
+    }
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    push_json_block(
+        &mut updated,
+        &format!("{} revision-{}", record.turn_id, record.revision),
+        record,
+    );
+    updated
+}
+
+pub fn with_updated_at(content: &str, timestamp: &str) -> String {
+    let prefix = "**Updated:**";
+    let Some(start) = content.find(prefix) else {
+        return content.to_string();
     };
+    let tail = &content[start..];
+    let Some(end) = tail.find('\n') else {
+        return content.to_string();
+    };
+    let mut updated = content.to_string();
+    updated.replace_range(start..start + end, &format!("{prefix} {timestamp}"));
+    updated
+}
+
+fn section_body<'a>(content: &'a str, heading: &str) -> Option<&'a str> {
+    let start = content.find(heading)? + heading.len();
+    let tail = &content[start..];
+    let end = tail.find("\n## ").unwrap_or(tail.len());
+    Some(tail[..end].trim())
+}
+
+fn parse_json_blocks<T>(content: &str) -> Vec<T>
+where
+    T: serde::de::DeserializeOwned,
+{
     let mut records = Vec::new();
-    let mut remaining = checkpoint_text;
-    while let Some(heading_pos) = remaining.find("\n### ") {
-        remaining = &remaining[heading_pos + 1..];
-        let Some(fence_start) = remaining.find("```json\n") else {
-            break;
-        };
+    let mut remaining = content;
+    while let Some(fence_start) = remaining.find("```json\n") {
         let json_start = fence_start + "```json\n".len();
         let Some(fence_end) = remaining[json_start..].find("\n```") else {
             break;
         };
         let json_text = &remaining[json_start..json_start + fence_end];
-        if let Ok(record) = serde_json::from_str::<CheckpointRecord>(json_text) {
+        if let Ok(record) = serde_json::from_str::<T>(json_text) {
             records.push(record);
         }
         remaining = &remaining[json_start + fence_end + "\n```".len()..];
@@ -191,44 +159,16 @@ pub fn parse_checkpoint_records(content: &str) -> Vec<CheckpointRecord> {
     records
 }
 
-pub fn summary(content: &str) -> String {
-    const SECTIONS: &[&str] = &[
-        "用户核心目标",
-        "已确认事实",
-        "已完成修改",
-        "关键设计决定",
-        "测试结果",
-        "当前运行状态",
-        "剩余问题",
-        "下一步",
-    ];
-    let mut parts = Vec::new();
-    for section in SECTIONS {
-        if let Some(body) = section_body(content, section) {
-            let compact = body
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !compact.is_empty() {
-                parts.push(format!("{section}: {compact}"));
-            }
-        }
-    }
-    if parts.is_empty() {
-        "未记录结构化摘要".to_string()
-    } else {
-        parts.join("；")
-    }
+fn json_block<T: serde::Serialize>(heading: &str, value: &T) -> String {
+    format!(
+        "### {heading}\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(value).expect("history record is serializable")
+    )
 }
 
-fn section_body<'a>(content: &'a str, heading: &str) -> Option<&'a str> {
-    let marker = format!("## {heading}");
-    let start = content.find(&marker)? + marker.len();
-    let tail = &content[start..];
-    let end = tail.find("\n## ").unwrap_or(tail.len());
-    Some(tail[..end].trim())
+fn push_json_block<T: serde::Serialize>(output: &mut String, heading: &str, value: &T) {
+    output.push_str(&json_block(heading, value));
+    output.push('\n');
 }
 
 pub fn checkpoint_from_args(
@@ -245,6 +185,7 @@ pub fn checkpoint_from_args(
         turn_id: explicit_turn_id.unwrap_or_default().to_string(),
         timestamp: explicit_timestamp.clone().unwrap_or_default(),
         user_intent: string_field(args, "user_intent").unwrap_or_default(),
+        raw_user_input: string_field(args, "raw_user_input").unwrap_or_default(),
         findings: string_array(args, "findings")?,
         decisions: string_array(args, "decisions")?,
         files_changed: string_array(args, "files_changed")?,
@@ -253,6 +194,7 @@ pub fn checkpoint_from_args(
         remaining_issues: string_array(args, "remaining_issues")?,
         next_actions: string_array(args, "next_actions")?,
         notes: string_field(args, "notes").unwrap_or_default(),
+        ..CheckpointRecord::default()
     };
     if record.turn_id.is_empty() {
         record.turn_id = automatic_turn_id(&record);
@@ -261,9 +203,22 @@ pub fn checkpoint_from_args(
     Ok(record)
 }
 
+pub fn checkpoint_fingerprint(record: &CheckpointRecord) -> String {
+    let mut canonical = record.clone();
+    canonical.timestamp.clear();
+    canonical.revision = 0;
+    canonical.supersedes = None;
+    canonical.content_hash.clear();
+    let encoded = serde_json::to_vec(&canonical).expect("checkpoint record is serializable");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+pub fn initial_input_fingerprint(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 fn automatic_turn_id(record: &CheckpointRecord) -> String {
-    let encoded = serde_json::to_vec(record).expect("checkpoint record is serializable");
-    let hash = format!("{:x}", Sha256::digest(encoded));
+    let hash = checkpoint_fingerprint(record);
     format!("auto-{}", &hash[..16])
 }
 
@@ -291,6 +246,7 @@ fn string_array(args: &Value, name: &str) -> Result<Vec<String>, String> {
 pub fn redact_record(record: &mut CheckpointRecord) -> bool {
     let mut changed = redact_text(&mut record.timestamp);
     changed |= redact_text(&mut record.user_intent);
+    changed |= redact_text(&mut record.raw_user_input);
     changed |= redact_text(&mut record.notes);
     for values in [
         &mut record.findings,
@@ -308,7 +264,7 @@ pub fn redact_record(record: &mut CheckpointRecord) -> bool {
     changed
 }
 
-fn redact_text(value: &mut String) -> bool {
+pub fn redact_text(value: &mut String) -> bool {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         vec![

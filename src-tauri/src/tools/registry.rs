@@ -28,7 +28,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "history_session_bootstrap",
         "Initialize or restore development session",
-        "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
+        "At the start of every new ChatGPT conversation, call this exactly once before the first response and pass the user's verbatim initial_user_input. It creates or resumes a lossless archive, then returns bounded current state and search/read guidance rather than all history.",
         false,
         false,
         false,
@@ -36,7 +36,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "history_session_checkpoint",
         "Save development checkpoint",
-        "Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by history_session_bootstrap so changing host metadata cannot redirect the checkpoint. The turn_id is optional and generated deterministically when omitted.",
+        "Append an idempotent, redacted development checkpoint. Pass session_key and expected_path exactly as returned by history_session_bootstrap, plus the user's verbatim raw_user_input; the server cannot read ChatGPT transcripts that were not passed as arguments. Changed content for the same turn_id is preserved as a revision.",
         false,
         false,
         false,
@@ -46,6 +46,22 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Validate session archive",
         "Validate history numbering, files, session mappings, and optionally rebuild the derived index without deleting history.",
         false,
+        false,
+        false,
+    ),
+    (
+        "history_session_search",
+        "Search session archive",
+        "Search lossless history archives by deterministic keywords and return a bounded page of ranked locations and snippets. Use history_session_read to retrieve exact source text.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "history_session_read",
+        "Read session archive",
+        "Read one lossless numeric Markdown archive by number or a path returned from history_session_search. Responses are UTF-8-safe pages: max_bytes defaults to 32 KiB and is capped at 64 KiB; follow next_cursor to recover the complete source.",
+        true,
         false,
         false,
     ),
@@ -305,6 +321,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
+    "history_session_search",
+    "history_session_read",
     "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
@@ -354,6 +372,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
+    "history_session_search",
+    "history_session_read",
     "check_exec_environment",
     "exec_health_check",
     "get_default_cwd",
@@ -408,6 +428,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "harness_status",
     "operation_log",
     "server_info",
+    "history_session_search",
+    "history_session_read",
     "check_exec_environment",
     "exec_health_check",
     "get_default_cwd",
@@ -502,6 +524,7 @@ pub fn input_schema(name: &str) -> Value {
                 "workspace_root": { "type": "string", "minLength": 1 },
                 "session_key": { "type": "string", "minLength": 1 },
                 "title": { "type": "string" },
+                "initial_user_input": { "type": "string" },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "create_if_missing": { "type": "boolean", "default": true }
             },
@@ -518,6 +541,7 @@ pub fn input_schema(name: &str) -> Value {
                 "turn_id": { "type": "string", "minLength": 1 },
                 "timestamp": { "type": "string" },
                 "user_intent": { "type": "string" },
+                "raw_user_input": { "type": "string" },
                 "findings": { "type": "array", "items": { "type": "string" } },
                 "decisions": { "type": "array", "items": { "type": "string" } },
                 "files_changed": { "type": "array", "items": { "type": "string" } },
@@ -535,6 +559,30 @@ pub fn input_schema(name: &str) -> Value {
                 "workspace_root": { "type": "string", "minLength": 1 },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "repair": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+        "history_session_search" => json!({
+            "type": "object",
+            "properties": {
+                "workspace_root": { "type": "string", "minLength": 1 },
+                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "query": { "type": "string", "default": "" },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+            },
+            "additionalProperties": false
+        }),
+        "history_session_read" => json!({
+            "type": "object",
+            "properties": {
+                "workspace_root": { "type": "string", "minLength": 1 },
+                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "number": { "type": "integer", "minimum": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 65536, "default": 32768 },
+                "expected_hash": { "type": "string", "minLength": 64, "maxLength": 64 }
             },
             "additionalProperties": false
         }),
@@ -668,7 +716,14 @@ pub fn input_schema(name: &str) -> Value {
                 "case_sensitive": { "type": "boolean", "default": false },
                 "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
                 "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
-                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
+                "max_file_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 67108864,
+                    "default": 2097152,
+                    "description": "Skip files larger than this many bytes (default 2MiB) to avoid memory spikes"
+                }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -868,7 +923,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile};
 
     #[test]
-    fn core_catalog_exposes_24_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_26_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -876,11 +931,13 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 26);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));
+        assert!(names.contains(&"history_session_search"));
+        assert!(names.contains(&"history_session_read"));
         assert!(names.contains(&"grep_text"));
         assert!(!names.contains(&"grep"));
 

@@ -3,11 +3,11 @@
   import { onDestroy } from "svelte";
   import { showToast } from "$lib/stores/toast";
 
-  const sessionPrompt = `请初始化或恢复当前项目会话，先调用 history_session_bootstrap。
-如果没有历史记录，则创建首个 history-session；
-如果已有历史记录，则读取 all_history_summary 和 latest_handoff 后继续工作。
-本会话每轮任务完成后调用 history_session_checkpoint，并原样传入 bootstrap 返回的 session_key 和 current_path；
-只有 checkpoint 返回 ok=true 且会话目标一致后才能确认进度已保存。`;
+  const sessionPrompt = `请初始化或恢复当前项目会话，先调用 history_session_bootstrap，并把我的首次请求逐字传入 initial_user_input。
+如果没有历史记录，则创建首个 history-session；如果已有历史记录，先阅读返回的有界 state。
+需要早期精确细节时，先调用 history_session_search，再用 history_session_read 分页读取相关原始 Markdown，并根据 next_cursor 继续直到完成；不要要求 bootstrap 返回全部历史。
+本会话每轮任务完成后调用 history_session_checkpoint，并原样传入 bootstrap 返回的 session_key 和 current_path，以及我本轮请求的逐字 raw_user_input。
+只有 checkpoint 返回 ok=true 且会话目标一致后才能确认进度已保存；服务端不能自动读取未通过工具参数传入的对话内容。`;
 
   let copying = $state(false);
   let copied = $state(false);
