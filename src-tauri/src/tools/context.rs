@@ -18,6 +18,7 @@ pub struct ToolContext {
     pub sessions: Arc<SessionStore>,
     pub workspace_id: String,
     pub external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+    pub turn_budget: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -122,7 +123,15 @@ impl ToolContext {
             sessions: Arc::new(SessionStore::new()),
             workspace_id,
             external_mcp,
+            turn_budget: Arc::new(crate::mcp::turn_budget::AgentTurnBudgetManager::new(
+                crate::mcp::turn_budget::AgentTurnBudgetConfig::default(),
+            )),
         }
+    }
+
+    pub fn with_turn_budget_manager(mut self, manager: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>) -> Self {
+        self.turn_budget = manager;
+        self
     }
 
     pub fn for_test(workspace_path: PathBuf, harness_root: PathBuf) -> Result<Self, String> {
