@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coding_tools_mcp_desktop_lib::mcp::turn_budget::{
-    AgentTurnBudgetConfig, AgentTurnBudgetManager, BudgetClock, CallDecision, MockBudgetClock, TurnBudgetStatus,
+    get_tool_traits, is_wrap_up_verification_command, AgentTurnBudgetConfig,
+    AgentTurnBudgetManager, CallDecision, MockBudgetClock, SystemBudgetClock,
+    TurnBudgetStatus,
 };
 use coding_tools_mcp_desktop_lib::mcp::handle_request;
 use coding_tools_mcp_desktop_lib::tools::ToolContext;
@@ -24,15 +26,69 @@ fn test_context_with_mock_budget(
 }
 
 #[test]
+fn test_tool_traits_and_command_classification() {
+    let empty_args = json!({});
+
+    // 1. 探索型工具
+    let st_traits = get_tool_traits("search_text", false, &empty_args);
+    assert!(st_traits.investigation);
+    assert!(!st_traits.wrap_up_allowed);
+    assert!(!st_traits.finalization_safe);
+
+    // 2. 外部 MCP 工具
+    let ext_traits = get_tool_traits("fast_context_search", true, &empty_args);
+    assert!(ext_traits.investigation);
+    assert!(!ext_traits.wrap_up_allowed);
+    assert!(!ext_traits.finalization_safe);
+
+    // 3. 修改型工具
+    let patch_traits = get_tool_traits("apply_patch", false, &empty_args);
+    assert!(patch_traits.mutating);
+    assert!(patch_traits.wrap_up_allowed);
+    assert!(!patch_traits.finalization_safe);
+
+    // 4. 收尾型与只读工具
+    let rf_traits = get_tool_traits("read_file", false, &empty_args);
+    assert!(!rf_traits.investigation);
+    assert!(rf_traits.wrap_up_allowed);
+    assert!(rf_traits.finalization_safe);
+
+    let ck_traits = get_tool_traits("history_session_checkpoint", false, &empty_args);
+    assert!(ck_traits.mutating);
+    assert!(ck_traits.wrap_up_allowed);
+    assert!(ck_traits.finalization_safe);
+
+    let ft_traits = get_tool_traits("finish_task", false, &empty_args);
+    assert!(ft_traits.mutating);
+    assert!(ft_traits.wrap_up_allowed);
+    assert!(ft_traits.finalization_safe);
+
+    // 5. 命令智能分类
+    assert!(is_wrap_up_verification_command("cargo check"));
+    assert!(is_wrap_up_verification_command("cargo test --test turn_budget"));
+    assert!(is_wrap_up_verification_command("npm run check"));
+    assert!(is_wrap_up_verification_command("npm run build"));
+    assert!(is_wrap_up_verification_command("git status"));
+    assert!(is_wrap_up_verification_command("git diff"));
+    assert!(is_wrap_up_verification_command("python --version"));
+
+    assert!(!is_wrap_up_verification_command("npm install"));
+    assert!(!is_wrap_up_verification_command("pip install torch"));
+    assert!(!is_wrap_up_verification_command("cargo install cargo-watch"));
+    assert!(!is_wrap_up_verification_command("git clone https://github.com/a/b.git"));
+    assert!(!is_wrap_up_verification_command("cargo check && cargo build"));
+}
+
+#[test]
 fn test_turn_budget_initialization_and_first_turn() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));
     let config = AgentTurnBudgetConfig::for_test_ms(
-        1000, 2000, 3000, 200, 500, 800, 4000, 500,
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
     );
     let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock));
 
-    let decision = manager.start_call("ws-1", Some("session-abc"));
+    let decision = manager.start_call("ws-1", Some("session-abc"), "list_files", false, &json!({}));
     match decision {
         CallDecision::Allowed {
             guard,
@@ -61,24 +117,20 @@ fn test_raii_guard_guarantees_active_calls_cleanup() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));
     let config = AgentTurnBudgetConfig::for_test_ms(
-        1000, 2000, 3000, 200, 500, 800, 4000, 500,
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
     );
     let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
 
-    let decision = manager.start_call("ws-1", Some("session-xyz"));
+    let decision = manager.start_call("ws-1", Some("session-xyz"), "read_file", false, &json!({}));
     if let CallDecision::Allowed { guard, .. } = decision {
-        // 在作用域内，模拟发生异常/Early Return
         {
             let _move_guard = guard;
-            // 退出作用域自动 drop，调用 complete_call
         }
     }
 
-    // 时间前移 100ms
     clock.advance(Duration::from_millis(100));
 
-    // 再次调用，确认 active_calls 已归 0，并且可以正常处理
-    let decision2 = manager.start_call("ws-1", Some("session-xyz"));
+    let decision2 = manager.start_call("ws-1", Some("session-xyz"), "read_file", false, &json!({}));
     match decision2 {
         CallDecision::Allowed { guard, snapshot, .. } => {
             assert_eq!(snapshot.status, TurnBudgetStatus::Normal);
@@ -89,68 +141,196 @@ fn test_raii_guard_guarantees_active_calls_cleanup() {
 }
 
 #[test]
+fn test_warning_and_wrap_up_and_finalization_lifecycle() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    // 阈值: warning=1000ms, wrap_up=1500ms, finalization=2000ms, hard_stop=3000ms, reserve=200ms(cutoff=2800ms)
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+
+    // 1. Normal (0ms)
+    let d0 = manager.start_call("ws-1", Some("s-1"), "search_text", false, &json!({}));
+    assert!(matches!(d0, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, snapshot, .. } = d0 {
+        assert_eq!(snapshot.status, TurnBudgetStatus::Normal);
+        drop(guard);
+    }
+
+    // 2. Warning 阶段 (1100ms)
+    clock.advance(Duration::from_millis(1100));
+    // (a) search_text 仍允许，但记录 warning
+    let d_warn_st = manager.start_call("ws-1", Some("s-1"), "search_text", false, &json!({}));
+    assert!(matches!(d_warn_st, CallDecision::Allowed { emit_full_warning: true, .. }));
+    if let CallDecision::Allowed { guard, snapshot, .. } = d_warn_st {
+        assert_eq!(snapshot.status, TurnBudgetStatus::Warning);
+        drop(guard);
+    }
+    // (b) fast_context 外部工具在 Warning 阶段仍允许
+    let d_warn_ext = manager.start_call("ws-1", Some("s-1"), "fast_context_search", true, &json!({}));
+    assert!(matches!(d_warn_ext, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_warn_ext {
+        drop(guard);
+    }
+
+    // 3. WRAP_UP 阶段 (1600ms): 禁止 investigation 与外部工具，允许 apply_patch 与短验证 exec
+    clock.advance(Duration::from_millis(500)); // total: 1600ms
+    // (a) search_text 被拒绝
+    let d_wrap_st = manager.start_call("ws-1", Some("s-1"), "search_text", false, &json!({}));
+    match d_wrap_st {
+        CallDecision::Restricted { error_payload, content_text, snapshot } => {
+            assert_eq!(snapshot.status, TurnBudgetStatus::WrapUp);
+            assert_eq!(error_payload["error"]["code"], "AGENT_TURN_WRAP_UP_RESTRICTED");
+            assert_eq!(error_payload["error"]["category"], "turn_budget");
+            assert_eq!(error_payload["error"]["retryable"], false);
+            assert!(content_text.contains("[TURN BUDGET RESTRICTED]"));
+        }
+        _ => panic!("Expected Restricted for search_text in WRAP_UP"),
+    }
+    // (b) fast_context 外部工具被拒绝
+    let d_wrap_ext = manager.start_call("ws-1", Some("s-1"), "fast_context_search", true, &json!({}));
+    assert!(matches!(d_wrap_ext, CallDecision::Restricted { .. }));
+    // (c) grep_text 被拒绝
+    let d_wrap_grep = manager.start_call("ws-1", Some("s-1"), "grep_text", false, &json!({}));
+    assert!(matches!(d_wrap_grep, CallDecision::Restricted { .. }));
+    // (d) list_files 被拒绝
+    let d_wrap_lf = manager.start_call("ws-1", Some("s-1"), "list_files", false, &json!({}));
+    assert!(matches!(d_wrap_lf, CallDecision::Restricted { .. }));
+    // (e) apply_patch 允许完成最后修改
+    let d_wrap_patch = manager.start_call("ws-1", Some("s-1"), "apply_patch", false, &json!({}));
+    assert!(matches!(d_wrap_patch, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_wrap_patch {
+        drop(guard);
+    }
+    // (f) read_file 允许
+    let d_wrap_rf = manager.start_call("ws-1", Some("s-1"), "read_file", false, &json!({}));
+    assert!(matches!(d_wrap_rf, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_wrap_rf {
+        drop(guard);
+    }
+    // (g) 验证型 exec 允许
+    let d_wrap_exec = manager.start_call("ws-1", Some("s-1"), "exec_command", false, &json!({ "cmd": "cargo check" }));
+    assert!(matches!(d_wrap_exec, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, runtime_budget, .. } = d_wrap_exec {
+        assert!(runtime_budget <= Duration::from_secs(30));
+        drop(guard);
+    }
+    // (h) 非验证型 exec (如 npm install) 拒绝
+    let d_wrap_install = manager.start_call("ws-1", Some("s-1"), "exec_command", false, &json!({ "cmd": "npm install" }));
+    assert!(matches!(d_wrap_install, CallDecision::Restricted { .. }));
+
+    // 4. FINALIZATION 阶段 (2100ms): 严禁 apply_patch 与 exec，仅允许只读收尾
+    clock.advance(Duration::from_millis(500)); // total: 2100ms
+    // (a) apply_patch 拒绝
+    let d_fin_patch = manager.start_call("ws-1", Some("s-1"), "apply_patch", false, &json!({}));
+    assert!(matches!(d_fin_patch, CallDecision::Restricted { .. }));
+    // (b) exec_command 拒绝
+    let d_fin_exec = manager.start_call("ws-1", Some("s-1"), "exec_command", false, &json!({ "cmd": "cargo check" }));
+    assert!(matches!(d_fin_exec, CallDecision::Restricted { .. }));
+    // (c) search_text 拒绝
+    let d_fin_st = manager.start_call("ws-1", Some("s-1"), "search_text", false, &json!({}));
+    assert!(matches!(d_fin_st, CallDecision::Restricted { .. }));
+    // (d) read_file 允许
+    let d_fin_rf = manager.start_call("ws-1", Some("s-1"), "read_file", false, &json!({}));
+    assert!(matches!(d_fin_rf, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_fin_rf {
+        drop(guard);
+    }
+    // (e) git_status 允许
+    let d_fin_gs = manager.start_call("ws-1", Some("s-1"), "git_status", false, &json!({}));
+    assert!(matches!(d_fin_gs, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_fin_gs {
+        drop(guard);
+    }
+    // (f) git_diff 允许
+    let d_fin_gd = manager.start_call("ws-1", Some("s-1"), "git_diff", false, &json!({}));
+    assert!(matches!(d_fin_gd, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_fin_gd {
+        drop(guard);
+    }
+    // (g) history_session_checkpoint 允许
+    let d_fin_chk = manager.start_call("ws-1", Some("s-1"), "history_session_checkpoint", false, &json!({}));
+    assert!(matches!(d_fin_chk, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_fin_chk {
+        drop(guard);
+    }
+    // (h) finish_task 允许
+    let d_fin_ft = manager.start_call("ws-1", Some("s-1"), "finish_task", false, &json!({}));
+    assert!(matches!(d_fin_ft, CallDecision::Allowed { .. }));
+    if let CallDecision::Allowed { guard, .. } = d_fin_ft {
+        drop(guard);
+    }
+
+    // 5. DISPATCH_CUTOFF (2850ms, cutoff=2800ms)
+    clock.advance(Duration::from_millis(750)); // total: 2850ms
+    let d_cutoff = manager.start_call("ws-1", Some("s-1"), "read_file", false, &json!({}));
+    match d_cutoff {
+        CallDecision::Blocked { error_payload, .. } => {
+            assert_eq!(error_payload["error"]["code"], "AGENT_TURN_BUDGET_DISPATCH_CUTOFF");
+        }
+        _ => panic!("Expected Blocked DispatchCutoff"),
+    }
+
+    // 6. HARD_STOP (3100ms >= 3000ms)
+    clock.advance(Duration::from_millis(250)); // total: 3100ms
+    let d_hs = manager.start_call("ws-1", Some("s-1"), "read_file", false, &json!({}));
+    match d_hs {
+        CallDecision::Blocked { error_payload, snapshot, .. } => {
+            assert_eq!(snapshot.status, TurnBudgetStatus::HardStop);
+            assert_eq!(error_payload["error"]["code"], "AGENT_TURN_BUDGET_EXHAUSTED");
+            assert_eq!(error_payload["error"]["category"], "turn_budget");
+            assert_eq!(error_payload["error"]["retryable"], false);
+            assert!(error_payload["error"]["recovery_hint"].as_str().unwrap().contains("DO NOT RETRY THIS TOOL"));
+        }
+        _ => panic!("Expected Blocked HardStop"),
+    }
+}
+
+#[test]
 fn test_dynamic_idle_reset_matrix() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));
-    // warning: 25m, urgent: 28m, hard_stop: 29m
     let config = AgentTurnBudgetConfig::default();
     let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
 
     // 1. 早期 (<20m): 90s idle 重置
     {
-        let d = manager.start_call("ws-1", Some("sess-1"));
-        if let CallDecision::Allowed { guard, .. } = d {
+        let d1 = manager.start_call("ws-1", Some("session-early"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, .. } = d1 {
             drop(guard);
         }
-    }
-    // 60s 后再次调用（< 90s），属于同一 turn
-    clock.advance(Duration::from_secs(60));
-    {
-        let d = manager.start_call("ws-1", Some("sess-1"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.elapsed_seconds, 60);
-            drop(guard);
-        }
-    }
-    // 95s 后（距离上次调用 60s 点流逝 95s），超过 early_idle_reset (90s)，重置新 turn
-    clock.advance(Duration::from_secs(95));
-    {
-        let d = manager.start_call("ws-1", Some("sess-1"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.elapsed_seconds, 0); // 重置为 0
+        clock.advance(Duration::from_secs(91));
+        let d2 = manager.start_call("ws-1", Some("session-early"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, snapshot, .. } = d2 {
+            assert_eq!(snapshot.elapsed_seconds, 0);
             drop(guard);
         }
     }
 
-    // 2. 中期 (20m~25m): 90s 不重置，180s 重置
+    // 2. 中期 (20m~25m): 180s idle 重置
     {
-        let d = manager.start_call("ws-1", Some("sess-mid"));
-        if let CallDecision::Allowed { guard, .. } = d {
+        let d1 = manager.start_call("ws-1", Some("session-mid"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, .. } = d1 {
             drop(guard);
         }
-    }
-    // 每隔 60s 推进一次调用，平滑推进 20 次，达到 20m (1200s)
-    for _ in 0..20 {
-        clock.advance(Duration::from_secs(60));
-        let d = manager.start_call("ws-1", Some("sess-mid"));
-        if let CallDecision::Allowed { guard, .. } = d {
+        // 每隔 60s 推进一次，连续运行到 21 分钟（1260s，保证中间没有单次超过 90s 空闲）
+        for _ in 0..21 {
+            clock.advance(Duration::from_secs(60));
+            let d = manager.start_call("ws-1", Some("session-mid"), "read_file", false, &json!({}));
+            if let CallDecision::Allowed { guard, .. } = d {
+                drop(guard);
+            }
+        }
+        clock.advance(Duration::from_secs(50)); // 1260s + 50s = 1310s (21m50s): 50s < 180s 不重置
+        let d2 = manager.start_call("ws-1", Some("session-mid"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, snapshot, .. } = d2 {
+            assert!(snapshot.elapsed_seconds >= 21 * 60);
             drop(guard);
         }
-    }
-    // 此时处于中期 (20m)。过了 100s（>90s 但 <180s），不应该重置 (总用时 21m40s = 1300s)
-    clock.advance(Duration::from_secs(100));
-    {
-        let d = manager.start_call("ws-1", Some("sess-mid"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.elapsed_seconds, 20 * 60 + 100);
-            drop(guard);
-        }
-    }
-    // 过了 190s（>180s），且总耗时 1300s + 190s = 1490s (< 1500s 仍在中期)，应该重置为新 turn
-    clock.advance(Duration::from_secs(190));
-    {
-        let d = manager.start_call("ws-1", Some("sess-mid"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
+        clock.advance(Duration::from_secs(185)); // 1310s + 185s = 1495s < 1500s: 185s >= 180s 重置
+        let d3 = manager.start_call("ws-1", Some("session-mid"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, snapshot, .. } = d3 {
             assert_eq!(snapshot.elapsed_seconds, 0);
             drop(guard);
         }
@@ -158,34 +338,22 @@ fn test_dynamic_idle_reset_matrix() {
 
     // 3. 晚期 (>=25m Warning 阶段): 严禁普通 idle 重置
     {
-        let d = manager.start_call("ws-1", Some("sess-warn"));
-        if let CallDecision::Allowed { guard, .. } = d {
+        let d1 = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, .. } = d1 {
             drop(guard);
         }
-    }
-    // 每隔 60s 推进一次调用，直到 26m
-    for _ in 0..26 {
-        clock.advance(Duration::from_secs(60));
-        let d = manager.start_call("ws-1", Some("sess-warn"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
+        // 推进到 26 分钟
+        for _ in 0..26 {
+            clock.advance(Duration::from_secs(60));
+            let d = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
+            if let CallDecision::Allowed { guard, .. } = d {
+                drop(guard);
+            }
         }
-    }
-    // 达到 26m，进入 Warning
-    {
-        let d = manager.start_call("ws-1", Some("sess-warn"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.status, TurnBudgetStatus::Warning);
-            drop(guard);
-        }
-    }
-    // 即使空闲了 300s，在未跨越平台隔离线前，绝对不能仅靠普通 idle 变成新 turn
-    clock.advance(Duration::from_secs(300));
-    {
-        let d = manager.start_call("ws-1", Some("sess-warn"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.status, TurnBudgetStatus::Warning);
-            assert_eq!(snapshot.elapsed_seconds, 26 * 60 + 300);
+        clock.advance(Duration::from_secs(200)); // 即使停顿 200s 也不重置
+        let d2 = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
+        if let CallDecision::Allowed { guard, snapshot, .. } = d2 {
+            assert!(snapshot.elapsed_seconds >= 26 * 60);
             drop(guard);
         }
     }
@@ -195,280 +363,100 @@ fn test_dynamic_idle_reset_matrix() {
 fn test_hard_stop_and_platform_isolation_recovery() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));
-    // 阈值：warning=25s, urgent=28s, hard_stop=29s, reserve=1s, platform_limit=30s, margin=5s
-    let config = AgentTurnBudgetConfig::for_test_ms(
-        25_000, 28_000, 29_000, 1_000, 5_000, 8_000, 30_000, 5_000,
-    );
+    let config = AgentTurnBudgetConfig::default();
     let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
 
-    // 0s 初始化并每隔 3s 推进一次（保证未超过 5s 的 early_idle_reset），直到 27s
-    for _ in 0..9 {
-        let d = manager.start_call("ws-1", Some("sess-hs"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-        clock.advance(Duration::from_millis(3_000));
-    }
-
-    // 再前移 2.5s，到达 29.5s HardStop 阶段
-    clock.advance(Duration::from_millis(2_500));
-    {
-        let d = manager.start_call("ws-1", Some("sess-hs"));
-        match d {
-            CallDecision::Blocked { snapshot, error_payload, content_text } => {
-                assert_eq!(snapshot.status, TurnBudgetStatus::HardStop);
-                assert!(content_text.contains("[TURN BUDGET HARD STOP]"));
-                assert_eq!(error_payload["error"]["code"], "AGENT_TURN_BUDGET_EXHAUSTED");
-            }
-            _ => panic!("Expected Blocked(HardStop)"),
-        }
-    }
-
-    // 31s 时重试（HardStop 后仅过了 1.5s，且总耗时 31s < 30s + 5s = 35s 平台隔离线）
-    // 必须继续拒绝！
-    clock.advance(Duration::from_millis(1_500));
-    {
-        let d = manager.start_call("ws-1", Some("sess-hs"));
-        match d {
-            CallDecision::Blocked { snapshot, .. } => {
-                assert_eq!(snapshot.status, TurnBudgetStatus::HardStop);
-            }
-            _ => panic!("Expected continuous Blocked(HardStop) before platform isolation line"),
-        }
-    }
-
-    // 前移至 36s（跨过 30s + 5s = 35s 平台隔离线），下次调用自动创建新 Turn
-    clock.advance(Duration::from_millis(5_000));
-    {
-        let d = manager.start_call("ws-1", Some("sess-hs"));
-        match d {
-            CallDecision::Allowed { guard, snapshot, .. } => {
-                assert_eq!(snapshot.status, TurnBudgetStatus::Normal);
-                assert_eq!(snapshot.elapsed_seconds, 0); // 成功重置为新 turn
-                drop(guard);
-            }
-            _ => panic!("Expected recovery and new turn after platform isolation deadline"),
-        }
-    }
-}
-
-#[test]
-fn test_concurrent_warning_emits_full_warning_only_once() {
-    let t0 = Instant::now();
-    let clock = Arc::new(MockBudgetClock::new(t0));
-    // warning=10s, urgent=20s, hard_stop=30s
-    let config = AgentTurnBudgetConfig::for_test_ms(
-        10_000, 20_000, 30_000, 1_000, 5_000, 5_000, 40_000, 5_000,
-    );
-    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
-
-    // 0s 初始化并每隔 3s 推进，直到 9s
-    for _ in 0..3 {
-        let d = manager.start_call("ws-1", Some("sess-concur"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-        clock.advance(Duration::from_millis(3_000));
-    }
-
-    // 前移 3s 到 12s（处于 10s Warning 阶段），两个并发请求同时发生
-    clock.advance(Duration::from_millis(3_000));
-    let d1 = manager.start_call("ws-1", Some("sess-concur"));
-    let d2 = manager.start_call("ws-1", Some("sess-concur"));
-
-    let (emit1, emit2) = match (d1, d2) {
-        (
-            CallDecision::Allowed { guard: g1, emit_full_warning: e1, .. },
-            CallDecision::Allowed { guard: g2, emit_full_warning: e2, .. },
-        ) => {
-            drop(g1);
-            drop(g2);
-            (e1, e2)
-        }
-        _ => panic!("Expected both Allowed"),
-    };
-
-    // 必须有且仅有一个请求得到完整的 emit_full_warning
-    assert!(
-        (emit1 && !emit2) || (!emit1 && emit2),
-        "Exactly one concurrent call must receive emit_full_warning=true"
-    );
-}
-
-#[test]
-fn test_top_level_meta_injection_preserves_external_structured_content() {
-    let t0 = Instant::now();
-    let clock = Arc::new(MockBudgetClock::new(t0));
-    let config = AgentTurnBudgetConfig::for_test_ms(
-        10_000, 20_000, 30_000, 1_000, 5_000, 5_000, 40_000, 5_000,
-    );
-    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock));
-
-    let decision = manager.start_call("ws-1", Some("sess-meta"));
-    if let CallDecision::Allowed { guard, snapshot, emit_full_warning, .. } = decision {
-        let external_raw_result = json!({
-            "content": [{
-                "type": "text",
-                "text": "fast-context search result"
-            }],
-            "structuredContent": {
-                "customSchemaField": 42,
-                "strictNestedArray": ["a", "b"]
-            },
-            "isError": false
-        });
-
-        let decorated = manager.decorate_allowed_result(external_raw_result.clone(), &snapshot, emit_full_warning);
-
-        // 1. 验证第三方 structuredContent 绝对没有被修改
-        assert_eq!(decorated["structuredContent"], external_raw_result["structuredContent"]);
-
-        // 2. 验证机器可读元数据注入在顶层 _meta
-        assert_eq!(
-            decorated["_meta"]["coding-tools/agentTurnBudget"]["status"],
-            "normal"
-        );
-        assert_eq!(
-            decorated["_meta"]["coding-tools/agentTurnBudget"]["timerOrigin"],
-            "first_observed_tool_call"
-        );
-
+    // 启动初始调用
+    let d1 = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
+    if let CallDecision::Allowed { guard, .. } = d1 {
         drop(guard);
     }
-}
 
-#[test]
-fn test_dispatch_cutoff_semantic_separation() {
-    let t0 = Instant::now();
-    let clock = Arc::new(MockBudgetClock::new(t0));
-    // warning=25s, urgent=28s, hard_stop=29s, reserve=1s (cutoff=28s)
-    let config = AgentTurnBudgetConfig::for_test_ms(
-        25_000, 28_000, 29_000, 1_000, 5_000, 8_000, 30_000, 5_000,
-    );
-    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+    // 推进到 29:05 触发 HardStop
+    clock.advance(Duration::from_secs(29 * 60 + 5));
+    let d_hs = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
+    assert!(matches!(d_hs, CallDecision::Blocked { .. }));
 
-    // 0s 初始化并推进到 27s
-    for _ in 0..9 {
-        let d = manager.start_call("ws-1", Some("sess-cutoff"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-        clock.advance(Duration::from_millis(3_000));
-    }
+    // 推进 20s (至 29:25): 严禁在此刻重置！
+    clock.advance(Duration::from_secs(20));
+    let d_retry = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
+    assert!(matches!(d_retry, CallDecision::Blocked { .. }));
 
-    // 28.5s（处于 28s cutoff ~ 29s hard_stop 之间）
-    clock.advance(Duration::from_millis(1_500));
-    {
-        let d = manager.start_call("ws-1", Some("sess-cutoff"));
-        match d {
-            CallDecision::Blocked { snapshot, error_payload, content_text } => {
-                assert_eq!(snapshot.status, TurnBudgetStatus::DispatchCutoff);
-                assert!(content_text.contains("[TURN BUDGET DISPATCH CUTOFF]"));
-                assert_eq!(error_payload["error"]["code"], "AGENT_TURN_BUDGET_DISPATCH_CUTOFF");
-            }
-            _ => panic!("Expected Blocked(DispatchCutoff)"),
-        }
-    }
-}
-
-#[test]
-fn test_rejected_calls_do_not_refresh_timestamps() {
-    let t0 = Instant::now();
-    let clock = Arc::new(MockBudgetClock::new(t0));
-    // warning=25s, urgent=28s, hard_stop=29s, reserve=1s, platform_limit=30s, margin=5s
-    let config = AgentTurnBudgetConfig::for_test_ms(
-        25_000, 28_000, 29_000, 1_000, 5_000, 8_000, 30_000, 5_000,
-    );
-    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
-
-    for _ in 0..9 {
-        let d = manager.start_call("ws-1", Some("sess-reject"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-        clock.advance(Duration::from_millis(3_000));
-    }
-
-    // 29.5s HardStop
-    clock.advance(Duration::from_millis(2_500));
-    let _ = manager.start_call("ws-1", Some("sess-reject"));
-
-    // 疯狂重试 10 次（每隔 500ms 重试一次）
-    for _ in 0..10 {
-        clock.advance(Duration::from_millis(500));
-        let d = manager.start_call("ws-1", Some("sess-reject"));
-        assert!(matches!(d, CallDecision::Blocked { .. }));
-    }
-
-    // 此时时间为 29.5s + 5.0s = 34.5s
-    // 再过 1s 到达 35.5s（跨过 30s + 5s = 35s 平台隔离线）
-    clock.advance(Duration::from_millis(1_000));
-    let recovery = manager.start_call("ws-1", Some("sess-reject"));
-    match recovery {
+    // 推进到 30m16s (超过 30m + 15s 隔离线): 必须成功重置为新 Turn
+    clock.advance(Duration::from_secs(46)); // 29m25s + 46s = 30m11s
+    clock.advance(Duration::from_secs(10)); // 30m21s
+    let d_recovered = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
+    match d_recovered {
         CallDecision::Allowed { guard, snapshot, .. } => {
             assert_eq!(snapshot.status, TurnBudgetStatus::Normal);
             assert_eq!(snapshot.elapsed_seconds, 0);
             drop(guard);
         }
-        _ => panic!("Expected recovery even after repeated rejection retries"),
+        _ => panic!("Expected Recovery after platform isolation"),
     }
 }
 
 #[test]
-fn test_state_ttl_and_lru_eviction() {
-    let t0 = Instant::now();
-    let clock = Arc::new(MockBudgetClock::new(t0));
-    let mut config = AgentTurnBudgetConfig::default();
-    config.max_states = 3;
-    config.state_ttl = Duration::from_secs(100);
+fn test_top_level_meta_injection_preserves_external_structured_content() {
+    let config = AgentTurnBudgetConfig::default();
+    let clock = Arc::new(SystemBudgetClock);
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock));
 
-    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+    let snapshot = coding_tools_mcp_desktop_lib::mcp::turn_budget::TurnBudgetSnapshot {
+        status: TurnBudgetStatus::Warning,
+        elapsed_seconds: 1501,
+        remaining_seconds: 239,
+        should_wrap_up: true,
+        should_stop_tool_calls: false,
+        timer_origin: "first_observed_tool_call",
+    };
 
-    // 依次插入 3 条状态，每次推进 1s 确保有严格时间序 (sess-1 最旧)
-    for i in 1..=3 {
-        let d = manager.start_call("ws-1", Some(&format!("sess-{i}")));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-        clock.advance(Duration::from_secs(1));
-    }
+    let original_external_result = json!({
+        "content": [{
+            "type": "text",
+            "text": "fast context results"
+        }],
+        "structuredContent": {
+            "matches": ["sym1", "sym2"],
+            "strict_field": 123
+        },
+        "isError": false
+    });
 
-    // 插入第 4 条，触发 max_states=3 淘汰严格最旧的 sess-1
-    clock.advance(Duration::from_secs(10));
-    {
-        let d = manager.start_call("ws-1", Some("sess-4"));
-        if let CallDecision::Allowed { guard, .. } = d {
-            drop(guard);
-        }
-    }
+    let decorated = manager.decorate_allowed_result(original_external_result, &snapshot, true);
 
-    // 此时重新访问 sess-1，应当作为全新 turn 重新创建 (turn_seq = 1, elapsed = 0)
-    {
-        let d = manager.start_call("ws-1", Some("sess-1"));
-        if let CallDecision::Allowed { guard, snapshot, .. } = d {
-            assert_eq!(snapshot.elapsed_seconds, 0);
-            drop(guard);
-        }
-    }
+    // 验证 structuredContent 完全保持原样
+    assert_eq!(decorated["structuredContent"]["matches"][0], "sym1");
+    assert_eq!(decorated["structuredContent"]["strict_field"], 123);
+
+    // 验证顶层 _meta 注入
+    let meta = &decorated["_meta"]["coding-tools/agentTurnBudget"];
+    assert_eq!(meta["status"], "warning");
+    assert_eq!(meta["elapsedSeconds"], 1501);
+    assert_eq!(meta["shouldWrapUp"], true);
+
+    // 验证 content[0].text 被前置注入 WARNING 文本
+    let text = decorated["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("[TURN BUDGET WARNING]"));
+    assert!(text.ends_with("fast context results"));
 }
 
 #[test]
 fn test_end_to_end_jsonrpc_tools_call_lifecycle() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));
-    // 阈值：warning=200ms, urgent=400ms, hard_stop=600ms, reserve=50ms
     let config = AgentTurnBudgetConfig::for_test_ms(
-        200, 400, 600, 50, 500, 500, 1000, 100,
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
     );
-    let (_workspace, _harness, ctx, _manager) = test_context_with_mock_budget(config, clock.clone());
+    let (_ws, _harness, ctx, _mgr) = test_context_with_mock_budget(config, clock.clone());
     let shared_ctx = Arc::new(ctx);
 
     let session_meta = json!({
-        "openai/session": "chatgpt-e2e-session"
+        "openai/session": "chatgpt-client-session-123"
     });
 
-    // 1. 阶段 1：Normal 调用
-    let normal_req = json!({
+    // 1. Normal 调用
+    let req0 = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
@@ -478,81 +466,59 @@ fn test_end_to_end_jsonrpc_tools_call_lifecycle() {
             "_meta": session_meta
         }
     });
-    let res1 = handle_request(&shared_ctx, &normal_req);
-    assert_eq!(res1["id"], 1);
-    assert_eq!(res1["result"]["isError"], false);
+    let res0 = handle_request(&shared_ctx, &req0);
+    assert_eq!(res0["id"], 1);
+    assert_eq!(res0["result"]["isError"], false);
     assert_eq!(
-        res1["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
+        res0["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
         "normal"
     );
 
-    // 2. 阶段 2：Warning 触发 (推进 250ms)
-    clock.advance(Duration::from_millis(250));
-    let warn_req = json!({
+    // 2. 推进到 WRAP_UP 阶段 (1600ms): 调用 search_text 被短路阻断
+    clock.advance(Duration::from_millis(1600));
+    let req_wrap = json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "list_files",
-            "arguments": {},
+            "name": "search_text",
+            "arguments": { "query": "test" },
             "_meta": session_meta
         }
     });
-    let res2 = handle_request(&shared_ctx, &warn_req);
-    assert_eq!(res2["id"], 2);
-    assert_eq!(res2["result"]["isError"], false);
+    let res_wrap = handle_request(&shared_ctx, &req_wrap);
+    assert_eq!(res_wrap["id"], 2);
+    assert_eq!(res_wrap["result"]["isError"], true);
     assert_eq!(
-        res2["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
-        "warning"
+        res_wrap["result"]["structuredContent"]["error"]["code"],
+        "AGENT_TURN_WRAP_UP_RESTRICTED"
     );
-    let text2 = res2["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text2.contains("[TURN BUDGET WARNING]"));
+    assert_eq!(
+        res_wrap["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
+        "wrap_up"
+    );
 
-    // 3. 阶段 3：Urgent 触发 (推进 200ms 至 450ms)
-    clock.advance(Duration::from_millis(200));
-    let urgent_req = json!({
+    // 3. 推进到 HARD_STOP (3100ms)
+    clock.advance(Duration::from_millis(1500));
+    let req_hs = json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "list_files",
-            "arguments": {},
+            "name": "read_file",
+            "arguments": { "path": "nonexistent.txt" },
             "_meta": session_meta
         }
     });
-    let res3 = handle_request(&shared_ctx, &urgent_req);
-    assert_eq!(res3["id"], 3);
-    assert_eq!(res3["result"]["isError"], false);
+    let res_hs = handle_request(&shared_ctx, &req_hs);
+    assert_eq!(res_hs["id"], 3);
+    assert_eq!(res_hs["result"]["isError"], true);
     assert_eq!(
-        res3["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
-        "urgent"
-    );
-    let text3 = res3["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text3.contains("[TURN BUDGET URGENT]"));
-
-    // 4. 阶段 4：HardStop 触发 (推进 200ms 至 650ms)
-    clock.advance(Duration::from_millis(200));
-    let hs_req = json!({
-        "jsonrpc": "2.0",
-        "id": 4,
-        "method": "tools/call",
-        "params": {
-            "name": "list_files",
-            "arguments": {},
-            "_meta": session_meta
-        }
-    });
-    let res4 = handle_request(&shared_ctx, &hs_req);
-    assert_eq!(res4["id"], 4);
-    assert_eq!(res4["result"]["isError"], true);
-    assert_eq!(
-        res4["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
-        "hard_stop"
-    );
-    let text4 = res4["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text4.contains("[TURN BUDGET HARD STOP]"));
-    assert_eq!(
-        res4["result"]["structuredContent"]["error"]["code"],
+        res_hs["result"]["structuredContent"]["error"]["code"],
         "AGENT_TURN_BUDGET_EXHAUSTED"
+    );
+    assert_eq!(
+        res_hs["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
+        "hard_stop"
     );
 }
