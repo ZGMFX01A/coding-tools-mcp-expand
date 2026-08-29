@@ -143,6 +143,17 @@ impl ExternalMcpManager {
         public_tool_name: &str,
         arguments: &Value,
     ) -> Result<Value, String> {
+        self.call_external_tool_with_budget(workspace_id, public_tool_name, arguments, None).await
+    }
+
+    /// 执行外部工具转发调用，支持传入 runtime_budget 限制
+    pub async fn call_external_tool_with_budget(
+        &self,
+        workspace_id: &str,
+        public_tool_name: &str,
+        arguments: &Value,
+        runtime_budget: Option<std::time::Duration>,
+    ) -> Result<Value, String> {
         let tool_entry = self
             .find_tool_entry(workspace_id, public_tool_name)
             .await
@@ -155,7 +166,9 @@ impl ExternalMcpManager {
                 .ok_or_else(|| format!("外部 MCP 服务实例不存在: {}", tool_entry.server_name))?
         };
 
-        instance.call_tool(&tool_entry.original_name, arguments).await
+        instance
+            .call_tool_with_budget(&tool_entry.original_name, arguments, runtime_budget)
+            .await
     }
 
     /// 获取工作区所有外部 MCP 状态 DTO 列表

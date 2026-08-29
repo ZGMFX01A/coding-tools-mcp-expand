@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use crate::external_mcp::config::ExternalMcpConfig;
 use crate::external_mcp::protocol::{McpCallToolResult, McpListToolsResult, McpTool};
 use crate::external_mcp::transport_stdio::StdioTransport;
+use crate::tunnel::append_profile_log;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -242,6 +243,16 @@ impl ExternalMcpInstance {
 
     /// 转发 tools/call
     pub async fn call_tool(&self, original_tool_name: &str, arguments: &Value) -> Result<Value, String> {
+        self.call_tool_with_budget(original_tool_name, arguments, None).await
+    }
+
+    /// 转发 tools/call，支持传入 Turn Budget 剩余可执行上限动态削峰
+    pub async fn call_tool_with_budget(
+        &self,
+        original_tool_name: &str,
+        arguments: &Value,
+        runtime_budget: Option<Duration>,
+    ) -> Result<Value, String> {
         let state = self.state.read().await.clone();
         if state != ExternalMcpState::Ready {
             return Err(format!("外部 MCP 实例 '{}' 当前不可用 (状态: {})", self.config.name, state.as_str()));
@@ -255,7 +266,27 @@ impl ExternalMcpInstance {
             "arguments": arguments
         });
 
-        let call_timeout = Duration::from_secs(self.config.call_timeout_seconds);
+        let configured_timeout = Duration::from_secs(self.config.call_timeout_seconds);
+        let call_timeout = match runtime_budget {
+            Some(budget) => {
+                let capped = configured_timeout.min(budget);
+                if capped < configured_timeout {
+                    append_profile_log(
+                        &self.workspace_id,
+                        "mcp-requests.log",
+                        &format!(
+                            "[turn-budget] external-timeout-capped instance={} configured={}s effective={}s",
+                            self.config.name,
+                            configured_timeout.as_secs(),
+                            capped.as_secs()
+                        ),
+                    );
+                }
+                capped
+            }
+            None => configured_timeout,
+        };
+
         let res_val = transport.send_request("tools/call", Some(params), call_timeout).await?;
 
         // 尝试解析为 McpCallToolResult 结构
