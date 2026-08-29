@@ -97,13 +97,32 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         .and_then(|meta| meta.get("openai/session"))
         .and_then(Value::as_str);
 
+    let mut args = tool_arguments(name, params);
+    if !args.is_object() {
+        args = serde_json::json!({});
+    }
+
+    let is_external = if let Some(ref external_mgr) = state.external_mcp {
+        tauri::async_runtime::block_on(external_mgr.find_tool_entry(&state.workspace_id, name))
+    } else {
+        None
+    };
+
     let decision = state.turn_budget.start_call(
         &state.workspace_id,
         openai_session,
+        name,
+        is_external.is_some(),
+        &args,
     );
 
     match decision {
         crate::mcp::turn_budget::CallDecision::Blocked {
+            snapshot,
+            error_payload,
+            content_text,
+        }
+        | crate::mcp::turn_budget::CallDecision::Restricted {
             snapshot,
             error_payload,
             content_text,
@@ -121,18 +140,11 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
             emit_full_warning,
             ..
         } => {
-            let mut args = tool_arguments(name, params);
-            if !args.is_object() {
-                args = serde_json::json!({});
-            }
             args["_runtime_budget_ms"] = serde_json::json!(runtime_budget.as_millis() as u64);
 
             // 检查是否为外部 stdio MCP 工具
-            if let Some(ref external_mgr) = state.external_mcp {
-                let is_external = tauri::async_runtime::block_on(
-                    external_mgr.find_tool_entry(&state.workspace_id, name),
-                );
-                if is_external.is_some() {
+            if is_external.is_some() {
+                if let Some(ref external_mgr) = state.external_mcp {
                     let res = tauri::async_runtime::block_on(
                         external_mgr.call_external_tool_with_budget(
                             &state.workspace_id,
