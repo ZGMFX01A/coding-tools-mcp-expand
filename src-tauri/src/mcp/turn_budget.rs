@@ -49,18 +49,274 @@ impl BudgetClock for MockBudgetClock {
     }
 }
 
+/// 工具属性标识结构体，避免单一枚举互斥导致的语义冲突
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolBudgetTraits {
+    /// 是否属于探索/发散型工具（会在代码库或历史中大规模寻找新线索）
+    pub investigation: bool,
+    /// 是否会修改代码或工作区状态
+    pub mutating: bool,
+    /// 是否会开启新的长任务或危险执行
+    pub starts_new_work: bool,
+    /// 是否属于安全无发散的只读验证
+    pub verification_safe: bool,
+    /// 是否允许在 WRAP_UP 阶段 (27m~28m) 执行
+    pub wrap_up_allowed: bool,
+    /// 是否允许在 FINALIZATION 阶段 (28m~28m55s) 执行
+    pub finalization_safe: bool,
+}
+
+/// 对给定工具根据其名称、参数以及是否 External 进行属性分类判定
+pub fn get_tool_traits(tool_name: &str, is_external: bool, args: &Value) -> ToolBudgetTraits {
+    if is_external {
+        return ToolBudgetTraits {
+            investigation: true,
+            mutating: false,
+            starts_new_work: true,
+            verification_safe: false,
+            wrap_up_allowed: false,
+            finalization_safe: false,
+        };
+    }
+
+    let canonical = crate::tools::registry::canonical_tool_name(tool_name);
+    match canonical {
+        // 探索型工具（在 27m WRAP_UP 阶段立即禁止）
+        "search_text" | "grep_text" | "grep" | "list_files" | "history_session_search"
+        | "history_session_read" | "git_log" | "git_show" | "git_blame" | "view_image" => {
+            ToolBudgetTraits {
+                investigation: true,
+                mutating: false,
+                starts_new_work: false,
+                verification_safe: false,
+                wrap_up_allowed: false,
+                finalization_safe: false,
+            }
+        }
+
+        // 修改代码工具（WRAP_UP 允许完成最后修改，FINALIZATION 严禁）
+        "apply_patch" => ToolBudgetTraits {
+            investigation: false,
+            mutating: true,
+            starts_new_work: false,
+            verification_safe: false,
+            wrap_up_allowed: true,
+            finalization_safe: false,
+        },
+
+        // 命令执行工具（结合参数智能识别验证类命令，WRAP_UP 阶段限额 30s，FINALIZATION 阶段禁止）
+        "exec_command" => {
+            let is_verif = args
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(is_wrap_up_verification_command)
+                .unwrap_or(false);
+
+            ToolBudgetTraits {
+                investigation: false,
+                mutating: false,
+                starts_new_work: !is_verif,
+                verification_safe: is_verif,
+                wrap_up_allowed: is_verif,
+                finalization_safe: false,
+            }
+        }
+
+        // 会话杀死（允许作为最终 cleanup 特例）
+        "kill_session" => ToolBudgetTraits {
+            investigation: false,
+            mutating: true,
+            starts_new_work: false,
+            verification_safe: true,
+            wrap_up_allowed: true,
+            finalization_safe: true,
+        },
+
+        // 会话 checkpoint 与任务完成（具有副作用但在收尾阶段必须允许）
+        "history_session_checkpoint" | "finish_task" => ToolBudgetTraits {
+            investigation: false,
+            mutating: true,
+            starts_new_work: false,
+            verification_safe: true,
+            wrap_up_allowed: true,
+            finalization_safe: true,
+        },
+
+        // 核心收尾与只读事实确认工具（全阶段至 28m55s 允许）
+        "read_file" | "git_status" | "git_diff" | "read_output" | "project_state"
+        | "change_summary" | "task_context" => ToolBudgetTraits {
+            investigation: false,
+            mutating: false,
+            starts_new_work: false,
+            verification_safe: true,
+            wrap_up_allowed: true,
+            finalization_safe: true,
+        },
+
+        // 轻量预检与环境诊断
+        "patch_check" | "check_exec_environment" | "exec_health_check" | "get_default_cwd" => {
+            ToolBudgetTraits {
+                investigation: false,
+                mutating: false,
+                starts_new_work: false,
+                verification_safe: true,
+                wrap_up_allowed: true,
+                finalization_safe: true,
+            }
+        }
+
+        // 其他状态工具（WRAP_UP 允许，FINALIZATION 默认收拢以防发散）
+        "list_dir" | "server_info" | "harness_status" | "operation_log" | "list_task_events" => {
+            ToolBudgetTraits {
+                investigation: false,
+                mutating: false,
+                starts_new_work: false,
+                verification_safe: true,
+                wrap_up_allowed: true,
+                finalization_safe: false,
+            }
+        }
+
+        // 其他可能开启新状态的工具（WRAP_UP 与 FINALIZATION 均禁止）
+        "set_default_cwd" | "start_task" | "update_task" | "pause_task" | "resume_task"
+        | "history_session_bootstrap" | "history_session_validate" | "request_permissions"
+        | "write_stdin" => ToolBudgetTraits {
+            investigation: false,
+            mutating: true,
+            starts_new_work: true,
+            verification_safe: false,
+            wrap_up_allowed: false,
+            finalization_safe: false,
+        },
+
+        // 兜底默认值
+        _ => ToolBudgetTraits {
+            investigation: true,
+            mutating: false,
+            starts_new_work: true,
+            verification_safe: false,
+            wrap_up_allowed: false,
+            finalization_safe: false,
+        },
+    }
+}
+
+/// 判断命令是否属于 WRAP_UP 阶段允许的轻量验证命令
+pub fn is_wrap_up_verification_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() || trimmed.len() > 1000 {
+        return false;
+    }
+    // 检查管道、重定向与链式语法
+    if trimmed.contains('|')
+        || trimmed.contains(';')
+        || trimmed.contains('&')
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+    {
+        return false;
+    }
+
+    let Ok(parts) = shell_words::split(trimmed) else {
+        return false;
+    };
+    if parts.is_empty() {
+        return false;
+    }
+
+    let exe = parts[0].to_ascii_lowercase();
+    let base_exe = exe
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&exe)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat");
+
+    // 严禁包含安装、克隆、下载、启动服务等动词
+    let forbidden_verbs = [
+        "install", "add", "clone", "get", "fetch", "pull", "push", "serve", "server", "start",
+        "dev", "watch", "run-server", "daemon", "rm", "del", "delete", "clean", "upgrade",
+    ];
+    for p in &parts[1..] {
+        let low = p.to_ascii_lowercase();
+        if forbidden_verbs.iter().any(|v| low == *v) {
+            return false;
+        }
+        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("git@") {
+            return false;
+        }
+    }
+
+    match base_exe {
+        "cargo" => {
+            if parts.len() >= 2 {
+                let sub = parts[1].to_ascii_lowercase();
+                sub == "check" || sub == "test" || sub == "clippy" || sub == "--version" || sub == "-v"
+            } else {
+                false
+            }
+        }
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            if parts.len() >= 2 {
+                let sub = parts[1].to_ascii_lowercase();
+                if sub == "test" || sub == "check" || sub == "lint" || sub == "--version" || sub == "-v" {
+                    return true;
+                }
+                if sub == "run" && parts.len() >= 3 {
+                    let script = parts[2].to_ascii_lowercase();
+                    return script == "check"
+                        || script == "build"
+                        || script == "test"
+                        || script == "lint"
+                        || script == "typecheck";
+                }
+            }
+            false
+        }
+        "git" => {
+            if parts.len() >= 2 {
+                let sub = parts[1].to_ascii_lowercase();
+                sub == "status" || sub == "diff" || sub == "branch" || sub == "--version" || sub == "show"
+            } else {
+                false
+            }
+        }
+        "python" | "python3" | "py" => {
+            if parts.len() >= 2 {
+                let sub = parts[1].to_ascii_lowercase();
+                sub == "--version" || sub == "-v" || sub == "-m"
+            } else {
+                false
+            }
+        }
+        "pytest" | "ruff" | "mypy" | "eslint" | "tsc" => true,
+        "node" | "rustc" | "go" | "dotnet" | "deno" => {
+            if parts.len() >= 2 {
+                let sub = parts[1].to_ascii_lowercase();
+                sub == "--version" || sub == "-v" || sub == "version" || sub == "test"
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Agent Turn 预算配置
 #[derive(Debug, Clone)]
 pub struct AgentTurnBudgetConfig {
     pub enabled: bool,
     /// 触发 25 分钟提醒的时间阈值
     pub warning_after: Duration,
-    /// 触发 28 分钟紧急收尾的时间阈值
-    pub urgent_after: Duration,
-    /// 29 分钟硬停止时间阈值
-    pub hard_stop_after: Duration,
+    /// 触发 27 分钟收敛阶段（禁止 investigation 与外部工具）
+    pub wrap_up_after: Duration,
+    /// 触发 28 分钟收尾阶段（仅允许最小只读收尾工具）
+    pub finalization_after: Duration,
     /// 调度截止预留时间（默认 5s，在 29m - 5s = 28m55s 之后拒绝启动新工具）
     pub deadline_reserve: Duration,
+    /// 29 分钟硬停止时间阈值
+    pub hard_stop_after: Duration,
     /// 早期（<20m）普通空闲重置阈值（默认 90s）
     pub early_idle_reset: Duration,
     /// 中期（20m~25m）空闲重置阈值（默认 180s）
@@ -80,7 +336,8 @@ impl Default for AgentTurnBudgetConfig {
         Self {
             enabled: true,
             warning_after: Duration::from_secs(25 * 60),
-            urgent_after: Duration::from_secs(28 * 60),
+            wrap_up_after: Duration::from_secs(27 * 60),
+            finalization_after: Duration::from_secs(28 * 60),
             hard_stop_after: Duration::from_secs(29 * 60),
             deadline_reserve: Duration::from_secs(5),
             early_idle_reset: Duration::from_secs(90),
@@ -97,7 +354,8 @@ impl AgentTurnBudgetConfig {
     /// 构造用于快速测试的毫秒级阈值配置
     pub fn for_test_ms(
         warning_ms: u64,
-        urgent_ms: u64,
+        wrap_up_ms: u64,
+        finalization_ms: u64,
         hard_stop_ms: u64,
         reserve_ms: u64,
         early_idle_ms: u64,
@@ -108,7 +366,8 @@ impl AgentTurnBudgetConfig {
         Self {
             enabled: true,
             warning_after: Duration::from_millis(warning_ms),
-            urgent_after: Duration::from_millis(urgent_ms),
+            wrap_up_after: Duration::from_millis(wrap_up_ms),
+            finalization_after: Duration::from_millis(finalization_ms),
             hard_stop_after: Duration::from_millis(hard_stop_ms),
             deadline_reserve: Duration::from_millis(reserve_ms),
             early_idle_reset: Duration::from_millis(early_idle_ms),
@@ -138,7 +397,8 @@ pub struct AgentTurnState {
     pub last_call_completed_at: Option<Instant>,
     pub active_calls: usize,
     pub warning_emitted: bool,
-    pub urgent_emitted: bool,
+    pub wrap_up_emitted: bool,
+    pub finalization_emitted: bool,
     pub hard_stopped_at: Option<Instant>,
 }
 
@@ -147,7 +407,9 @@ pub struct AgentTurnState {
 pub enum TurnBudgetStatus {
     Normal,
     Warning,
+    WrapUp,
     Urgent,
+    Finalization,
     DispatchCutoff,
     HardStop,
     Unmanaged,
@@ -158,7 +420,9 @@ impl TurnBudgetStatus {
         match self {
             Self::Normal => "normal",
             Self::Warning => "warning",
+            Self::WrapUp => "wrap_up",
             Self::Urgent => "urgent",
+            Self::Finalization => "finalization",
             Self::DispatchCutoff => "dispatch_cutoff",
             Self::HardStop => "hard_stop",
             Self::Unmanaged => "unmanaged",
@@ -206,7 +470,13 @@ pub enum CallDecision {
         emit_full_warning: bool,
         emit_urgent: bool,
     },
-    /// 被阻止（DispatchCutoff 或 HardStop）
+    /// 受政策限制被拒绝（WRAP_UP 或 FINALIZATION 阶段）
+    Restricted {
+        snapshot: TurnBudgetSnapshot,
+        error_payload: Value,
+        content_text: String,
+    },
+    /// 被硬阻止（DispatchCutoff 或 HardStop）
     Blocked {
         snapshot: TurnBudgetSnapshot,
         error_payload: Value,
@@ -260,11 +530,14 @@ impl AgentTurnBudgetManager {
         format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
     }
 
-    /// 在工具调用前进行评估与状态登记
+    /// 在工具调用前进行评估与状态登记，结合 Turn Budget Tool Policy 进行阶段与权限检查
     pub fn start_call(
         self: &Arc<Self>,
         workspace_id: &str,
         session_id: Option<&str>,
+        tool_name: &str,
+        is_external: bool,
+        args: &Value,
     ) -> CallDecision {
         if !self.config.enabled {
             return CallDecision::Unmanaged;
@@ -285,10 +558,10 @@ impl AgentTurnBudgetManager {
         self.cleanup_stale_states_locked(&mut states, now);
 
         let sanitized_session = Self::sanitize_session_for_log(&key.session_id);
+        let traits = get_tool_traits(tool_name, is_external, args);
 
         let (decision, log_event) = match states.get_mut(&key) {
             None => {
-                // 如果即将插入新 key 且容量已达上限，先淘汰最旧非活跃状态
                 if states.len() >= self.config.max_states {
                     self.evict_oldest_inactive_locked(&mut states);
                 }
@@ -301,7 +574,8 @@ impl AgentTurnBudgetManager {
                     last_call_completed_at: None,
                     active_calls: 1,
                     warning_emitted: false,
-                    urgent_emitted: false,
+                    wrap_up_emitted: false,
+                    finalization_emitted: false,
                     hard_stopped_at: None,
                 };
                 states.insert(key.clone(), new_state);
@@ -327,8 +601,8 @@ impl AgentTurnBudgetManager {
                         emit_urgent: false,
                     },
                     Some(format!(
-                        "[turn-budget] new workspace={} session={} turn_seq=1",
-                        workspace_id, sanitized_session
+                        "[turn-budget] new workspace={} session={} turn_seq=1 tool={}",
+                        workspace_id, sanitized_session, tool_name
                     )),
                 )
             }
@@ -336,7 +610,6 @@ impl AgentTurnBudgetManager {
                 // 检查是否应当重置为新 Turn
                 if state.active_calls == 0 {
                     if state.hard_stopped_at.is_some() {
-                        // HardStop 状态下的重置要求：跨越平台硬限制隔离线 (started_at + platform_turn_limit + post_limit_safety_margin)
                         let isolation_deadline = state.started_at
                             + self.config.platform_turn_limit
                             + self.config.post_limit_safety_margin;
@@ -346,7 +619,8 @@ impl AgentTurnBudgetManager {
                             state.last_call_started_at = now;
                             state.last_call_completed_at = None;
                             state.warning_emitted = false;
-                            state.urgent_emitted = false;
+                            state.wrap_up_emitted = false;
+                            state.finalization_emitted = false;
                             state.hard_stopped_at = None;
                             append_profile_log(
                                 workspace_id,
@@ -373,9 +647,9 @@ impl AgentTurnBudgetManager {
                                 "error": {
                                     "code": "AGENT_TURN_BUDGET_EXHAUSTED",
                                     "message": "Tool execution was not started because this agent turn reached the local safety limit.",
-                                    "category": "execution",
+                                    "category": "turn_budget",
                                     "retryable": false,
-                                    "recovery_hint": "Respond to the user now without calling additional tools."
+                                    "recovery_hint": "DO NOT RETRY THIS TOOL OR CALL ANY OTHER TOOL. Respond to the user immediately with current progress."
                                 }
                             });
                             return CallDecision::Blocked {
@@ -408,7 +682,8 @@ impl AgentTurnBudgetManager {
                             state.last_call_started_at = now;
                             state.last_call_completed_at = None;
                             state.warning_emitted = false;
-                            state.urgent_emitted = false;
+                            state.wrap_up_emitted = false;
+                            state.finalization_emitted = false;
                             state.hard_stopped_at = None;
                             append_profile_log(
                                 workspace_id,
@@ -428,8 +703,8 @@ impl AgentTurnBudgetManager {
                     .hard_stop_after
                     .saturating_sub(self.config.deadline_reserve);
 
+                // 1. HARD_STOP (>= 29m)
                 if elapsed >= self.config.hard_stop_after {
-                    // >= 29 分钟：触发 HardStop
                     state.hard_stopped_at.get_or_insert(now);
                     let snapshot = TurnBudgetSnapshot {
                         status: TurnBudgetStatus::HardStop,
@@ -445,9 +720,9 @@ impl AgentTurnBudgetManager {
                         "error": {
                             "code": "AGENT_TURN_BUDGET_EXHAUSTED",
                             "message": "Tool execution was not started because this agent turn reached the local safety limit.",
-                            "category": "execution",
+                            "category": "turn_budget",
                             "retryable": false,
-                            "recovery_hint": "Respond to the user now without calling additional tools."
+                            "recovery_hint": "DO NOT RETRY THIS TOOL OR CALL ANY OTHER TOOL. Respond to the user immediately with current progress."
                         }
                     });
                     (
@@ -457,12 +732,12 @@ impl AgentTurnBudgetManager {
                             content_text,
                         },
                         Some(format!(
-                            "[turn-budget] hard-stop workspace={} session={} turn_seq={} elapsed_secs={}",
-                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs()
+                            "[turn-budget] hard_stop workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
                         )),
                     )
                 } else if elapsed >= cutoff_point {
-                    // 28分55秒 ~ 29分钟：进入 Dispatch Cutoff 阶段
+                    // 2. DISPATCH_CUTOFF (28m55s ~ 29m)
                     let snapshot = TurnBudgetSnapshot {
                         status: TurnBudgetStatus::DispatchCutoff,
                         elapsed_seconds: elapsed.as_secs(),
@@ -481,9 +756,9 @@ impl AgentTurnBudgetManager {
                         "error": {
                             "code": "AGENT_TURN_BUDGET_DISPATCH_CUTOFF",
                             "message": "Tool execution dispatch was cutoff because this agent turn is near the local safety limit.",
-                            "category": "execution",
+                            "category": "turn_budget",
                             "retryable": false,
-                            "recovery_hint": "Respond to the user now without calling additional tools."
+                            "recovery_hint": "DO NOT RETRY THIS TOOL OR CALL ANY OTHER TOOL. Respond to the user immediately with current progress."
                         }
                     });
                     (
@@ -493,73 +768,216 @@ impl AgentTurnBudgetManager {
                             content_text,
                         },
                         Some(format!(
-                            "[turn-budget] dispatch-cutoff workspace={} session={} turn_seq={} elapsed_secs={}",
-                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs()
+                            "[turn-budget] dispatch_cutoff workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
                         )),
                     )
-                } else {
-                    // 允许启动调用
+                } else if elapsed >= self.config.finalization_after {
+                    // 3. FINALIZATION (28m ~ 28m55s): 仅允许 finalization_safe 工具
+                    if !traits.finalization_safe {
+                        let snapshot = TurnBudgetSnapshot {
+                            status: TurnBudgetStatus::Finalization,
+                            elapsed_seconds: elapsed.as_secs(),
+                            remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
+                            should_wrap_up: true,
+                            should_stop_tool_calls: false,
+                            timer_origin: "first_observed_tool_call",
+                        };
+                        let content_text = format!(
+                            "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in finalization mode (elapsed: {}s). Code changes, new executions, searches, and external tools are no longer allowed. Use only finalization-safe tools (e.g. read_file, git_status, git_diff, history_session_checkpoint, finish_task) to verify the current state, then respond to the user immediately.",
+                            tool_name, elapsed.as_secs()
+                        );
+                        let error_payload = json!({
+                            "ok": false,
+                            "error": {
+                                "code": "AGENT_TURN_WRAP_UP_RESTRICTED",
+                                "message": format!("Tool '{}' is blocked in finalization mode.", tool_name),
+                                "category": "turn_budget",
+                                "retryable": false,
+                                "recovery_hint": "Do not retry this tool. This turn is in finalization mode. Code changes, new executions, searches, and external tools are no longer allowed. Use only finalization-safe tools to verify current state, then respond to the user immediately."
+                            }
+                        });
+                        (
+                            CallDecision::Restricted {
+                                snapshot,
+                                error_payload,
+                                content_text,
+                            },
+                            Some(format!(
+                                "[turn-budget] tool_rejected_by_finalization workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                                workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
+                            )),
+                        )
+                    } else {
+                        // 允许 finalization 工具执行
+                        state.active_calls += 1;
+                        state.last_call_started_at = now;
+                        let runtime_budget = cutoff_point.saturating_sub(elapsed);
+                        let first_fin = !state.finalization_emitted;
+                        state.finalization_emitted = true;
+
+                        let snapshot = TurnBudgetSnapshot {
+                            status: TurnBudgetStatus::Finalization,
+                            elapsed_seconds: elapsed.as_secs(),
+                            remaining_seconds: runtime_budget.as_secs(),
+                            should_wrap_up: true,
+                            should_stop_tool_calls: false,
+                            timer_origin: "first_observed_tool_call",
+                        };
+                        let guard = TurnCallGuard::new(self.clone(), key.clone());
+                        (
+                            CallDecision::Allowed {
+                                guard,
+                                runtime_budget,
+                                snapshot,
+                                emit_full_warning: false,
+                                emit_urgent: first_fin,
+                            },
+                            if first_fin {
+                                Some(format!(
+                                    "[turn-budget] urgent_injected workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                                    workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
+                                ))
+                            } else {
+                                None
+                            },
+                        )
+                    }
+                } else if elapsed >= self.config.wrap_up_after {
+                    // 4. WRAP_UP (27m ~ 28m): 禁止 investigation，允许最后修改与验证
+                    if !traits.wrap_up_allowed {
+                        let snapshot = TurnBudgetSnapshot {
+                            status: TurnBudgetStatus::WrapUp,
+                            elapsed_seconds: elapsed.as_secs(),
+                            remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
+                            should_wrap_up: true,
+                            should_stop_tool_calls: false,
+                            timer_origin: "first_observed_tool_call",
+                        };
+                        let content_text = format!(
+                            "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in wrap-up mode (elapsed: {}s). New investigation and task expansion are no longer allowed. Finish only the already identified work using finalization-safe tools, then respond to the user.",
+                            tool_name, elapsed.as_secs()
+                        );
+                        let error_payload = json!({
+                            "ok": false,
+                            "error": {
+                                "code": "AGENT_TURN_WRAP_UP_RESTRICTED",
+                                "message": format!("Tool '{}' is blocked in wrap-up mode.", tool_name),
+                                "category": "turn_budget",
+                                "retryable": false,
+                                "recovery_hint": "Do not retry this tool. This turn is in wrap-up mode. New investigation is no longer allowed. Finish only the already identified work using finalization-safe tools, then respond to the user."
+                            }
+                        });
+                        (
+                            CallDecision::Restricted {
+                                snapshot,
+                                error_payload,
+                                content_text,
+                            },
+                            Some(format!(
+                                "[turn-budget] tool_rejected_by_wrap_up workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                                workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
+                            )),
+                        )
+                    } else {
+                        state.active_calls += 1;
+                        state.last_call_started_at = now;
+                        let mut runtime_budget = cutoff_point.saturating_sub(elapsed);
+                        if tool_name == "exec_command" {
+                            // WRAP_UP exec 强制压缩至最多 30s
+                            runtime_budget = runtime_budget.min(Duration::from_secs(30));
+                        }
+
+                        let snapshot = TurnBudgetSnapshot {
+                            status: TurnBudgetStatus::WrapUp,
+                            elapsed_seconds: elapsed.as_secs(),
+                            remaining_seconds: runtime_budget.as_secs(),
+                            should_wrap_up: true,
+                            should_stop_tool_calls: false,
+                            timer_origin: "first_observed_tool_call",
+                        };
+                        let guard = TurnCallGuard::new(self.clone(), key.clone());
+                        (
+                            CallDecision::Allowed {
+                                guard,
+                                runtime_budget,
+                                snapshot,
+                                emit_full_warning: false,
+                                emit_urgent: false,
+                            },
+                            None,
+                        )
+                    }
+                } else if elapsed >= self.config.warning_after {
+                    // 5. WARNING (25m ~ 27m): 允许所有工具，但记录 post_warning_investigation_attempt
                     state.active_calls += 1;
                     state.last_call_started_at = now;
                     let runtime_budget = cutoff_point.saturating_sub(elapsed);
 
-                    let (status, emit_full_warning, emit_urgent, log_str) =
-                        if elapsed >= self.config.urgent_after {
-                            let first_urgent = !state.urgent_emitted;
-                            state.urgent_emitted = true;
-                            (
-                                TurnBudgetStatus::Urgent,
-                                false,
-                                first_urgent,
-                                if first_urgent {
-                                    Some(format!(
-                                        "[turn-budget] urgent workspace={} session={} turn_seq={} elapsed_secs={}",
-                                        workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs()
-                                    ))
-                                } else {
-                                    None
-                                },
-                            )
-                        } else if elapsed >= self.config.warning_after {
-                            let first_warning = !state.warning_emitted;
-                            state.warning_emitted = true;
-                            (
-                                TurnBudgetStatus::Warning,
-                                first_warning,
-                                false,
-                                if first_warning {
-                                    Some(format!(
-                                        "[turn-budget] warning workspace={} session={} turn_seq={} elapsed_secs={}",
-                                        workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs()
-                                    ))
-                                } else {
-                                    None
-                                },
-                            )
-                        } else {
-                            (TurnBudgetStatus::Normal, false, false, None)
-                        };
+                    let first_warning = !state.warning_emitted;
+                    state.warning_emitted = true;
+
+                    let mut log_msgs = Vec::new();
+                    if first_warning {
+                        log_msgs.push(format!(
+                            "[turn-budget] warning_injected workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
+                        ));
+                    }
+                    if traits.investigation && !first_warning {
+                        log_msgs.push(format!(
+                            "[turn-budget] post_warning_investigation_attempt workspace={} session={} turn_seq={} elapsed_secs={} tool={}",
+                            workspace_id, sanitized_session, state.turn_seq, elapsed.as_secs(), tool_name
+                        ));
+                    }
 
                     let snapshot = TurnBudgetSnapshot {
-                        status,
+                        status: TurnBudgetStatus::Warning,
                         elapsed_seconds: elapsed.as_secs(),
                         remaining_seconds: runtime_budget.as_secs(),
-                        should_wrap_up: status == TurnBudgetStatus::Warning
-                            || status == TurnBudgetStatus::Urgent,
+                        should_wrap_up: true,
                         should_stop_tool_calls: false,
                         timer_origin: "first_observed_tool_call",
                     };
-
                     let guard = TurnCallGuard::new(self.clone(), key.clone());
                     (
                         CallDecision::Allowed {
                             guard,
                             runtime_budget,
                             snapshot,
-                            emit_full_warning,
-                            emit_urgent,
+                            emit_full_warning: first_warning,
+                            emit_urgent: false,
                         },
-                        log_str,
+                        if !log_msgs.is_empty() {
+                            Some(log_msgs.join("\n"))
+                        } else {
+                            None
+                        },
+                    )
+                } else {
+                    // 6. NORMAL (< 25m)
+                    state.active_calls += 1;
+                    state.last_call_started_at = now;
+                    let runtime_budget = cutoff_point.saturating_sub(elapsed);
+
+                    let snapshot = TurnBudgetSnapshot {
+                        status: TurnBudgetStatus::Normal,
+                        elapsed_seconds: elapsed.as_secs(),
+                        remaining_seconds: runtime_budget.as_secs(),
+                        should_wrap_up: false,
+                        should_stop_tool_calls: false,
+                        timer_origin: "first_observed_tool_call",
+                    };
+                    let guard = TurnCallGuard::new(self.clone(), key.clone());
+                    (
+                        CallDecision::Allowed {
+                            guard,
+                            runtime_budget,
+                            snapshot,
+                            emit_full_warning: false,
+                            emit_urgent: false,
+                        },
+                        None,
                     )
                 }
             }
@@ -587,7 +1005,6 @@ impl AgentTurnBudgetManager {
         states: &mut HashMap<TurnKey, AgentTurnState>,
         now: Instant,
     ) {
-        // 1. 移除 TTL 过期且无活跃调用的状态
         states.retain(|_, state| {
             if state.active_calls > 0 {
                 return true;
@@ -598,7 +1015,6 @@ impl AgentTurnBudgetManager {
             now.saturating_duration_since(last_active) < self.config.state_ttl
         });
 
-        // 2. 超出最大条目数时，移除最旧的非活跃状态
         while states.len() > self.config.max_states {
             if !self.evict_oldest_inactive_locked(states) {
                 break;
@@ -622,7 +1038,7 @@ impl AgentTurnBudgetManager {
         }
     }
 
-    /// 为被阻断的调用生成统一的返回结构
+    /// 为被阻断或受限的调用生成统一的返回结构
     pub fn build_blocked_result(
         &self,
         snapshot: &TurnBudgetSnapshot,
@@ -657,7 +1073,7 @@ impl AgentTurnBudgetManager {
                 &mut result,
                 "[TURN BUDGET WARNING]\nThis agent turn has been using tools for about 25 minutes.\nStop expanding the task. Finish only the currently necessary work, then respond to the user with completed work, verification results, and remaining work.\n\n",
             );
-        } else if snapshot.status == TurnBudgetStatus::Urgent {
+        } else if snapshot.status == TurnBudgetStatus::Finalization || snapshot.status == TurnBudgetStatus::Urgent {
             prepend_content_text(
                 &mut result,
                 "[TURN BUDGET URGENT]\nLess than one minute of local tool budget remains. Do not start new investigation. Finish only essential cleanup and respond to the user.\n\n",
