@@ -182,7 +182,10 @@ export class TurnObserverOverlay {
               <span class="ct-turn-observer-logo-dot"></span>
               <span>Coding Tools</span>
             </div>
-            <button type="button" class="ct-turn-observer-toggle-btn" id="ct-collapse-btn" title="折叠">－</button>
+            <div class="ct-turn-observer-actions">
+              <button type="button" class="ct-turn-observer-toggle-btn" id="ct-settings-btn" title="配置 (打开设置)">⚙</button>
+              <button type="button" class="ct-turn-observer-toggle-btn" id="ct-collapse-btn" title="折叠">－</button>
+            </div>
           </div>
           <div class="ct-turn-observer-row">
             <span class="ct-turn-observer-label">${modelRowLabel}</span>
@@ -194,7 +197,7 @@ export class TurnObserverOverlay {
           </div>
           <div class="ct-turn-observer-row">
             <span class="ct-turn-observer-label">MCP：</span>
-            <span class="ct-turn-observer-value ct-turn-observer-status-pill" title="${state?.bridgeMessage || statusLabel}">
+            <span class="ct-turn-observer-value ct-turn-observer-status-pill ct-clickable" id="ct-status-pill" title="点击配置: ${state?.bridgeMessage || statusLabel}">
               <span class="ct-turn-observer-status-dot ${statusClass}"></span>
               <span>${statusLabel}</span>
             </span>
@@ -206,12 +209,40 @@ export class TurnObserverOverlay {
     this.bindEvents();
   }
 
+  private openSettings() {
+    try {
+      if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
+        chrome.runtime.openOptionsPage();
+      } else if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
+        window.open(chrome.runtime.getURL('options/options.html'), '_blank');
+      }
+    } catch (e) {
+      console.warn('[TurnObserver] 打开设置页失败:', e);
+    }
+  }
+
   private bindEvents() {
     if (!this.container) return;
 
     const dragHandle = this.container.querySelector('#ct-drag-handle') as HTMLElement | null;
     if (dragHandle) {
       this.initDraggable(dragHandle);
+    }
+
+    const settingsBtn = this.container.querySelector('#ct-settings-btn');
+    if (settingsBtn) {
+      settingsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.openSettings();
+      });
+    }
+
+    const statusPill = this.container.querySelector('#ct-status-pill');
+    if (statusPill) {
+      statusPill.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.openSettings();
+      });
     }
 
     const collapseBtn = this.container.querySelector('#ct-collapse-btn');

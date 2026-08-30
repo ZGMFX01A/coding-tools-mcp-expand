@@ -56,6 +56,12 @@
   background: #3b82f6;
 }
 
+.ct-turn-observer-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .ct-turn-observer-toggle-btn {
   background: transparent;
   border: none;
@@ -141,3 +147,13 @@
 .ct-turn-observer-mini:active {
   cursor: grabbing;
 }
+
+.ct-clickable {
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.ct-clickable:hover {
+  opacity: 0.8;
+}
+
