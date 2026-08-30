@@ -108,13 +108,23 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         None
     };
 
-    let decision = state.turn_budget.start_call(
-        &state.workspace_id,
-        openai_session,
-        name,
-        is_external.is_some(),
-        &args,
-    );
+    let decision = if let Some(session) = openai_session.map(str::trim).filter(|s| !s.is_empty()) {
+        let now = state.turn_budget.clock().now();
+        let (_confidence, identity) = state.turn_correlator.correlate(
+            &state.workspace_id,
+            session,
+            &state.turn_registry,
+            now,
+        );
+        state.turn_budget.start_call_with_identity(
+            identity,
+            name,
+            is_external.is_some(),
+            &args,
+        )
+    } else {
+        crate::mcp::turn_budget::CallDecision::Unmanaged
+    };
 
     match decision {
         crate::mcp::turn_budget::CallDecision::Blocked {

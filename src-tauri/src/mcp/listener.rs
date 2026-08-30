@@ -35,6 +35,7 @@ struct ListenerState {
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
+    browser_bridge_token: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -72,6 +73,26 @@ pub fn spawn_listener(
     } else {
         None
     };
+    let browser_bridge_token = {
+        let key = "browser_bridge_token";
+        let existing = if auth.use_shared_secrets {
+            SecretStore::get_shared(key).unwrap_or(None)
+        } else {
+            SecretStore::get(&workspace_id, key).unwrap_or(None)
+        };
+        match existing {
+            Some(t) if !t.trim().is_empty() => Some(t),
+            _ => {
+                let generated = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "");
+                if auth.use_shared_secrets {
+                    let _ = SecretStore::set_shared(key, &generated);
+                } else {
+                    let _ = SecretStore::set(&workspace_id, key, &generated);
+                }
+                Some(generated)
+            }
+        }
+    };
     let configured_public_url = public_base_url.trim().to_string();
     let oauth = if auth.oauth_enabled() {
         let password = oauth_password.unwrap_or_default();
@@ -101,6 +122,7 @@ pub fn spawn_listener(
         bearer_token,
         oauth,
         oauth_client_secret,
+        browser_bridge_token,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -141,6 +163,8 @@ async fn serve(
         )
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
+        .route("/internal/chatgpt-turn-event", post(post_chatgpt_turn_event))
+        .route("/internal/chatgpt-turn-observer/status", get(get_chatgpt_turn_observer_status))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -373,6 +397,116 @@ fn oauth_not_configured() -> Response {
         Json(json!({ "error": "OAuth not configured" })),
     )
         .into_response()
+}
+
+async fn post_chatgpt_turn_event(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(err_resp) = verify_observer_token(&state, &headers) {
+        return err_resp;
+    }
+    if body.len() > 8192 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "ok": false, "error": "payload too large" })),
+        )
+            .into_response();
+    }
+    let event: crate::mcp::browser_turn::BrowserTurnEvent = match serde_json::from_slice(&body) {
+        Ok(ev) => ev,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("invalid json: {err}") })),
+            )
+                .into_response();
+        }
+    };
+    if event.observer_id.len() > 128
+        || event.turn_id.len() > 256
+        || event.conversation_id.as_ref().map_or(false, |c| c.len() > 256)
+        || event.request_id.as_ref().map_or(false, |r| r.len() > 256)
+        || event.actual_model.as_ref().map_or(false, |m| m.len() > 128)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "field length exceeds limit" })),
+        )
+            .into_response();
+    }
+
+    let now = state.mcp.turn_budget.clock().now();
+    state
+        .mcp
+        .turn_registry
+        .record_event(&state.workspace_id, event, now);
+
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+async fn get_chatgpt_turn_observer_status(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = verify_observer_token(&state, &headers) {
+        return err_resp;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "service": "chatgpt_turn_observer",
+            "version": env!("CARGO_PKG_VERSION"),
+            "workspace_id": state.workspace_id,
+        })),
+    )
+        .into_response()
+}
+
+fn verify_observer_token(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
+    let expected_token = match &state.browser_bridge_token {
+        Some(t) if !t.trim().is_empty() => t.trim(),
+        _ => {
+            return Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "ok": false, "error": "Observer token not configured on server" })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-coding-tools-observer-token").and_then(|v| v.to_str().ok()));
+
+    match auth_header {
+        Some(header_val) => {
+            let token = header_val.trim_start_matches("Bearer ").trim();
+            if token == expected_token {
+                None
+            } else {
+                Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "ok": false, "error": "Invalid observer token" })),
+                    )
+                        .into_response(),
+                )
+            }
+        }
+        None => Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": "Missing Authorization header" })),
+            )
+                .into_response(),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,19 @@ impl SecretStore {
         DataStore::read_file(|data| Ok(data.shared_secrets.get(key).cloned()))
     }
 
+    pub fn set_shared(key: &str, value: &str) -> AppResult<()> {
+        DataStore::update_file(|data| {
+            data.shared_secrets.insert(key.to_string(), value.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn regenerate_shared(key: &str) -> AppResult<String> {
+        let value = random_secret();
+        Self::set_shared(key, &value)?;
+        Ok(value)
+    }
+
     pub fn get_app(scope: &str, item_id: &str) -> AppResult<Option<String>> {
         DataStore::read_file(|data| {
             Ok(data

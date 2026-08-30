@@ -380,19 +380,24 @@ impl AgentTurnBudgetConfig {
     }
 }
 
-/// 唯一标识一个 ChatGPT 客户端会话在特定工作区中的 Turn Key
+use crate::mcp::browser_turn::TurnIdentity;
+
+/// 唯一标识一个客户端会话/单轮在特定工作区中的 Turn Key
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TurnKey {
     pub workspace_id: String,
     pub session_id: String,
+    pub conversation_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 /// 单轮 Agent 运行状态
 #[derive(Debug, Clone)]
 pub struct AgentTurnState {
     pub turn_seq: u64,
-    /// 本地观测到的首个工具调用开始时间 (timer_origin = first_observed_tool_call)
+    /// 观测到的起始时间（Browser 模式为 browser_observed_turn_start，Fallback 模式为 first_observed_tool_call）
     pub started_at: Instant,
+    pub timer_origin: &'static str,
     pub last_call_started_at: Instant,
     pub last_call_completed_at: Option<Instant>,
     pub active_calls: usize,
@@ -530,11 +535,10 @@ impl AgentTurnBudgetManager {
         format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
     }
 
-    /// 在工具调用前进行评估与状态登记，结合 Turn Budget Tool Policy 进行阶段与权限检查
-    pub fn start_call(
+    /// 根据解析后的 TurnIdentity 进行评估与状态登记
+    pub fn start_call_with_identity(
         self: &Arc<Self>,
-        workspace_id: &str,
-        session_id: Option<&str>,
+        identity: TurnIdentity,
         tool_name: &str,
         is_external: bool,
         args: &Value,
@@ -543,33 +547,77 @@ impl AgentTurnBudgetManager {
             return CallDecision::Unmanaged;
         }
 
-        let session = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(s) => s.to_string(),
-            None => return CallDecision::Unmanaged,
-        };
-
-        let key = TurnKey {
-            workspace_id: workspace_id.to_string(),
-            session_id: session,
+        let (key, is_browser, effective_started_at, initial_timer_origin) = match identity {
+            TurnIdentity::Browser {
+                workspace_id,
+                session_id,
+                conversation_id,
+                turn_id,
+                effective_started_at,
+                timer_origin,
+            } => (
+                TurnKey {
+                    workspace_id,
+                    session_id,
+                    conversation_id: Some(conversation_id),
+                    turn_id: Some(turn_id),
+                },
+                true,
+                effective_started_at,
+                timer_origin,
+            ),
+            TurnIdentity::SessionFallback {
+                workspace_id,
+                session_id,
+            } => {
+                let s = session_id.trim();
+                if s.is_empty() {
+                    return CallDecision::Unmanaged;
+                }
+                (
+                    TurnKey {
+                        workspace_id,
+                        session_id: s.to_string(),
+                        conversation_id: None,
+                        turn_id: None,
+                    },
+                    false,
+                    self.clock.now(),
+                    "first_observed_tool_call",
+                )
+            }
         };
 
         let now = self.clock.now();
         let mut states = self.states.lock().expect("agent turn budget lock poisoned");
         self.cleanup_stale_states_locked(&mut states, now);
 
+        let workspace_id = key.workspace_id.clone();
         let sanitized_session = Self::sanitize_session_for_log(&key.session_id);
         let traits = get_tool_traits(tool_name, is_external, args);
 
         let (decision, log_event) = match states.get_mut(&key) {
             None => {
+                // 如果是 Browser 模式且有新 key，清理同 (workspace_id, session_id) 下残留的旧会话或旧 Turn 状态
+                if is_browser {
+                    states.retain(|k, _| !(k.workspace_id == key.workspace_id && k.session_id == key.session_id));
+                }
+
                 if states.len() >= self.config.max_states {
                     self.evict_oldest_inactive_locked(&mut states);
                 }
 
+                let start_time = if is_browser {
+                    effective_started_at
+                } else {
+                    now
+                };
+
                 // 首个观测到的调用，创建新 Turn
                 let new_state = AgentTurnState {
                     turn_seq: 1,
-                    started_at: now,
+                    started_at: start_time,
+                    timer_origin: initial_timer_origin,
                     last_call_started_at: now,
                     last_call_completed_at: None,
                     active_calls: 1,
@@ -580,15 +628,16 @@ impl AgentTurnBudgetManager {
                 };
                 states.insert(key.clone(), new_state);
 
+                let elapsed = now.saturating_duration_since(start_time);
                 let cutoff = self.config.hard_stop_after.saturating_sub(self.config.deadline_reserve);
-                let runtime_budget = cutoff;
+                let runtime_budget = cutoff.saturating_sub(elapsed);
                 let snapshot = TurnBudgetSnapshot {
                     status: TurnBudgetStatus::Normal,
-                    elapsed_seconds: 0,
+                    elapsed_seconds: elapsed.as_secs(),
                     remaining_seconds: runtime_budget.as_secs(),
                     should_wrap_up: false,
                     should_stop_tool_calls: false,
-                    timer_origin: "first_observed_tool_call",
+                    timer_origin: initial_timer_origin,
                 };
 
                 let guard = TurnCallGuard::new(self.clone(), key.clone());
@@ -601,8 +650,8 @@ impl AgentTurnBudgetManager {
                         emit_urgent: false,
                     },
                     Some(format!(
-                        "[turn-budget] new workspace={} session={} turn_seq=1 tool={}",
-                        workspace_id, sanitized_session, tool_name
+                        "[turn-budget] new workspace={} session={} turn_seq=1 origin={} tool={}",
+                        workspace_id, sanitized_session, initial_timer_origin, tool_name
                     )),
                 )
             }
@@ -623,7 +672,7 @@ impl AgentTurnBudgetManager {
                             state.finalization_emitted = false;
                             state.hard_stopped_at = None;
                             append_profile_log(
-                                workspace_id,
+                                &workspace_id,
                                 "mcp-requests.log",
                                 &format!(
                                     "[turn-budget] reset-after-platform-limit workspace={} session={} new_turn_seq={}",
@@ -639,7 +688,7 @@ impl AgentTurnBudgetManager {
                                 remaining_seconds: 0,
                                 should_wrap_up: true,
                                 should_stop_tool_calls: true,
-                                timer_origin: "first_observed_tool_call",
+                                timer_origin: state.timer_origin,
                             };
                             let content_text = "[TURN BUDGET HARD STOP]\nTool execution was not started because this agent turn reached the local safety limit. Do not call any more tools in this turn. Respond to the user now with completed work, verification results, and remaining work.".to_string();
                             let error_payload = json!({
@@ -686,7 +735,7 @@ impl AgentTurnBudgetManager {
                             state.finalization_emitted = false;
                             state.hard_stopped_at = None;
                             append_profile_log(
-                                workspace_id,
+                                &workspace_id,
                                 "mcp-requests.log",
                                 &format!(
                                     "[turn-budget] reset-by-idle workspace={} session={} new_turn_seq={}",
@@ -712,7 +761,7 @@ impl AgentTurnBudgetManager {
                         remaining_seconds: 0,
                         should_wrap_up: true,
                         should_stop_tool_calls: true,
-                        timer_origin: "first_observed_tool_call",
+                        timer_origin: state.timer_origin,
                     };
                     let content_text = "[TURN BUDGET HARD STOP]\nTool execution was not started because this agent turn reached the local safety limit. Do not call any more tools in this turn. Respond to the user now with completed work, verification results, and remaining work.".to_string();
                     let error_payload = json!({
@@ -748,7 +797,7 @@ impl AgentTurnBudgetManager {
                             .as_secs(),
                         should_wrap_up: true,
                         should_stop_tool_calls: true,
-                        timer_origin: "first_observed_tool_call",
+                        timer_origin: state.timer_origin,
                     };
                     let content_text = "[TURN BUDGET DISPATCH CUTOFF]\nTool execution dispatch was cutoff because this agent turn has less than 5 seconds of local execution budget remaining. Do not call additional tools. Respond to the user now with completed work, verification results, and remaining work.".to_string();
                     let error_payload = json!({
@@ -781,7 +830,7 @@ impl AgentTurnBudgetManager {
                             remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
                             should_wrap_up: true,
                             should_stop_tool_calls: false,
-                            timer_origin: "first_observed_tool_call",
+                            timer_origin: state.timer_origin,
                         };
                         let content_text = format!(
                             "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in finalization mode (elapsed: {}s). Code changes, new executions, searches, and external tools are no longer allowed. Use only finalization-safe tools (e.g. read_file, git_status, git_diff, history_session_checkpoint, finish_task) to verify the current state, then respond to the user immediately.",
@@ -822,7 +871,7 @@ impl AgentTurnBudgetManager {
                             remaining_seconds: runtime_budget.as_secs(),
                             should_wrap_up: true,
                             should_stop_tool_calls: false,
-                            timer_origin: "first_observed_tool_call",
+                            timer_origin: state.timer_origin,
                         };
                         let guard = TurnCallGuard::new(self.clone(), key.clone());
                         (
@@ -852,7 +901,7 @@ impl AgentTurnBudgetManager {
                             remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
                             should_wrap_up: true,
                             should_stop_tool_calls: false,
-                            timer_origin: "first_observed_tool_call",
+                            timer_origin: state.timer_origin,
                         };
                         let content_text = format!(
                             "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in wrap-up mode (elapsed: {}s). New investigation and task expansion are no longer allowed. Finish only the already identified work using finalization-safe tools, then respond to the user.",
@@ -894,7 +943,7 @@ impl AgentTurnBudgetManager {
                             remaining_seconds: runtime_budget.as_secs(),
                             should_wrap_up: true,
                             should_stop_tool_calls: false,
-                            timer_origin: "first_observed_tool_call",
+                            timer_origin: state.timer_origin,
                         };
                         let guard = TurnCallGuard::new(self.clone(), key.clone());
                         (
@@ -937,7 +986,7 @@ impl AgentTurnBudgetManager {
                         remaining_seconds: runtime_budget.as_secs(),
                         should_wrap_up: true,
                         should_stop_tool_calls: false,
-                        timer_origin: "first_observed_tool_call",
+                        timer_origin: state.timer_origin,
                     };
                     let guard = TurnCallGuard::new(self.clone(), key.clone());
                     (
@@ -966,7 +1015,7 @@ impl AgentTurnBudgetManager {
                         remaining_seconds: runtime_budget.as_secs(),
                         should_wrap_up: false,
                         should_stop_tool_calls: false,
-                        timer_origin: "first_observed_tool_call",
+                        timer_origin: state.timer_origin,
                     };
                     let guard = TurnCallGuard::new(self.clone(), key.clone());
                     (
@@ -984,10 +1033,34 @@ impl AgentTurnBudgetManager {
         };
 
         if let Some(log_line) = log_event {
-            append_profile_log(workspace_id, "mcp-requests.log", &log_line);
+            append_profile_log(&workspace_id, "mcp-requests.log", &log_line);
         }
 
         decision
+    }
+
+    /// 在工具调用前进行评估与状态登记（兼容旧 SessionFallback 调用）
+    pub fn start_call(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        tool_name: &str,
+        is_external: bool,
+        args: &Value,
+    ) -> CallDecision {
+        let session = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => return CallDecision::Unmanaged,
+        };
+        self.start_call_with_identity(
+            TurnIdentity::SessionFallback {
+                workspace_id: workspace_id.to_string(),
+                session_id: session,
+            },
+            tool_name,
+            is_external,
+            args,
+        )
     }
 
     /// 在工具调用完成时更新 active_calls 和 last_call_completed_at
