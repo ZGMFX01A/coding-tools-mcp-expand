@@ -44,16 +44,19 @@ Coding Tools MCP 是一个 Rust + Tauri 2 桌面应用。选择项目目录并�
 
 ## 五分钟开始使用
 
-### 1. 安装桌面客户端
+### 1. 安装桌面客户端与浏览器扩展
 
 打开 [Releases](https://github.com/mybolide/coding-tools-mcp/releases/latest) 并下载对应安装包：
 
-| 系统 | 安装包 |
-| --- | --- |
-| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` |
-| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` |
+| 系统 / 平台 | 安装包 / 产物 | 用途 |
+| --- | --- | --- |
+| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` | 桌面端安装包 |
+| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` | 桌面端安装包 |
+| Chrome / Edge 浏览器 | `chatgpt-turn-observer.zip` | ChatGPT Turn Observer 伴生浏览器扩展 |
 
 macOS 安装包目前未签名。如果系统阻止首次打开，请在“系统设置 → 隐私与安全性”中确认打开。
+
+浏览器扩展安装方式：下载 `chatgpt-turn-observer.zip` 并解压，打开 Chrome / Edge 的 `chrome://extensions/` 开启“开发者模式”，点击“加载已解压的扩展程序”并选择解压目录即可。
 
 ### 2. 添加项目工作区
 
@@ -264,7 +267,48 @@ Coding Tools MCP 负责启动和管理本机已有的 stdio MCP 服务，将其�
 3. 点击 **测试连接**（会自动检测本地命令或文件是否存在），确认无误后保存配置。
 4. 网页端 Agent 连接后将在 `tools/list` 中看到 `fast-context__fast_context_search` 工具，即可直接进行中大型代码库的自然语言语义搜索。
 
-典型开发过程：
+## Agent Turn Budget（单轮执行预算与超时保护）
+
+ChatGPT 网页端对话存在大约 30 分钟的单轮回复超时上限。若 Agent 在单轮内长时间发散调用工具（如大量搜索代码、死循环排查），会导致整轮回复在 30 分钟时被网页端硬性中断丢弃，从而丢失当前轮次的所有代码修改与进展记录。
+
+Coding Tools MCP 内置了 **Agent Turn Budget** 状态机，根据服务端单调时钟与浏览器感知事件进行分级预算约束：
+
+```text
+ 0m                25m               27m             28m           28m55s+
+ ├──────────────────┼─────────────────┼───────────────┼──────────────┤
+  NORMAL 阶段       WARNING 阶段      WRAP_UP 阶段    FINALIZATION   HARD STOP
+  (全工具正常开放)  (提示加快任务收尾) (禁止探索发散,  (仅允许只读确认 (彻底阻断工具,
+                                       限完成修改验证) 和环境清理)    强制输出答复)
+```
+
+- **0 ~ 25m (NORMAL)**：所有文件、代码、命令工具完全正常放行；
+- **25m ~ 27m (WARNING)**：在工具调用元数据 `_meta.coding-tools/agentTurnBudget` 中附加告警提示，引导 Agent 规划收尾；
+- **27m ~ 28m (WRAP_UP / SoftWrap)**：立即**禁止**所有探索/发散型工具（`search_text`、`grep`、`list_files` 等），仅允许执行最后修改（`apply_patch`）和安全只读验证（`git_status`、`git_diff`、验证类 `exec_command`）；
+- **28m ~ 28m55s (FINALIZATION)**：进入最后确认期，禁止任何修改和复杂命令，仅允许只读事实确认与资源清理；
+- **28m55s+ (HARD STOP)**：彻底阻断一切后续工具调用，返回结构化强制答复指令，迫使 Agent 立即向用户提交已完成工作与交接，确保任务进度安全落盘。
+
+当未配置扩展或缺少会话标识时，系统将自动进入工作区保守预算（`WorkspaceFallback`），同一工作区多次无会话调用累计计算预算，不同工作区物理隔离。
+
+## ChatGPT Turn Observer（伴生浏览器扩展）
+
+为了提供毫米级高精度的 Turn 生命期感知，项目配套提供了开源 Chrome / Edge 伴生扩展 **ChatGPT Turn Observer**（位于 `browser-extension/chatgpt-turn-observer`）。
+
+![ChatGPT Turn Observer 网页悬浮窗](docs/images/turn-observer-overlay.png)
+
+### 核心能力与优势
+
+1. **精准感知用户发送与生成流**：
+   - 监听用户真正点击发送或新建 Turn（严格校验 user 角色与动作白名单，自动过滤复制打点、历史消息回放和翻页等非 Turn 请求）；
+   - 通过流式 SSE 与 WebSocket 解析提取实际生效模型（如 `o3-mini`, `gpt-4o`, `gpt-5.6` 等）；
+2. **网页端与桌面端双向联动**：
+   - 在 ChatGPT 网页端提供轻量可拖拽、可折叠的 **实时状态悬浮窗 (Overlay)**，实时显示当前轮次计时、生效模型、本地/公网同步状态；
+   - 通过本地 HTTP / 远程公网 HTTPS Bridge 将 `turn_started`、`turn_updated`、`stream_completed`、`turn_closed` 事件安全推送到桌面端 MCP 引擎；
+3. **高可靠与安全架构**：
+   - **Outbox 退避重试队列**：网络抖动或跨网通信异常时在队头按指数退避（500ms~10s）自动重试，保证事件单调严格有序；
+   - **工作区握手前置**：在握手成功前自动挂起事件投递，避免向错误工作区投递事件；
+   - **完全 DOM 安全**：密钥仅在独立扩展 Options 选项页中安全存储，绝不暴露给 ChatGPT 网页 DOM，消除页面脚本窃取风险。
+
+## 典型开发过程
 
 ```text
 打开 Workspace
@@ -301,9 +345,11 @@ npm run desktop
 常用验证命令：
 
 ```bash
-npm run check
-npm run build
-cd src-tauri && cargo test
+npm run check             # 桌面端前端检查
+npm run extension:check   # 浏览器扩展类型检查
+npm run extension:test    # 浏览器扩展自动化测试
+npm run extension:build   # 浏览器扩展打包
+cd src-tauri && cargo test # 运行 Rust 核心测试
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
@@ -314,9 +360,10 @@ Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌
 | 路径 | 作用 |
 | --- | --- |
 | `src-tauri/src/tools/` | 文件、Patch、Exec、Git 等共享工具内核 |
-| `src-tauri/src/mcp/` | MCP Streamable HTTP 服务 |
+| `src-tauri/src/mcp/` | MCP Streamable HTTP 服务与 Turn Budget 状态机 |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 网关 |
 | `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
+| `browser-extension/chatgpt-turn-observer/` | ChatGPT Turn Observer Chrome / Edge 伴生浏览器扩展 |
 | `src/` | SvelteKit 桌面界面 |
 | `old/` | Python 参考实现和兼容性基线 |
 

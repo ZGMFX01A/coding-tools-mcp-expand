@@ -44,16 +44,19 @@ For a first connection, remember only this: **the desktop app turns the project 
 
 ## Get started in five minutes
 
-### 1. Install the desktop client
+### 1. Install the desktop client and browser extension
 
 Open [Releases](https://github.com/mybolide/coding-tools-mcp/releases/latest) and download the package for your platform:
 
-| Platform | Package |
-| --- | --- |
-| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` |
-| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` |
+| Platform | Package / Asset | Purpose |
+| --- | --- | --- |
+| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` | Desktop installer |
+| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` | Desktop installer |
+| Chrome / Edge | `chatgpt-turn-observer.zip` | ChatGPT Turn Observer companion extension |
 
 The macOS build is currently unsigned. If macOS blocks the first launch, allow it from System Settings → Privacy & Security.
+
+To install the browser extension: download and extract `chatgpt-turn-observer.zip`, open `chrome://extensions/` in Chrome/Edge, enable "Developer mode", click "Load unpacked", and select the extracted folder.
 
 ### 2. Add a project workspace
 
@@ -230,7 +233,46 @@ The default `core` profile provides a stable, composable development tool set:
 | Environment | `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd` |
 | History sessions | `history_session_bootstrap`, `history_session_checkpoint`, `history_session_validate` |
 
-A typical development loop is:
+## Agent Turn Budget (Execution Budget & Timeout Protection)
+
+ChatGPT web conversations have an approximate 30-minute hard timeout per turn. If an agent executes divergent tool loops (excessive searches, debugging loops), the entire turn may be abruptly dropped at 30 minutes, losing all code edits and intermediate context.
+
+Coding Tools MCP provides an **Agent Turn Budget** state machine driven by server monotonic time and browser-observed events:
+
+```text
+ 0m                25m               27m             28m           28m55s+
+ ├──────────────────┼─────────────────┼───────────────┼──────────────┤
+  NORMAL phase      WARNING phase     WRAP_UP phase   FINALIZATION   HARD STOP
+  (All tools open)  (Suggest wrap up) (Exploratory    (Read-only     (Block tools,
+                                       tools blocked)  cleanup only)  force answer)
+```
+
+- **0 ~ 25m (NORMAL)**: Full tool access allowed without restriction;
+- **25m ~ 27m (WARNING)**: Appends warning metadata in `_meta.coding-tools/agentTurnBudget` to prompt the agent to plan completion;
+- **27m ~ 28m (WRAP_UP / SoftWrap)**: Immediately **blocks** exploratory tools (`search_text`, `grep`, `list_files`, etc.); only allows final edits (`apply_patch`) and safe read-only verification (`git_status`, `git_diff`, verification `exec_command`);
+- **28m ~ 28m55s (FINALIZATION)**: Read-only fact verification and process cleanup only;
+- **28m55s+ (HARD STOP)**: Blocks all subsequent tool calls and returns a structured force-response directive, compelling the agent to yield its current progress and handoff cleanly to the user.
+
+When unmanaged or missing session headers, the engine automatically activates a conservative workspace budget (`WorkspaceFallback`), aggregating consecutive calls within the workspace while isolating different workspaces.
+
+## ChatGPT Turn Observer (Companion Browser Extension)
+
+To provide millisecond-accurate Turn lifecycle awareness, the repository includes an open-source Chrome/Edge companion extension **ChatGPT Turn Observer** (located in `browser-extension/chatgpt-turn-observer`).
+
+### Core Features
+
+1. **Accurate User Turn and Model Detection**:
+   - Accurately tracks when the user sends a new message (strict user role and action whitelisting, filtering out telemetry and history replays);
+   - Analyzes SSE and WebSocket frames to detect the actual responding model (e.g. `o3-mini`, `gpt-4o`, `gpt-5.6`);
+2. **Seamless UI & Desktop Bridge**:
+   - Provides a lightweight, draggable, collapsible **Overlay** on ChatGPT showing turn elapsed time, active model, and bridge status;
+   - Pushes `turn_started`, `turn_updated`, `stream_completed`, and `turn_closed` events via local/remote HTTP bridge with Bearer authentication;
+3. **Resilient Outbox & Security Architecture**:
+   - **Outbox Queue with Exponential Backoff**: Retains head event and retries with backoff (500ms~10s) upon network hiccups;
+   - **Pre-flight Workspace Handshake**: Suspends outbox processing until the workspace ID is verified;
+   - **DOM-safe Key Storage**: Credentials reside solely in extension storage and the isolated Options page, completely hidden from the ChatGPT DOM.
+
+## Typical development loop
 
 ```text
 Open Workspace
@@ -267,9 +309,11 @@ npm run desktop
 Useful verification commands:
 
 ```bash
-npm run check
-npm run build
-cd src-tauri && cargo test
+npm run check             # Desktop frontend check
+npm run extension:check   # Browser extension typecheck
+npm run extension:test    # Browser extension tests
+npm run extension:build   # Browser extension build
+cd src-tauri && cargo test # Run Rust core test suite
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
@@ -280,9 +324,10 @@ On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone t
 | Path | Purpose |
 | --- | --- |
 | `src-tauri/src/tools/` | Shared file, Patch, Exec, and Git tool kernel |
-| `src-tauri/src/mcp/` | MCP Streamable HTTP server |
+| `src-tauri/src/mcp/` | MCP Streamable HTTP server & Turn Budget state machine |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI gateway |
 | `src-tauri/src/tunnel/` | FRP / Cloudflare tunnel and process management |
+| `browser-extension/chatgpt-turn-observer/` | ChatGPT Turn Observer Chrome / Edge companion extension |
 | `src/` | SvelteKit desktop UI |
 | `old/` | Python reference implementation and compatibility baseline |
 
