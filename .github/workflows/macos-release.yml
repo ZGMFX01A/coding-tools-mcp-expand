@@ -30,6 +30,13 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: 同步指定发布版本
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          node scripts/sync-release-version.mjs "$RELEASE_TAG"
+
       - name: 安装前端依赖
         run: npm ci
 
