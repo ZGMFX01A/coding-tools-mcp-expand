@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Form, Query, State};
 use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
@@ -424,7 +425,70 @@ async fn post_chatgpt_turn_event(
                 .into_response();
         }
     };
-    if event.observer_id.len() > 128
+    if event.schema_version != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": format!("unsupported schema_version: {}", event.schema_version) })),
+        )
+            .into_response();
+    }
+    if event.workspace_id != state.workspace_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": format!("workspace mismatch: expected {}, got {}", state.workspace_id, event.workspace_id) })),
+        )
+            .into_response();
+    }
+
+    // started_at/completed_at 只用于事件一致性校验；预算起算仍由服务端单调时钟负责。
+    // 过远的客户端时间戳不能参与状态推进，避免恶意或错误时钟污染生命周期。
+    let wall_now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let too_far_in_future = event.started_at > wall_now_ms.saturating_add(60_000);
+    let too_old = wall_now_ms.saturating_sub(event.started_at) > 2 * 60 * 60 * 1000;
+    let completed_before_started = event
+        .completed_at
+        .is_some_and(|completed_at| completed_at < event.started_at);
+    let completed_too_far_in_future = event
+        .completed_at
+        .is_some_and(|completed_at| completed_at > wall_now_ms.saturating_add(60_000));
+    if too_far_in_future || too_old || completed_before_started || completed_too_far_in_future {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "event timestamp is outside the accepted window"
+            })),
+        )
+            .into_response();
+    }
+
+    if event.sequence == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "sequence must be positive (> 0)" })),
+        )
+            .into_response();
+    }
+    if uuid::Uuid::parse_str(&event.event_id).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "event_id must be a valid UUID" })),
+        )
+            .into_response();
+    }
+    if uuid::Uuid::parse_str(&event.tab_instance_id).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "tab_instance_id must be a valid UUID" })),
+        )
+            .into_response();
+    }
+    if event.observer_id.trim().is_empty()
+        || event.observer_id.len() > 128
+        || event.turn_id.trim().is_empty()
         || event.turn_id.len() > 256
         || event.conversation_id.as_ref().map_or(false, |c| c.len() > 256)
         || event.request_id.as_ref().map_or(false, |r| r.len() > 256)
@@ -432,7 +496,7 @@ async fn post_chatgpt_turn_event(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": "field length exceeds limit" })),
+            Json(json!({ "ok": false, "error": "field validation failed" })),
         )
             .into_response();
     }

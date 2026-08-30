@@ -1,6 +1,6 @@
 import { formatModelDisplayName } from './parsers';
 import { loadSettings, saveSettings } from './settings';
-import type { BridgeMode, ObserverSettings, TabTurnState } from './types';
+import { DEFAULT_LOCAL_PORT, type BridgeMode, type ObserverSettings, type TabTurnState } from './types';
 
 export class TurnObserverOverlay {
   private container: HTMLDivElement | null = null;
@@ -130,6 +130,7 @@ export class TurnObserverOverlay {
 
   private render(state?: TabTurnState) {
     if (!this.container) return;
+    this.container.replaceChildren();
 
     const actualModelText = state?.actualModel
       ? formatModelDisplayName(state.actualModel)
@@ -167,65 +168,165 @@ export class TurnObserverOverlay {
     const durationText = this.formatDuration(this.timerSeconds);
 
     if (this.isCollapsed) {
+      const miniWrap = document.createElement('div');
+      miniWrap.className = 'ct-turn-observer-mini';
+      miniWrap.id = 'ct-drag-handle';
+
+      const dot = document.createElement('span');
+      dot.className = 'ct-turn-observer-logo-dot';
+      miniWrap.appendChild(dot);
+
+      const titleSpan = document.createElement('span');
+      titleSpan.textContent = 'CT';
+      miniWrap.appendChild(titleSpan);
+
+      const sep1 = document.createElement('span');
+      sep1.textContent = '·';
+      miniWrap.appendChild(sep1);
+
+      const modelSpan = document.createElement('span');
       const miniModelText = requestedModelText
         ? actualModelText
           ? `${requestedModelText} → ${actualModelText}`
           : requestedModelText
         : actualModelText || '—';
+      modelSpan.textContent = miniModelText;
+      miniWrap.appendChild(modelSpan);
 
-      this.container.innerHTML = `
-        <div class="ct-turn-observer-mini" id="ct-drag-handle">
-          <span class="ct-turn-observer-logo-dot"></span>
-          <span>CT</span>
-          <span>·</span>
-          <span>${miniModelText}</span>
-          <span>·</span>
-          <span class="ct-mini-timer">${durationText}</span>
-          <span class="ct-turn-observer-status-dot ${statusClass}"></span>
-          <button type="button" class="ct-turn-observer-toggle-btn" id="ct-expand-btn" title="展开">＋</button>
-        </div>
-      `;
+      const sep2 = document.createElement('span');
+      sep2.textContent = '·';
+      miniWrap.appendChild(sep2);
+
+      const timerSpan = document.createElement('span');
+      timerSpan.className = 'ct-mini-timer';
+      timerSpan.textContent = durationText;
+      miniWrap.appendChild(timerSpan);
+
+      const statusDot = document.createElement('span');
+      statusDot.className = `ct-turn-observer-status-dot ${statusClass}`;
+      miniWrap.appendChild(statusDot);
+
+      const expandBtn = document.createElement('button');
+      expandBtn.type = 'button';
+      expandBtn.className = 'ct-turn-observer-toggle-btn';
+      expandBtn.id = 'ct-expand-btn';
+      expandBtn.title = '展开';
+      expandBtn.textContent = '＋';
+      miniWrap.appendChild(expandBtn);
+
+      this.container.appendChild(miniWrap);
     } else {
-      this.container.innerHTML = `
-        <div class="ct-turn-observer-card">
-          <div class="ct-turn-observer-header" id="ct-drag-handle">
-            <div class="ct-turn-observer-title">
-              <span class="ct-turn-observer-logo-dot"></span>
-              <span>Coding Tools</span>
-            </div>
-            <div class="ct-turn-observer-actions">
-              <button type="button" class="ct-turn-observer-toggle-btn" id="ct-settings-btn" title="配置 (打开设置)">⚙</button>
-              <button type="button" class="ct-turn-observer-toggle-btn" id="ct-collapse-btn" title="折叠">－</button>
-            </div>
-          </div>
-          <div class="ct-turn-observer-row">
-            <span class="ct-turn-observer-label">请求模型：</span>
-            <span class="ct-turn-observer-value" title="${requestedRowValue}">${requestedRowValue}</span>
-          </div>
-          <div class="ct-turn-observer-row">
-            <span class="ct-turn-observer-label">响应模型：</span>
-            <span class="ct-turn-observer-value" title="${responseRowValue}">${responseRowValue}</span>
-          </div>
-          <div class="ct-turn-observer-row">
-            <span class="ct-turn-observer-label">本轮：</span>
-            <span class="ct-turn-observer-value ct-timer-val">${durationText}</span>
-          </div>
-          <div class="ct-turn-observer-row">
-            <span class="ct-turn-observer-label">MCP：</span>
-            <span class="ct-turn-observer-value ct-turn-observer-status-pill ct-clickable" id="ct-status-pill" title="点击配置: ${state?.bridgeMessage || statusLabel}">
-              <span class="ct-turn-observer-status-dot ${statusClass}"></span>
-              <span>${statusLabel}</span>
-            </span>
-          </div>
-        </div>
-      `;
+      const card = document.createElement('div');
+      card.className = 'ct-turn-observer-card';
+
+      // Header
+      const header = document.createElement('div');
+      header.className = 'ct-turn-observer-header';
+      header.id = 'ct-drag-handle';
+
+      const titleWrap = document.createElement('div');
+      titleWrap.className = 'ct-turn-observer-title';
+      const logoDot = document.createElement('span');
+      logoDot.className = 'ct-turn-observer-logo-dot';
+      const titleText = document.createElement('span');
+      titleText.textContent = 'Coding Tools';
+      titleWrap.appendChild(logoDot);
+      titleWrap.appendChild(titleText);
+      header.appendChild(titleWrap);
+
+      const actions = document.createElement('div');
+      actions.className = 'ct-turn-observer-actions';
+
+      const settingsBtn = document.createElement('button');
+      settingsBtn.type = 'button';
+      settingsBtn.className = 'ct-turn-observer-toggle-btn';
+      settingsBtn.id = 'ct-settings-btn';
+      settingsBtn.title = '配置 (打开设置)';
+      settingsBtn.textContent = '⚙';
+      actions.appendChild(settingsBtn);
+
+      const collapseBtn = document.createElement('button');
+      collapseBtn.type = 'button';
+      collapseBtn.className = 'ct-turn-observer-toggle-btn';
+      collapseBtn.id = 'ct-collapse-btn';
+      collapseBtn.title = '折叠';
+      collapseBtn.textContent = '－';
+      actions.appendChild(collapseBtn);
+
+      header.appendChild(actions);
+      card.appendChild(header);
+
+      // Row 1: 请求模型
+      const row1 = this.createRow('请求模型：', requestedRowValue);
+      card.appendChild(row1);
+
+      // Row 2: 响应模型
+      const row2 = this.createRow('响应模型：', responseRowValue);
+      card.appendChild(row2);
+
+      // Row 3: 本轮耗时
+      const row3 = document.createElement('div');
+      row3.className = 'ct-turn-observer-row';
+      const r3Label = document.createElement('span');
+      r3Label.className = 'ct-turn-observer-label';
+      r3Label.textContent = '本轮：';
+      const r3Val = document.createElement('span');
+      r3Val.className = 'ct-turn-observer-value ct-timer-val';
+      r3Val.textContent = durationText;
+      row3.appendChild(r3Label);
+      row3.appendChild(r3Val);
+      card.appendChild(row3);
+
+      // Row 4: MCP 状态
+      const row4 = document.createElement('div');
+      row4.className = 'ct-turn-observer-row';
+      const r4Label = document.createElement('span');
+      r4Label.className = 'ct-turn-observer-label';
+      r4Label.textContent = 'MCP：';
+
+      const pill = document.createElement('span');
+      pill.className = 'ct-turn-observer-value ct-turn-observer-status-pill ct-clickable';
+      pill.id = 'ct-status-pill';
+      pill.title = `点击配置: ${state?.bridgeMessage || statusLabel}`;
+
+      const pDot = document.createElement('span');
+      pDot.className = `ct-turn-observer-status-dot ${statusClass}`;
+      const pText = document.createElement('span');
+      pText.textContent = statusLabel;
+
+      pill.appendChild(pDot);
+      pill.appendChild(pText);
+      row4.appendChild(r4Label);
+      row4.appendChild(pill);
+      card.appendChild(row4);
+
+      this.container.appendChild(card);
     }
 
     this.bindEvents();
   }
 
+  private createRow(label: string, value: string): HTMLDivElement {
+    const row = document.createElement('div');
+    row.className = 'ct-turn-observer-row';
+    const l = document.createElement('span');
+    l.className = 'ct-turn-observer-label';
+    l.textContent = label;
+    const v = document.createElement('span');
+    v.className = 'ct-turn-observer-value';
+    v.title = value;
+    v.textContent = value;
+    row.appendChild(l);
+    row.appendChild(v);
+    return row;
+  }
+
   private async openSettings() {
-    this.openInlineSettingsModal();
+    if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
+      chrome.runtime.openOptionsPage();
+    } else {
+      this.openInlineSettingsModal();
+    }
   }
 
   private async openInlineSettingsModal() {
@@ -237,65 +338,143 @@ export class TurnObserverOverlay {
 
     this.modalContainer = document.createElement('div');
     this.modalContainer.className = 'ct-modal-root';
-    this.modalContainer.innerHTML = `
-      <div class="ct-modal-backdrop" id="ct-modal-backdrop">
-        <div class="ct-modal-card">
-          <div class="ct-modal-header">
-            <div class="ct-modal-title">
-              <span class="ct-turn-observer-logo-dot"></span>
-              <span>Coding Tools 桥接设置</span>
-            </div>
-            <button type="button" class="ct-modal-close-btn" id="ct-modal-close" title="关闭">✕</button>
-          </div>
-          <div class="ct-modal-body">
-            <div class="ct-form-group">
-              <label class="ct-form-label">上报模式 (Bridge Mode)</label>
-              <div class="ct-radio-group">
-                <label class="ct-radio-label">
-                  <input type="radio" name="ct-modal-mode" value="auto" ${current.bridgeMode === 'auto' ? 'checked' : ''}>
-                  <span>Auto (自动探测，推荐)</span>
-                </label>
-                <label class="ct-radio-label">
-                  <input type="radio" name="ct-modal-mode" value="local" ${current.bridgeMode === 'local' ? 'checked' : ''}>
-                  <span>Local (仅本地)</span>
-                </label>
-                <label class="ct-radio-label">
-                  <input type="radio" name="ct-modal-mode" value="remote" ${current.bridgeMode === 'remote' ? 'checked' : ''}>
-                  <span>Remote (仅远端公网)</span>
-                </label>
-              </div>
-            </div>
 
-            <div class="ct-form-group">
-              <label class="ct-form-label" for="ct-modal-local-url">Local Base URL</label>
-              <input type="text" class="ct-input" id="ct-modal-local-url" value="${current.localBaseUrl}" placeholder="http://127.0.0.1:40111" />
-            </div>
+    const backdrop = document.createElement('div');
+    backdrop.className = 'ct-modal-backdrop';
+    backdrop.id = 'ct-modal-backdrop';
 
-            <div class="ct-form-group">
-              <label class="ct-form-label" for="ct-modal-remote-url">Remote Base URL</label>
-              <input type="text" class="ct-input" id="ct-modal-remote-url" value="${current.remoteBaseUrl}" placeholder="https://mcp-myws.example.com" />
-            </div>
+    const card = document.createElement('div');
+    card.className = 'ct-modal-card';
 
-            <div class="ct-form-group">
-              <label class="ct-form-label" for="ct-modal-token">Browser Bridge Token (必填)</label>
-              <div class="ct-input-password-wrap">
-                <input type="password" class="ct-input" id="ct-modal-token" value="${current.bridgeToken}" placeholder="在 Desktop 桌面端设置 -> 共享密钥中复制" />
-                <button type="button" class="ct-eye-btn" id="ct-modal-toggle-token" title="显示/隐藏 Token">👁️</button>
-              </div>
-              <span class="ct-form-hint">在 Coding Tools 桌面端“设置 -> 共享密钥 -> ChatGPT Observer 桥接密钥”中复制</span>
-            </div>
+    // Header
+    const header = document.createElement('div');
+    header.className = 'ct-modal-header';
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'ct-modal-title';
+    const dot = document.createElement('span');
+    dot.className = 'ct-turn-observer-logo-dot';
+    const titleText = document.createElement('span');
+    titleText.textContent = 'Coding Tools 桥接设置';
+    titleWrap.appendChild(dot);
+    titleWrap.appendChild(titleText);
+    header.appendChild(titleWrap);
 
-            <div class="ct-modal-actions">
-              <button type="button" class="ct-btn ct-btn-secondary" id="ct-modal-test-btn">测试连接</button>
-              <button type="button" class="ct-btn ct-btn-primary" id="ct-modal-save-btn">保存配置</button>
-            </div>
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ct-modal-close-btn';
+    closeBtn.id = 'ct-modal-close';
+    closeBtn.title = '关闭';
+    closeBtn.textContent = '✕';
+    header.appendChild(closeBtn);
+    card.appendChild(header);
 
-            <div class="ct-test-status" id="ct-modal-status"></div>
-          </div>
-        </div>
-      </div>
-    `;
+    // Body
+    const body = document.createElement('div');
+    body.className = 'ct-modal-body';
 
+    // Bridge Mode
+    const fgMode = document.createElement('div');
+    fgMode.className = 'ct-form-group';
+    const lblMode = document.createElement('label');
+    lblMode.className = 'ct-form-label';
+    lblMode.textContent = '上报模式 (Bridge Mode)';
+    fgMode.appendChild(lblMode);
+
+    const radioGroup = document.createElement('div');
+    radioGroup.className = 'ct-radio-group';
+    const modes: Array<{ val: BridgeMode; label: string }> = [
+      { val: 'auto', label: 'Auto (自动探测，推荐)' },
+      { val: 'local', label: 'Local (仅本地)' },
+      { val: 'remote', label: 'Remote (仅远端公网)' },
+    ];
+    for (const m of modes) {
+      const rl = document.createElement('label');
+      rl.className = 'ct-radio-label';
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = 'ct-modal-mode';
+      input.value = m.val;
+      if (current.bridgeMode === m.val) input.checked = true;
+      const span = document.createElement('span');
+      span.textContent = m.label;
+      rl.appendChild(input);
+      rl.appendChild(span);
+      radioGroup.appendChild(rl);
+    }
+    fgMode.appendChild(radioGroup);
+    body.appendChild(fgMode);
+
+    // Local Base URL
+    const fgLocal = document.createElement('div');
+    fgLocal.className = 'ct-form-group';
+    const lblLocal = document.createElement('label');
+    lblLocal.className = 'ct-form-label';
+    lblLocal.htmlFor = 'ct-modal-local-url';
+    lblLocal.textContent = 'Local Base URL';
+    const inputLocal = document.createElement('input');
+    inputLocal.type = 'text';
+    inputLocal.className = 'ct-input';
+    inputLocal.id = 'ct-modal-local-url';
+    inputLocal.value = current.localBaseUrl;
+    inputLocal.placeholder = `http://127.0.0.1:${DEFAULT_LOCAL_PORT}`;
+    fgLocal.appendChild(lblLocal);
+    fgLocal.appendChild(inputLocal);
+    body.appendChild(fgLocal);
+
+    // Remote Base URL
+    const fgRemote = document.createElement('div');
+    fgRemote.className = 'ct-form-group';
+    const lblRemote = document.createElement('label');
+    lblRemote.className = 'ct-form-label';
+    lblRemote.htmlFor = 'ct-modal-remote-url';
+    lblRemote.textContent = 'Remote Base URL';
+    const inputRemote = document.createElement('input');
+    inputRemote.type = 'text';
+    inputRemote.className = 'ct-input';
+    inputRemote.id = 'ct-modal-remote-url';
+    inputRemote.value = current.remoteBaseUrl;
+    inputRemote.placeholder = 'https://mcp-myws.example.com';
+    fgRemote.appendChild(lblRemote);
+    fgRemote.appendChild(inputRemote);
+    body.appendChild(fgRemote);
+
+    // 安全提示：Token 仅在独立扩展选项页中配置
+    const fgSecurity = document.createElement('div');
+    fgSecurity.className = 'ct-form-group';
+    const securityTip = document.createElement('div');
+    securityTip.className = 'ct-form-hint';
+    securityTip.style.color = '#38bdf8';
+    securityTip.textContent = '🔒 安全提示：Browser Bridge 密钥在扩展独立选项页（Options Page）中安全存储与管理，绝不暴露给 ChatGPT 网页 DOM。';
+    fgSecurity.appendChild(securityTip);
+    body.appendChild(fgSecurity);
+
+    // Actions
+    const actionsWrap = document.createElement('div');
+    actionsWrap.className = 'ct-modal-actions';
+    const openOptionsBtn = document.createElement('button');
+    openOptionsBtn.type = 'button';
+    openOptionsBtn.className = 'ct-btn ct-btn-secondary';
+    openOptionsBtn.id = 'ct-modal-open-options';
+    openOptionsBtn.textContent = '⚙️ 打开选项页配置密钥';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'ct-btn ct-btn-primary';
+    saveBtn.id = 'ct-modal-save-btn';
+    saveBtn.textContent = '保存模式与地址';
+
+    actionsWrap.appendChild(openOptionsBtn);
+    actionsWrap.appendChild(saveBtn);
+    body.appendChild(actionsWrap);
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'ct-test-status';
+    statusEl.id = 'ct-modal-status';
+    body.appendChild(statusEl);
+
+    card.appendChild(body);
+    backdrop.appendChild(card);
+    this.modalContainer.appendChild(backdrop);
     document.body.appendChild(this.modalContainer);
     this.bindModalEvents();
   }
@@ -312,9 +491,7 @@ export class TurnObserverOverlay {
 
     const backdrop = this.modalContainer.querySelector('#ct-modal-backdrop');
     const closeBtn = this.modalContainer.querySelector('#ct-modal-close');
-    const toggleTokenBtn = this.modalContainer.querySelector('#ct-modal-toggle-token');
-    const tokenInput = this.modalContainer.querySelector('#ct-modal-token') as HTMLInputElement | null;
-    const testBtn = this.modalContainer.querySelector('#ct-modal-test-btn') as HTMLButtonElement | null;
+    const openOptionsBtn = this.modalContainer.querySelector('#ct-modal-open-options') as HTMLButtonElement | null;
     const saveBtn = this.modalContainer.querySelector('#ct-modal-save-btn') as HTMLButtonElement | null;
     const statusEl = this.modalContainer.querySelector('#ct-modal-status') as HTMLDivElement | null;
 
@@ -328,106 +505,42 @@ export class TurnObserverOverlay {
       this.closeInlineSettingsModal();
     });
 
-    toggleTokenBtn?.addEventListener('click', () => {
-      if (!tokenInput) return;
-      tokenInput.type = tokenInput.type === 'password' ? 'text' : 'password';
+    openOptionsBtn?.addEventListener('click', () => {
+      if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
+        chrome.runtime.openOptionsPage();
+      } else {
+        window.open(chrome.runtime.getURL('options.html'), '_blank');
+      }
     });
 
     const getFormData = () => {
       const modeRadio = this.modalContainer?.querySelector('input[name="ct-modal-mode"]:checked') as HTMLInputElement | null;
       const mode = (modeRadio?.value || 'auto') as BridgeMode;
-      const localUrl = (this.modalContainer?.querySelector('#ct-modal-local-url') as HTMLInputElement)?.value?.trim() || 'http://127.0.0.1:40111';
+      const localUrl = (this.modalContainer?.querySelector('#ct-modal-local-url') as HTMLInputElement)?.value?.trim() || `http://127.0.0.1:${DEFAULT_LOCAL_PORT}`;
       const remoteUrl = (this.modalContainer?.querySelector('#ct-modal-remote-url') as HTMLInputElement)?.value?.trim() || '';
-      const token = (this.modalContainer?.querySelector('#ct-modal-token') as HTMLInputElement)?.value?.trim() || '';
-      return { mode, localUrl, remoteUrl, token };
+      return { mode, localUrl, remoteUrl };
     };
-
-    testBtn?.addEventListener('click', async () => {
-      if (!statusEl) return;
-      const { mode, localUrl, remoteUrl, token } = getFormData();
-      if (!token) {
-        statusEl.className = 'ct-test-status error';
-        statusEl.textContent = '❌ 请先填写 Browser Bridge Token';
-        return;
-      }
-
-      statusEl.className = 'ct-test-status info';
-      statusEl.textContent = '⏳ 正在测试连接…';
-
-      const endpointsToTry: string[] = [];
-      if (mode === 'local') {
-        endpointsToTry.push(localUrl);
-      } else if (mode === 'remote') {
-        if (!remoteUrl) {
-          statusEl.className = 'ct-test-status error';
-          statusEl.textContent = '❌ 远程模式下必须填写 Remote Base URL';
-          return;
-        }
-        endpointsToTry.push(remoteUrl);
-      } else {
-        endpointsToTry.push(localUrl);
-        if (remoteUrl) endpointsToTry.push(remoteUrl);
-      }
-
-      let success = false;
-      let lastErr = '';
-
-      for (const base of endpointsToTry) {
-        const cleanBase = base.replace(/\/+$/, '');
-        const target = `${cleanBase}/internal/chatgpt-turn-observer/status`;
-        try {
-          const resp = await fetch(target, {
-            method: 'GET',
-            headers: {
-              'Authorization': `Bearer ${token}`,
-            },
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            statusEl.className = 'ct-test-status success';
-            statusEl.textContent = `✅ 连接成功: ${cleanBase} (v${data.version || '0.1.30'}, 工作区: ${data.workspace_id || 'default'})`;
-            success = true;
-            break;
-          } else {
-            const txt = await resp.text();
-            lastErr = `${cleanBase} 响应 HTTP ${resp.status}: ${txt}`;
-          }
-        } catch (e: any) {
-          lastErr = `${cleanBase} 请求失败: ${e.message || String(e)}`;
-        }
-      }
-
-      if (!success) {
-        statusEl.className = 'ct-test-status error';
-        statusEl.textContent = `❌ 测试连接失败: ${lastErr}`;
-      }
-    });
 
     saveBtn?.addEventListener('click', async () => {
       if (!statusEl) return;
-      const { mode, localUrl, remoteUrl, token } = getFormData();
-      saveBtn.disabled = true;
-
+      const { mode, localUrl, remoteUrl } = getFormData();
+      statusEl.className = 'ct-test-status info';
+      statusEl.textContent = '💾 正在保存配置…';
       try {
         await saveSettings({
           bridgeMode: mode,
           localBaseUrl: localUrl,
           remoteBaseUrl: remoteUrl,
-          bridgeToken: token,
         });
-
         statusEl.className = 'ct-test-status success';
-        statusEl.textContent = '✅ 配置保存成功！';
-
-        this.onSettingsSaved?.();
-
+        statusEl.textContent = '✅ 配置已保存！';
+        await this.onSettingsSaved?.();
         setTimeout(() => {
           this.closeInlineSettingsModal();
-        }, 600);
-      } catch (e: any) {
+        }, 800);
+      } catch (err: unknown) {
         statusEl.className = 'ct-test-status error';
-        statusEl.textContent = `❌ 保存失败: ${e.message || String(e)}`;
-        saveBtn.disabled = false;
+        statusEl.textContent = `❌ 保存失败: ${err instanceof Error ? err.message : String(err)}`;
       }
     });
   }

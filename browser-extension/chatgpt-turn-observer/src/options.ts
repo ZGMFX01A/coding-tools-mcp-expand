@@ -130,6 +130,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     testResultBox.className = `test-result-box ${allOk ? 'success' : 'error'}`;
     testResultTitle.textContent = allOk ? '✅ 测试通过' : '❌ 测试未通过';
-    testResultDetail.innerHTML = results.map((r) => `<div>${r}</div>`).join('');
+    testResultDetail.textContent = '';
+    for (const r of results) {
+      const div = document.createElement('div');
+      div.textContent = r;
+      testResultDetail.appendChild(div);
+    }
   });
 });

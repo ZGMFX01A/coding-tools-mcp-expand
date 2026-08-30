@@ -41,3 +41,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+
+  browser-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: browser-extension/chatgpt-turn-observer/package-lock.json
+      - name: 安装依赖
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm ci
+      - name: 运行单元测试
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm test
+      - name: 运行类型检查
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm run typecheck
+      - name: 构建扩展
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm run build

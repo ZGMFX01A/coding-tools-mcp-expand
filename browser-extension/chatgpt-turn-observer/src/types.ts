@@ -1,5 +1,7 @@
 export type BridgeMode = 'auto' | 'local' | 'remote';
 
+export const DEFAULT_LOCAL_PORT = 28766;
+
 export type BridgeStatus =
   | 'idle'
   | 'not_configured'
@@ -19,13 +21,18 @@ export type EventKind =
   | 'turn_started'
   | 'turn_updated'
   | 'stream_completed'
-  | 'conversation_resolved';
+  | 'conversation_resolved'
+  | 'turn_closed';
 
 export interface BrowserTurnEvent {
-  schema_version: number;
+  schema_version: 1;
+  event_id: string;
+  tab_instance_id: string;
   observer_id: string;
   tab_id: number;
+  sequence: number;
   event: EventKind;
+  workspace_id: string;
   conversation_id: string | null;
   turn_id: string;
   request_id: string | null;
@@ -48,7 +55,7 @@ export interface ObserverSettings {
 export const DEFAULT_SETTINGS: ObserverSettings = {
   schemaVersion: 1,
   bridgeMode: 'auto',
-  localBaseUrl: 'http://127.0.0.1:28766',
+  localBaseUrl: `http://127.0.0.1:${DEFAULT_LOCAL_PORT}`,
   remoteBaseUrl: '',
   bridgeToken: '',
   overlayPosition: null,

@@ -391,10 +391,17 @@ pub struct TurnKey {
     pub turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnLifecyclePhase {
+    Active,
+    Closing,
+}
+
 /// 单轮 Agent 运行状态
 #[derive(Debug, Clone)]
 pub struct AgentTurnState {
     pub turn_seq: u64,
+    pub phase: TurnLifecyclePhase,
     /// 观测到的起始时间（Browser 模式为 browser_observed_turn_start，Fallback 模式为 first_observed_tool_call）
     pub started_at: Instant,
     pub timer_origin: &'static str,
@@ -586,6 +593,20 @@ impl AgentTurnBudgetManager {
                     "first_observed_tool_call",
                 )
             }
+            TurnIdentity::WorkspaceFallback {
+                workspace_id,
+                fallback_id,
+            } => (
+                TurnKey {
+                    workspace_id,
+                    session_id: fallback_id,
+                    conversation_id: None,
+                    turn_id: None,
+                },
+                false,
+                self.clock.now(),
+                "workspace_fallback",
+            ),
         };
 
         let now = self.clock.now();
@@ -598,9 +619,21 @@ impl AgentTurnBudgetManager {
 
         let (decision, log_event) = match states.get_mut(&key) {
             None => {
-                // 如果是 Browser 模式且有新 key，清理同 (workspace_id, session_id) 下残留的旧会话或旧 Turn 状态
+                // 如果是 Browser 模式且有新 key，软关闭同 (workspace_id, session_id) 下残留的旧 Turn 状态
                 if is_browser {
-                    states.retain(|k, _| !(k.workspace_id == key.workspace_id && k.session_id == key.session_id));
+                    states.retain(|k, v| {
+                        if k.workspace_id == key.workspace_id && k.session_id == key.session_id && *k != key {
+                            if v.active_calls > 0 {
+                                v.phase = TurnLifecyclePhase::Closing;
+                                v.hard_stopped_at = Some(now);
+                                true // 保持直到 active_calls 归零
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        }
+                    });
                 }
 
                 if states.len() >= self.config.max_states {
@@ -616,6 +649,7 @@ impl AgentTurnBudgetManager {
                 // 首个观测到的调用，创建新 Turn
                 let new_state = AgentTurnState {
                     turn_seq: 1,
+                    phase: TurnLifecyclePhase::Active,
                     started_at: start_time,
                     timer_origin: initial_timer_origin,
                     last_call_started_at: now,
@@ -650,12 +684,38 @@ impl AgentTurnBudgetManager {
                         emit_urgent: false,
                     },
                     Some(format!(
-                        "[turn-budget] new workspace={} session={} turn_seq=1 origin={} tool={}",
-                        workspace_id, sanitized_session, initial_timer_origin, tool_name
+                        "[turn-budget] start workspace={} session={} turn_seq=1 origin={}",
+                        workspace_id, sanitized_session, initial_timer_origin
                     )),
                 )
             }
             Some(state) => {
+                if state.phase == TurnLifecyclePhase::Closing {
+                    let snapshot = TurnBudgetSnapshot {
+                        status: TurnBudgetStatus::HardStop,
+                        elapsed_seconds: now.saturating_duration_since(state.started_at).as_secs(),
+                        remaining_seconds: 0,
+                        should_wrap_up: true,
+                        should_stop_tool_calls: true,
+                        timer_origin: state.timer_origin,
+                    };
+                    let content_text = "[TURN BUDGET CLOSED]\nThis previous turn is closing and no longer accepts new tool calls.".to_string();
+                    let error_payload = json!({
+                        "ok": false,
+                        "error": {
+                            "code": "AGENT_TURN_CLOSED",
+                            "message": "This turn is closing and does not accept new calls.",
+                            "category": "turn_budget",
+                            "retryable": false,
+                        }
+                    });
+                    return CallDecision::Blocked {
+                        snapshot,
+                        error_payload,
+                        content_text,
+                    };
+                }
+
                 // 检查是否应当重置为新 Turn
                 if state.active_calls == 0 {
                     if state.hard_stopped_at.is_some() {
@@ -1063,12 +1123,19 @@ impl AgentTurnBudgetManager {
         )
     }
 
-    /// 在工具调用完成时更新 active_calls 和 last_call_completed_at
+    /// 在工具调用完成时更新 active_calls 和 last_call_completed_at，并在 Closing 状态完全结束时安全回收
     pub fn complete_call(&self, key: &TurnKey, now: Instant) {
         let mut states = self.states.lock().expect("agent turn budget lock poisoned");
+        let mut should_remove = false;
         if let Some(state) = states.get_mut(key) {
             state.active_calls = state.active_calls.saturating_sub(1);
             state.last_call_completed_at = Some(now);
+            if state.phase == TurnLifecyclePhase::Closing && state.active_calls == 0 {
+                should_remove = true;
+            }
+        }
+        if should_remove {
+            states.remove(key);
         }
     }
 
@@ -1080,7 +1147,12 @@ impl AgentTurnBudgetManager {
     ) {
         states.retain(|_, state| {
             if state.active_calls > 0 {
+                // 只要存在活跃调用，无论何种阶段均严格保持存活，确保 Guard 安全析构
                 return true;
+            }
+            if state.phase == TurnLifecyclePhase::Closing {
+                // 无活跃调用的 Closing 状态直接清理
+                return false;
             }
             let last_active = state
                 .last_call_completed_at

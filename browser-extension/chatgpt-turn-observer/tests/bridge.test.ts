@@ -1,19 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { DEFAULT_SETTINGS, type BrowserTurnEvent, type ObserverSettings } from '../src/types';
+import { BridgeOutbox, type OutboxItem } from '../src/bridge';
+import { type BrowserTurnEvent } from '../src/types';
 
-describe('bridge dispatch logic', () => {
-  let mockFetch: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    mockFetch = vi.fn();
-    global.fetch = mockFetch;
-  });
-
+describe('BridgeOutbox real queue behavior and retry logic', () => {
   const sampleEvent: BrowserTurnEvent = {
     schema_version: 1,
+    event_id: 'evt-test-1234',
+    tab_instance_id: 'tab-inst-999',
     observer_id: 'obs-001',
     tab_id: 101,
+    sequence: 1,
     event: 'turn_started',
+    workspace_id: 'ws_demo',
     conversation_id: 'conv-001',
     turn_id: 'turn-001',
     request_id: null,
@@ -23,105 +21,109 @@ describe('bridge dispatch logic', () => {
     actual_model: null,
   };
 
-  async function simulateDispatch(
-    settings: ObserverSettings,
-    event: BrowserTurnEvent
-  ): Promise<{ status: string; message: string | null }> {
-    if (!settings.bridgeToken) {
-      return { status: 'not_configured', message: '未配置 Token' };
+  it('dequeues item when sendFn succeeds with 200', async () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: true, status: 200, retryable: false });
+    const outbox = new BridgeOutbox(sendFn);
+
+    outbox.enqueue(sampleEvent);
+    expect(outbox.getQueueLength()).toBe(1);
+
+    await outbox.process();
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(outbox.getQueueLength()).toBe(0);
+  });
+
+  it('dequeues item immediately without retry on non-retryable 400/403/422 business rejection', async () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, status: 400, retryable: false, error: 'Bad Request' });
+    const outbox = new BridgeOutbox(sendFn);
+
+    outbox.enqueue(sampleEvent);
+    await outbox.process();
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(outbox.getQueueLength()).toBe(0);
+  });
+
+  it('retains head item and reuses same event_id/sequence upon retryable network error', async () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, status: 500, retryable: true, error: 'Network timeout' });
+    const outbox = new BridgeOutbox(sendFn);
+
+    outbox.enqueue(sampleEvent);
+    await outbox.process();
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    // 可重试错误保留在队头
+    expect(outbox.getQueueLength()).toBe(1);
+    const head = outbox.getQueue()[0];
+    expect(head.attempts).toBe(1);
+    expect(head.event.event_id).toBe('evt-test-1234');
+    expect(head.event.sequence).toBe(1);
+    expect(head.nextRetryAt).toBeGreaterThan(Date.now() - 10);
+  });
+
+  it('drops item after exceeding maximum 5 retry attempts', async () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, status: 503, retryable: true, error: 'Service Unavailable' });
+    const outbox = new BridgeOutbox(sendFn);
+
+    outbox.enqueue(sampleEvent);
+
+    for (let i = 1; i <= 5; i++) {
+      // 模拟时间到达 nextRetryAt
+      const q = outbox.getQueue();
+      if (q.length > 0) {
+        (q[0] as { nextRetryAt: number }).nextRetryAt = 0;
+      }
+      await outbox.process();
     }
 
-    const postTo = async (baseUrl: string, timeoutMs: number) => {
-      const url = `${baseUrl.trim().replace(/\/+$/, '')}/internal/chatgpt-turn-event`;
-      return fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${settings.bridgeToken}`,
-        },
-        body: JSON.stringify(event),
+    expect(sendFn).toHaveBeenCalledTimes(5);
+    // 超过 5 次后出队丢弃
+    expect(outbox.getQueueLength()).toBe(0);
+  });
+
+  it('respects maximum queue capacity (128) by evicting oldest item', () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, retryable: true });
+    const outbox = new BridgeOutbox(sendFn);
+
+    for (let i = 1; i <= 130; i++) {
+      outbox.enqueue({
+        ...sampleEvent,
+        event_id: `evt-${i}`,
+        sequence: i,
+        event: 'turn_updated',
       });
-    };
-
-    if (settings.bridgeMode === 'local') {
-      const resp = await postTo(settings.localBaseUrl, 3000);
-      if (resp.ok) return { status: 'synced', message: '已同步 · Local' };
-      return { status: 'failed', message: resp.status === 401 ? '401 认证失败' : `HTTP ${resp.status}` };
-    } else if (settings.bridgeMode === 'remote') {
-      const resp = await postTo(settings.remoteBaseUrl, 4000);
-      if (resp.ok) return { status: 'synced', message: '已同步 · Remote' };
-      return { status: 'failed', message: resp.status === 401 ? '401 认证失败' : `HTTP ${resp.status}` };
-    } else {
-      // Auto
-      let localOk = false;
-      try {
-        const resp = await postTo(settings.localBaseUrl, 600);
-        if (resp.ok) {
-          return { status: 'synced', message: '已同步 · Local' };
-        } else if (resp.status === 401 || resp.status === 403) {
-          // 401 严禁 fallback
-          return { status: 'failed', message: '401 认证失败' };
-        }
-      } catch {
-        // network error / timeout -> fallback to remote
-      }
-
-      if (settings.remoteBaseUrl) {
-        try {
-          const resp = await postTo(settings.remoteBaseUrl, 4000);
-          if (resp.ok) return { status: 'synced', message: '已同步 · Remote' };
-          return { status: 'failed', message: resp.status === 401 ? '401 认证失败' : `Remote HTTP ${resp.status}` };
-        } catch {
-          return { status: 'failed', message: 'Remote 网络错误' };
-        }
-      }
-      return { status: 'failed', message: 'Local 不可用且未配置 Remote' };
     }
-  }
 
-  it('handles local mode success', async () => {
-    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    const res = await simulateDispatch(
-      { ...DEFAULT_SETTINGS, bridgeMode: 'local', bridgeToken: 'secret' },
-      sampleEvent
-    );
-    expect(res.status).toBe('synced');
-    expect(res.message).toBe('已同步 · Local');
+    expect(outbox.getQueueLength()).toBe(128);
+    expect(outbox.getQueue()[0].event.event_id).toBe('evt-3');
   });
 
-  it('handles auto mode fallback to remote when local fails with connection error', async () => {
-    mockFetch
-      .mockRejectedValueOnce(new Error('Connection refused'))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+  it('does not evict lifecycle events when the queue is full', () => {
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, retryable: true });
+    const outbox = new BridgeOutbox(sendFn);
 
-    const res = await simulateDispatch(
-      {
-        ...DEFAULT_SETTINGS,
-        bridgeMode: 'auto',
-        bridgeToken: 'secret',
-        remoteBaseUrl: 'https://tunnel.example.com',
-      },
-      sampleEvent
-    );
-    expect(res.status).toBe('synced');
-    expect(res.message).toBe('已同步 · Remote');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    for (let i = 1; i <= 128; i++) {
+      outbox.enqueue({
+        ...sampleEvent,
+        event_id: `evt-${i}`,
+        sequence: i,
+        event: 'turn_started',
+      });
+    }
+
+    expect(outbox.enqueue({ ...sampleEvent, event_id: 'evt-overflow', sequence: 129 })).toBe(false);
+    expect(outbox.getQueueLength()).toBe(128);
+    expect(outbox.getQueue()[0].event.event_id).toBe('evt-1');
   });
 
-  it('does NOT fallback to remote when local returns 401 Unauthorized', async () => {
-    mockFetch.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
+  it('converts an unexpected sender exception into a retryable result', async () => {
+    const sendFn = vi.fn().mockRejectedValue(new Error('transport crashed'));
+    const outbox = new BridgeOutbox(sendFn);
 
-    const res = await simulateDispatch(
-      {
-        ...DEFAULT_SETTINGS,
-        bridgeMode: 'auto',
-        bridgeToken: 'wrong_secret',
-        remoteBaseUrl: 'https://tunnel.example.com',
-      },
-      sampleEvent
-    );
-    expect(res.status).toBe('failed');
-    expect(res.message).toBe('401 认证失败');
-    expect(mockFetch).toHaveBeenCalledTimes(1);
+    outbox.enqueue(sampleEvent);
+    await outbox.process();
+
+    expect(outbox.getQueueLength()).toBe(1);
+    expect(outbox.getQueue()[0].attempts).toBe(1);
   });
 });

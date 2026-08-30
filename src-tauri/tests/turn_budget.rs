@@ -24,7 +24,6 @@ fn test_context_with_mock_budget(
         .with_turn_budget_manager(manager.clone());
     (workspace, harness, ctx, manager)
 }
-
 #[test]
 fn test_tool_traits_and_command_classification() {
     let empty_args = json!({});
@@ -521,4 +520,148 @@ fn test_end_to_end_jsonrpc_tools_call_lifecycle() {
         res_hs["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
         "hard_stop"
     );
+}
+
+#[test]
+fn test_missing_session_enters_workspace_fallback_and_is_managed() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let (_ws, _harness, ctx, _mgr) = test_context_with_mock_budget(config, clock.clone());
+    let shared_ctx = Arc::new(ctx);
+
+    // 缺少 openai/session
+    let req0 = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "list_files",
+            "arguments": {}
+        }
+    });
+    let res0 = handle_request(&shared_ctx, &req0);
+    assert_eq!(res0["id"], 1);
+    assert_eq!(res0["result"]["isError"], false);
+    assert_eq!(
+        res0["result"]["_meta"]["coding-tools/agentTurnBudget"]["timerOrigin"],
+        "workspace_fallback"
+    );
+
+    // 同一工作区后续无 session 调用必须复用同一个 fallback 预算桶，而不是重新计时。
+    clock.advance_ms(3200);
+    let req1 = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "list_files",
+            "arguments": {}
+        }
+    });
+    let res1 = handle_request(&shared_ctx, &req1);
+    assert_eq!(res1["result"]["isError"], true);
+    assert_eq!(
+        res1["result"]["_meta"]["coding-tools/agentTurnBudget"]["status"],
+        "hard_stop"
+    );
+}
+
+#[test]
+fn test_closing_turn_lifecycle_and_reclaim() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+
+    // 1. 旧 Turn 启动一个长调用
+    let identity_old = coding_tools_mcp_desktop_lib::mcp::browser_turn::TurnIdentity::Browser {
+        workspace_id: "ws-test".to_string(),
+        session_id: "sess-test".to_string(),
+        conversation_id: "conv-1".to_string(),
+        turn_id: "turn-old".to_string(),
+        effective_started_at: t0,
+        timer_origin: "browser_observed_turn_start",
+    };
+    let decision_old = manager.start_call_with_identity(
+        identity_old,
+        "read_file",
+        false,
+        &json!({}),
+    );
+    let old_guard = match decision_old {
+        CallDecision::Allowed { guard, .. } => guard,
+        _ => panic!("Expected allowed"),
+    };
+
+    // 2. 新 Turn 到来
+    let identity_new = coding_tools_mcp_desktop_lib::mcp::browser_turn::TurnIdentity::Browser {
+        workspace_id: "ws-test".to_string(),
+        session_id: "sess-test".to_string(),
+        conversation_id: "conv-1".to_string(),
+        turn_id: "turn-new".to_string(),
+        effective_started_at: t0,
+        timer_origin: "browser_observed_turn_start",
+    };
+    let decision_new = manager.start_call_with_identity(
+        identity_new,
+        "read_file",
+        false,
+        &json!({}),
+    );
+    assert!(matches!(decision_new, CallDecision::Allowed { .. }));
+
+    // 3. 旧 Guard 释放后，旧状态被自动完全清理
+    drop(old_guard);
+}
+
+#[test]
+fn test_workspace_fallback_accumulates_budget_and_triggers_hard_stop() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+
+    let identity = coding_tools_mcp_desktop_lib::mcp::browser_turn::TurnIdentity::WorkspaceFallback {
+        workspace_id: "ws-test".to_string(),
+        fallback_id: "unmanaged_ws_ws-test".to_string(),
+    };
+
+    // 第一次调用：正常放行，耗时 100ms
+    let d1 = manager.start_call_with_identity(identity.clone(), "list_files", false, &json!({}));
+    let g1 = match d1 {
+        CallDecision::Allowed { guard, .. } => guard,
+        _ => panic!("Expected allowed"),
+    };
+    clock.advance_ms(100);
+    drop(g1);
+
+    // 第二次调用：时间推进 1100ms（进入 soft_wrap 阶段），正常放行但 status 应为 SoftWrap
+    clock.advance_ms(1000);
+    let d2 = manager.start_call_with_identity(identity.clone(), "list_files", false, &json!({}));
+    let g2 = match d2 {
+        CallDecision::Allowed { guard, meta, .. } => {
+            assert_eq!(meta.status, TurnBudgetStatus::SoftWrap);
+            guard
+        }
+        _ => panic!("Expected allowed with SoftWrap"),
+    };
+    clock.advance_ms(100);
+    drop(g2);
+
+    // 第三次调用：时间总计推进超过 3000ms（进入 hard_stop 阶段），必须被直接阻断！
+    clock.advance_ms(2000);
+    let d3 = manager.start_call_with_identity(identity.clone(), "list_files", false, &json!({}));
+    match d3 {
+        CallDecision::Blocked { meta, .. } => {
+            assert_eq!(meta.status, TurnBudgetStatus::HardStop);
+        }
+        _ => panic!("Expected Blocked with HardStop for accumulated WorkspaceFallback"),
+    }
 }

@@ -36,7 +36,10 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
         type,
         payload,
       };
-      window.postMessage(msg, '*');
+      const targetOrigin = window.location.origin;
+      // opaque origin 无法安全限定接收方，宁可放弃上报也不广播到 '*'
+      if (!targetOrigin || targetOrigin === 'null') return;
+      window.postMessage(msg, targetOrigin);
     } catch {
       // 忽略 postMessage 异常
     }
@@ -75,7 +78,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return res;
   };
 
-  // 2. Pending Capture 管理（参考 chatgpt-route-inspector）
+  // 2. Pending Capture 与已见 Message ID LRU 管理
   interface PendingLiveCapture extends ConversationCorrelation {
     captureId: string;
     turnId: string;
@@ -85,6 +88,18 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
 
   const pendingLiveCaptures = new Map<string, PendingLiveCapture>();
   const PENDING_CAPTURE_TTL_MS = 10 * 60 * 1000;
+
+  const seenUserMessageIds = new Set<string>();
+  const MAX_SEEN_MESSAGE_IDS = 256;
+
+  function markUserMessageIdSeen(id: string): void {
+    if (!id) return;
+    if (seenUserMessageIds.size >= MAX_SEEN_MESSAGE_IDS) {
+      const oldest = seenUserMessageIds.values().next().value as string | undefined;
+      if (oldest) seenUserMessageIds.delete(oldest);
+    }
+    seenUserMessageIds.add(id);
+  }
 
   function prunePendingCaptures(now = Date.now()): void {
     for (const [captureId, pending] of pendingLiveCaptures) {
@@ -121,7 +136,6 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     prunePendingCaptures();
     const pending = [...pendingLiveCaptures.values()];
 
-    // 1. 优先通过 inputMessageId 精确匹配
     const inputMatches = pending.filter(
       (c) =>
         Boolean(c.inputMessageId) &&
@@ -130,7 +144,6 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     );
     if (inputMatches.length > 0) return uniqueCandidate(inputMatches);
 
-    // 2. 次选通过 parentMessageId 匹配
     const parentMatches = pending.filter(
       (c) =>
         Boolean(c.parentMessageId) &&
@@ -141,7 +154,6 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     );
     if (parentMatches.length > 0) return uniqueCandidate(parentMatches);
 
-    // 3. 兜底通过 conversationId 匹配
     const conversationMatches = pending.filter(
       (c) =>
         Boolean(c.conversationId) &&
@@ -150,7 +162,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return uniqueCandidate(conversationMatches);
   }
 
-  // 3. Fetch Hook
+  // 3. Fetch Hook (严格判定新用户 Turn，非新 Turn 绝不注册 Live Capture)
   const nativeFetch = window.fetch;
 
   function requestUrl(input: RequestInfo | URL): string {
@@ -192,7 +204,6 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
       endpointKind: endpoint.kind,
     });
 
-    // 关键守卫：非对话流请求（如复制打点、上传文件、设置等）直接原生放行，绝对不进入 Turn 逻辑！
     if (endpoint.kind !== 'conversation_stream' || method !== 'POST') {
       return target.call(receiver, input as RequestInfo, init);
     }
@@ -200,12 +211,25 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     const captureId = generateUuid();
     const startedAt = Date.now();
 
-    // 异步提取请求上下文
     const bodyPromise = requestBody(input, init);
     const correlationPromise = bodyPromise.then((raw) => {
       if (!raw) return null;
       const correlation = parseConversationCorrelation(raw);
       if (!correlation) return null;
+
+      // 严格检查是否为真正的新用户发送且未被重放
+      if (!correlation.isNewUserTurn) {
+        debugLog('Non-turn request observed, short-circuited', { action: correlation.action });
+        return null;
+      }
+
+      if (correlation.inputMessageId) {
+        if (seenUserMessageIds.has(correlation.inputMessageId)) {
+          debugLog('MessageId replayed, short-circuited', { msgId: correlation.inputMessageId });
+          return null;
+        }
+        markUserMessageIdSeen(correlation.inputMessageId);
+      }
 
       const turnId = correlation.inputMessageId || generateUuid();
       const reqConvId = correlation.conversationId || conversationIdFromUrl(location.href);
@@ -246,7 +270,8 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
           const sseParser = new SseStreamParser();
 
           void correlationPromise.then((ctx) => {
-            const boundTurnId = ctx?.turnId || null;
+            if (!ctx) return;
+            const boundTurnId = ctx.turnId;
             (async () => {
               try {
                 while (true) {
@@ -267,24 +292,24 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                   }
                   if (value) {
                     const text = decoder.decode(value, { stream: true });
-                    const evidence = sseParser.feed(text);
+                    const ev = sseParser.feed(text);
                     if (
-                      evidence.resolvedModelSlug ||
-                      evidence.serverModelSlug ||
-                      evidence.responseModelSlug ||
-                      evidence.conversationId ||
-                      evidence.requestId ||
-                      evidence.isStreamDone
+                      ev.resolvedModelSlug ||
+                      ev.serverModelSlug ||
+                      ev.responseModelSlug ||
+                      ev.conversationId ||
+                      ev.requestId ||
+                      ev.isStreamDone
                     ) {
                       safePost('SSE_CHUNK', {
                         captureId,
                         turnId: boundTurnId,
-                        conversationId: evidence.conversationId,
-                        requestId: evidence.requestId,
-                        resolvedModelSlug: evidence.resolvedModelSlug,
-                        serverModelSlug: evidence.serverModelSlug,
-                        responseModelSlug: evidence.responseModelSlug,
-                        isStreamDone: evidence.isStreamDone,
+                        conversationId: ev.conversationId,
+                        requestId: ev.requestId,
+                        resolvedModelSlug: ev.resolvedModelSlug,
+                        serverModelSlug: ev.serverModelSlug,
+                        responseModelSlug: ev.responseModelSlug,
+                        isStreamDone: Boolean(ev.isStreamDone),
                       });
                     }
                   }
@@ -303,23 +328,18 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return response;
   }
 
-  try {
-    window.fetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
-      return inspectFetch(nativeFetch, this ?? window, input, init);
-    };
-  } catch {
-    // 忽略赋值异常
-  }
+  window.fetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+    return inspectFetch(nativeFetch, this, input, init);
+  } as typeof window.fetch;
 
-  // 4. WebSocket Hook（严格 correlation 绑定，绝不全局广播）
+  // 4. WebSocket Hook
   const nativeWebSocket = window.WebSocket;
-  function isTargetWs(urlStr: string): boolean {
+
+  function isTargetWs(url: string): boolean {
     try {
-      const parsed = new URL(urlStr, location.href);
-      return (
-        parsed.hostname.endsWith('.chatgpt.com') ||
-        parsed.hostname.endsWith('.openai.com')
-      );
+      const parsed = new URL(url);
+      const pathname = parsed.pathname;
+      return pathname.startsWith('/backend-api') || pathname.startsWith('/backend-anon');
     } catch {
       return false;
     }
@@ -329,7 +349,6 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     const evidenceItems = parseWebSocketFrame(raw);
     for (const item of evidenceItems) {
       const pending = pendingCaptureFor(item);
-      // 关键守卫：如果无法对齐到当前 pending live capture，彻底忽略，绝不广播！
       if (!pending) continue;
 
       const ev = item.evidence;
@@ -345,6 +364,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
           captureId: pending.captureId,
           turnId: pending.turnId,
           conversationId: ev.conversationId || pending.conversationId,
+          requestId: ev.requestId || null,
           resolvedModelSlug: ev.resolvedModelSlug,
           serverModelSlug: ev.serverModelSlug,
           responseModelSlug: ev.responseModelSlug,

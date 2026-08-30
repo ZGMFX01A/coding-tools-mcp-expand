@@ -123,7 +123,18 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
             &args,
         )
     } else {
-        crate::mcp::turn_budget::CallDecision::Unmanaged
+        // 缺少 session 时，绑定至该工作区专属的稳定 fallback 预算桶，确保连续调用累计消耗预算，且不同工作区物理隔离。
+        let fallback_id = format!("unmanaged_ws_{}", state.workspace_id);
+        let identity = crate::mcp::browser_turn::TurnIdentity::WorkspaceFallback {
+            workspace_id: state.workspace_id.clone(),
+            fallback_id,
+        };
+        state.turn_budget.start_call_with_identity(
+            identity,
+            name,
+            is_external.is_some(),
+            &args,
+        )
     };
 
     match decision {

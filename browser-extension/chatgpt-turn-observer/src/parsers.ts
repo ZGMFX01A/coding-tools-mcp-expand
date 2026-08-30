@@ -90,16 +90,24 @@ function asString(val: unknown): string | null {
   return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null;
 }
 
+export const ALLOWED_USER_TURN_ACTIONS = new Set(['next', 'create']);
+export const DISALLOWED_ACTIONS = new Set(['continue', 'retry', 'edit_previous', 'fork', 'tool_response', 'variant']);
+
 export interface ConversationCorrelation {
   conversationId: string | null;
   inputMessageId: string | null;
   parentMessageId: string | null;
   requestedModel: string | null;
   action: string | null;
+  isNewUserTurn: boolean;
 }
 
 /**
- * 提取对话请求关联信息（严格要求用户消息语义）
+ * 提取对话请求关联信息并严格判定是否为新用户 Turn：
+ * 1. action 必须显式属于 ALLOWED_USER_TURN_ACTIONS 白名单；
+ * 2. messages 的最后一个条目必须明确属于 role='user' 且带有有效 message id；
+ * 3. 若提供 client_message_id，必须与上述 user message id 一致；
+ * 4. 仅有 conversation_id 而无本次新 user message（如 continuation、历史消息回放等）严格判定为 isNewUserTurn=false。
  */
 export function parseConversationCorrelation(
   raw: string | Record<string, unknown>
@@ -107,32 +115,49 @@ export function parseConversationCorrelation(
   const root = typeof raw === 'string' ? asRecord(safeJsonParse(raw)) : asRecord(raw);
   if (!root) return null;
 
-  const messages = Array.isArray(root.messages) ? root.messages : [];
-  let inputMessageId: string | null = null;
-
-  // 倒序遍历 messages，寻找明确带有 role === 'user' 或 author.role === 'user' 的输入消息
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = asRecord(messages[i]);
-    if (!msg) continue;
-    const author = asRecord(msg.author);
-    const role = asString(author?.role) || asString(msg.role);
-    if (role === 'user') {
-      inputMessageId = asString(msg.id);
-      if (inputMessageId) break;
-    }
-  }
-
-  // 备选：当根对象存在明确的 client_message_id / message_id 且 action 为生成类时
-  if (!inputMessageId && (root.action === 'next' || root.action === 'create' || !root.action)) {
-    inputMessageId = asString(root.client_message_id) || asString(root.message_id);
-  }
-
   const conversationId = asString(root.conversation_id);
   const parentMessageId = asString(root.parent_message_id);
   const requestedModel = asString(root.model);
   const action = asString(root.action);
+  const clientMessageId = asString(root.client_message_id) || asString(root.message_id);
 
-  // 如果连 inputMessageId 和 conversationId 都没有，不是合法的对话生成请求
+  // 1. 严格要求 action 必须显式存在且属于白名单 ('next', 'create')，缺失或其它 action 一律非新 Turn
+  if (!action || !ALLOWED_USER_TURN_ACTIONS.has(action)) {
+    if (!conversationId && !clientMessageId) return null;
+    return {
+      conversationId,
+      inputMessageId: clientMessageId,
+      parentMessageId,
+      requestedModel,
+      action,
+      isNewUserTurn: false,
+    };
+  }
+
+  // 2. 检查 messages 数组最后一个元素是否明确属于 role='user' 且带有有效非空 ID
+  const messages = Array.isArray(root.messages) ? root.messages : [];
+  let isNewUserTurn = false;
+  let inputMessageId: string | null = null;
+
+  if (messages.length > 0) {
+    const lastMsg = asRecord(messages[messages.length - 1]);
+    if (lastMsg) {
+      const author = asRecord(lastMsg.author);
+      const role = asString(author?.role) || asString(lastMsg.role);
+      const msgId = asString(lastMsg.id);
+      if (role === 'user' && msgId) {
+        // 若同时提供了 client_message_id，必须与末尾 user message 的 id 一致
+        if (!clientMessageId || clientMessageId === msgId) {
+          isNewUserTurn = true;
+          inputMessageId = msgId;
+        }
+      }
+    }
+  }
+
+  // 3. 根对象 client_message_id 只能用于校验，不能在缺少末尾 user 消息时充当输入消息。
+  if (!isNewUserTurn) inputMessageId = null;
+
   if (!inputMessageId && !conversationId) return null;
 
   return {
@@ -141,6 +166,7 @@ export function parseConversationCorrelation(
     parentMessageId,
     requestedModel,
     action,
+    isNewUserTurn,
   };
 }
 

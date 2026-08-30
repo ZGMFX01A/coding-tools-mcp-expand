@@ -61,8 +61,8 @@ describe('parsers following chatgpt-route-inspector architecture', () => {
     });
   });
 
-  describe('parseConversationCorrelation (Strict Input Message Extraction)', () => {
-    it('extracts inputMessageId and requestedModel from real user send payload', () => {
+  describe('parseConversationCorrelation (P0-1 Strict User Turn Semantics)', () => {
+    it('extracts inputMessageId and confirms isNewUserTurn=true for genuine user send', () => {
       const payload = {
         action: 'next',
         messages: [
@@ -83,6 +83,93 @@ describe('parsers following chatgpt-route-inspector architecture', () => {
       expect(correlation?.conversationId).toBe('conv-real-99');
       expect(correlation?.parentMessageId).toBe('parent-001');
       expect(correlation?.requestedModel).toBe('gpt-4o');
+      expect(correlation?.isNewUserTurn).toBe(true);
+    });
+
+    it('identifies isNewUserTurn=false when action is missing', () => {
+      const payload = {
+        messages: [
+          {
+            id: 'msg-user-1',
+            author: { role: 'user' },
+          },
+        ],
+        conversation_id: 'conv-99',
+      };
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.inputMessageId).toBeNull();
+      expect(correlation?.isNewUserTurn).toBe(false);
+    });
+
+    it('identifies isNewUserTurn=false for continuation requests', () => {
+      const payload = {
+        action: 'continue',
+        conversation_id: 'conv-real-99',
+        parent_message_id: 'parent-001',
+        model: 'gpt-4o',
+        messages: [
+          {
+            id: 'msg-user-history-1',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: ['Previous user text'] },
+          },
+        ],
+      };
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.inputMessageId).toBeNull();
+      expect(correlation?.isNewUserTurn).toBe(false);
+    });
+
+    it('identifies isNewUserTurn=false for retry and fork requests', () => {
+      const payloadRetry = {
+        action: 'retry',
+        conversation_id: 'conv-real-99',
+        client_message_id: 'msg-retry-1',
+      };
+      expect(parseConversationCorrelation(payloadRetry)?.isNewUserTurn).toBe(false);
+
+      const payloadFork = {
+        action: 'fork',
+        conversation_id: 'conv-real-99',
+        client_message_id: 'msg-fork-1',
+      };
+      expect(parseConversationCorrelation(payloadFork)?.isNewUserTurn).toBe(false);
+    });
+
+    it('identifies isNewUserTurn=false when request only contains conversation_id', () => {
+      const payload = {
+        action: 'next',
+        conversation_id: 'conv-only-1234',
+      };
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.conversationId).toBe('conv-only-1234');
+      expect(correlation?.inputMessageId).toBeNull();
+      expect(correlation?.isNewUserTurn).toBe(false);
+    });
+
+    it('identifies isNewUserTurn=false when messages last item is assistant (tool response/continuation) even with client_message_id', () => {
+      const payload = {
+        action: 'next',
+        client_message_id: 'msg-client-root-1',
+        messages: [
+          {
+            id: 'msg-user-history-1',
+            author: { role: 'user' },
+          },
+          {
+            id: 'msg-assistant-prev',
+            author: { role: 'assistant' },
+          },
+        ],
+        conversation_id: 'conv-real-99',
+      };
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.inputMessageId).toBeNull();
+      expect(correlation?.isNewUserTurn).toBe(false);
     });
 
     it('returns null for payload without inputMessageId and conversationId', () => {
@@ -90,18 +177,6 @@ describe('parsers following chatgpt-route-inspector architecture', () => {
         action: 'dummy',
       };
       expect(parseConversationCorrelation(emptyPayload)).toBeNull();
-    });
-
-    it('returns correlation when client_message_id exists on root', () => {
-      const payload = {
-        client_message_id: 'msg-client-root-1',
-        conversation_id: 'conv-123',
-        model: 'o3-mini',
-      };
-      const correlation = parseConversationCorrelation(payload);
-      expect(correlation).not.toBeNull();
-      expect(correlation?.inputMessageId).toBe('msg-client-root-1');
-      expect(correlation?.requestedModel).toBe('o3-mini');
     });
   });
 
@@ -214,12 +289,12 @@ data: {"author": {"role": "assistant"}, "metadata": {"model_slug": "gpt-4o"}}
   });
 
   describe('parseWebSocketFrame with Correlation Extraction', () => {
-    it('extracts model evidence and message/conversation correlation IDs', () => {
+    it('extracts model evidence and message/conversation correlation IDs and requestId', () => {
       const wsFrame = JSON.stringify([
         {
           payload: {
             payload: {
-              encoded_item: 'data: {"id": "msg-user-ws", "conversation_id": "conv-ws-1", "author": {"role": "user"}}\ndata: {"metadata": {"resolved_model_slug": "o3-mini"}}\ndata: [DONE]\n',
+              encoded_item: 'data: {"id": "msg-user-ws", "conversation_id": "conv-ws-1", "author": {"role": "user"}}\ndata: {"metadata": {"resolved_model_slug": "o3-mini", "request_id": "req-ws-888"}}\ndata: [DONE]\n',
             },
           },
         },
@@ -229,6 +304,7 @@ data: {"author": {"role": "assistant"}, "metadata": {"model_slug": "gpt-4o"}}
       expect(results.length).toBe(1);
       const first = results[0];
       expect(first.evidence.resolvedModelSlug).toBe('o3-mini');
+      expect(first.evidence.requestId).toBe('req-ws-888');
       expect(first.conversationIds).toContain('conv-ws-1');
       expect(first.messageIds).toContain('msg-user-ws');
       expect(first.terminal).toBe(true);
