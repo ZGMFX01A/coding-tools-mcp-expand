@@ -138,21 +138,12 @@ export class TurnObserverOverlay {
       ? formatModelDisplayName(state.requestedModel)
       : null;
 
-    let modelRowLabel = '模型：';
-    let modelRowValue = '—';
-    if (actualModelText) {
-      modelRowLabel = '模型：';
-      modelRowValue = actualModelText;
-    } else if (requestedModelText) {
-      modelRowLabel = '请求：';
-      modelRowValue = `${requestedModelText} (实际: 未知)`;
-    } else if (state?.state === 'active' || state?.state === 'turn_starting') {
-      modelRowLabel = '模型：';
-      modelRowValue = '检测中…';
-    } else {
-      modelRowLabel = '模型：';
-      modelRowValue = '—';
-    }
+    const requestedRowValue = requestedModelText || '—';
+    const responseRowValue = actualModelText
+      ? actualModelText
+      : (state?.state === 'active' || state?.state === 'turn_starting')
+      ? '检测中…'
+      : '—';
 
     let statusClass = 'idle';
     let statusLabel = '待同步';
@@ -176,12 +167,18 @@ export class TurnObserverOverlay {
     const durationText = this.formatDuration(this.timerSeconds);
 
     if (this.isCollapsed) {
+      const miniModelText = requestedModelText
+        ? actualModelText
+          ? `${requestedModelText} → ${actualModelText}`
+          : requestedModelText
+        : actualModelText || '—';
+
       this.container.innerHTML = `
         <div class="ct-turn-observer-mini" id="ct-drag-handle">
           <span class="ct-turn-observer-logo-dot"></span>
           <span>CT</span>
           <span>·</span>
-          <span>${actualModelText || requestedModelText || '—'}</span>
+          <span>${miniModelText}</span>
           <span>·</span>
           <span class="ct-mini-timer">${durationText}</span>
           <span class="ct-turn-observer-status-dot ${statusClass}"></span>
@@ -202,8 +199,12 @@ export class TurnObserverOverlay {
             </div>
           </div>
           <div class="ct-turn-observer-row">
-            <span class="ct-turn-observer-label">${modelRowLabel}</span>
-            <span class="ct-turn-observer-value" title="${modelRowValue}">${modelRowValue}</span>
+            <span class="ct-turn-observer-label">请求模型：</span>
+            <span class="ct-turn-observer-value" title="${requestedRowValue}">${requestedRowValue}</span>
+          </div>
+          <div class="ct-turn-observer-row">
+            <span class="ct-turn-observer-label">响应模型：</span>
+            <span class="ct-turn-observer-value" title="${responseRowValue}">${responseRowValue}</span>
           </div>
           <div class="ct-turn-observer-row">
             <span class="ct-turn-observer-label">本轮：</span>
