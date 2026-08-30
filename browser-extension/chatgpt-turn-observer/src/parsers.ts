@@ -1,7 +1,6 @@
 import {
   EMPTY_ROUTE_EVIDENCE,
   type RouteEvidence,
-  type TurnStartDecision,
 } from './types';
 
 const STANDARD_CONVERSATION_PATH = /^\/c\/([^/?#]+)(?=[/?#]|$)/;
@@ -25,51 +24,41 @@ export function conversationIdFromUrl(urlOrPathname: string): string | null {
   return null;
 }
 
-export function isConversationEndpoint(urlStr: string): boolean {
-  if (!urlStr) return false;
+export type EndpointKind = 'conversation_stream' | 'conversation_record' | 'other';
+
+/**
+ * 严格端点分类（参考 chatgpt-route-inspector 设计）：
+ * 只有正向匹配到真实对话生成流端点时才判定为 conversation_stream。
+ * 所有遥测、交互（如点击复制打点）、文件上传、设置等全部归为 other。
+ */
+export function classifyEndpoint(
+  input: string,
+  base = 'https://chatgpt.com/'
+): { kind: EndpointKind; conversationId: string | null } {
+  let url: URL;
   try {
-    const parsed = new URL(urlStr, typeof location !== 'undefined' ? location.origin : 'https://chatgpt.com');
-    const p = parsed.pathname.toLowerCase();
-
-    // 排除明确的非对话交互端点（遥测、文件上传、语音合成等）
-    if (
-      p.includes('/files') ||
-      p.includes('/synthesize') ||
-      p.includes('/telemetry') ||
-      p.includes('/analytics') ||
-      p.includes('/ces/') ||
-      p.includes('/settings') ||
-      p.includes('/models')
-    ) {
-      return false;
-    }
-
-    return (
-      p.includes('/backend-api/conversation') ||
-      p.includes('/backend-api/conversations') ||
-      p.includes('/backend-api/lat/r') ||
-      p.includes('/backend-api/f/r') ||
-      p.includes('/backend-api/f/conversation') ||
-      p.includes('/backend-anon/conversation') ||
-      p.includes('/backend-anon/conversations')
-    );
+    url = new URL(input, base);
   } catch {
-    const lower = urlStr.toLowerCase();
-    if (
-      lower.includes('/files') ||
-      lower.includes('/synthesize') ||
-      lower.includes('/telemetry') ||
-      lower.includes('/ces/')
-    ) {
-      return false;
-    }
-    return (
-      lower.includes('/backend-api/conversation') ||
-      lower.includes('/backend-api/lat/r') ||
-      lower.includes('/backend-api/f/r') ||
-      lower.includes('/backend-anon/conversation')
-    );
+    return { kind: 'other', conversationId: null };
   }
+
+  const p = url.pathname;
+
+  // 对话生成 SSE 流端点白名单
+  if (
+    /^\/backend-api\/(?:f\/)?conversations?$/.test(p) ||
+    /^\/backend-anon\/(?:f\/)?conversations?$/.test(p)
+  ) {
+    return { kind: 'conversation_stream', conversationId: null };
+  }
+
+  // 历史对话记录端点
+  const match = /^\/backend-api\/conversations?\/([^/]+)$/.exec(p);
+  if (match?.[1]) {
+    return { kind: 'conversation_record', conversationId: decodeURIComponent(match[1]) };
+  }
+
+  return { kind: 'other', conversationId: null };
 }
 
 export function generateUuid(): string {
@@ -101,100 +90,114 @@ function asString(val: unknown): string | null {
   return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null;
 }
 
+export interface ConversationCorrelation {
+  conversationId: string | null;
+  inputMessageId: string | null;
+  parentMessageId: string | null;
+  requestedModel: string | null;
+  action: string | null;
+}
+
 /**
- * 扫描 messages 数组，找到明确 role === 'user' 且带有有效 id 的最新用户消息
+ * 提取对话请求关联信息（严格要求用户消息语义）
  */
-export function findNewestUserMessage(messages: unknown): { id: string } | null {
-  if (!Array.isArray(messages)) return null;
+export function parseConversationCorrelation(
+  raw: string | Record<string, unknown>
+): ConversationCorrelation | null {
+  const root = typeof raw === 'string' ? asRecord(safeJsonParse(raw)) : asRecord(raw);
+  if (!root) return null;
+
+  const messages = Array.isArray(root.messages) ? root.messages : [];
+  let inputMessageId: string | null = null;
+
+  // 倒序遍历 messages，寻找明确带有 role === 'user' 或 author.role === 'user' 的输入消息
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = asRecord(messages[i]);
     if (!msg) continue;
     const author = asRecord(msg.author);
     const role = asString(author?.role) || asString(msg.role);
     if (role === 'user') {
-      const id = asString(msg.id);
-      if (id) {
-        return { id };
-      }
+      inputMessageId = asString(msg.id);
+      if (inputMessageId) break;
     }
   }
-  return null;
-}
 
-/**
- * 严格消息语义判定：仅当检测到明确的 user-authored message 时才允许 NEW_USER_TURN。
- * 杜绝图片上传预请求、复制文本遥测请求、后台轮询等造成的 False Positive。
- */
-export function classifyUserTurnStart(
-  urlStr: string,
-  method: string,
-  rawBody: string | Record<string, unknown> | null,
-  currentTurnId: string | null
-): TurnStartDecision {
-  const upperMethod = (method || 'GET').toUpperCase();
-  if (upperMethod !== 'POST') {
-    return { type: 'NON_TURN_REQUEST', reason: 'UNRELATED_ENDPOINT' };
-  }
-
-  // 1. 拦截明确的遥测/上传/非对话接口
-  const lowerUrl = urlStr.toLowerCase();
-  if (lowerUrl.includes('/files') || lowerUrl.includes('/attachment') || lowerUrl.includes('/upload')) {
-    return { type: 'NON_TURN_REQUEST', reason: 'UPLOAD_ONLY' };
-  }
-  if (lowerUrl.includes('/ces/') || lowerUrl.includes('/telemetry') || lowerUrl.includes('/analytics')) {
-    return { type: 'NON_TURN_REQUEST', reason: 'COPY_TELEMETRY' };
-  }
-
-  if (!isConversationEndpoint(urlStr)) {
-    return { type: 'NON_TURN_REQUEST', reason: 'UNRELATED_ENDPOINT' };
-  }
-
-  // 2. 检查 Request Body 结构
-  if (!rawBody) {
-    return { type: 'NON_TURN_REQUEST', reason: 'INVALID_STRUCTURE' };
-  }
-
-  const root = typeof rawBody === 'string' ? asRecord(safeJsonParse(rawBody)) : asRecord(rawBody);
-  if (!root) {
-    return { type: 'NON_TURN_REQUEST', reason: 'INVALID_STRUCTURE' };
-  }
-
-  // 3. 严格扫描 user-authored message
-  const userMsg = findNewestUserMessage(root.messages);
-  let userMessageId: string | null = userMsg?.id ?? null;
-
-  // 兼容根字段上的 client_message_id / message_id（仅当 action 为 next/create 时）
-  if (!userMessageId && (root.action === 'next' || root.action === 'create' || !root.action)) {
-    userMessageId =
-      asString(root.client_message_id) ||
-      asString(root.message_id) ||
-      asString(root.user_message_id);
-  }
-
-  if (!userMessageId) {
-    return { type: 'NON_TURN_REQUEST', reason: 'NO_USER_MESSAGE' };
+  // 备选：当根对象存在明确的 client_message_id / message_id 且 action 为生成类时
+  if (!inputMessageId && (root.action === 'next' || root.action === 'create' || !root.action)) {
+    inputMessageId = asString(root.client_message_id) || asString(root.message_id);
   }
 
   const conversationId = asString(root.conversation_id);
-  const requestedModel = asString(root.model);
   const parentMessageId = asString(root.parent_message_id);
+  const requestedModel = asString(root.model);
+  const action = asString(root.action);
 
-  // 4. 比对当前 TurnId
-  if (currentTurnId && userMessageId === currentTurnId) {
-    return {
-      type: 'SAME_TURN_CONTINUATION',
-      userMessageId,
-      conversationId,
-    };
-  }
+  // 如果连 inputMessageId 和 conversationId 都没有，不是合法的对话生成请求
+  if (!inputMessageId && !conversationId) return null;
 
   return {
-    type: 'NEW_USER_TURN',
-    userMessageId,
-    requestedModel,
     conversationId,
+    inputMessageId,
     parentMessageId,
+    requestedModel,
+    action,
   };
+}
+
+export interface WebSocketRouteEvidence {
+  evidence: RouteEvidence;
+  conversationIds: string[];
+  messageIds: string[];
+  parentIds: string[];
+  terminal: boolean;
+}
+
+interface CorrelationAccumulator {
+  conversationIds: string[];
+  messageIds: string[];
+  parentIds: string[];
+  terminal: boolean;
+  visited: number;
+}
+
+function collectCorrelation(
+  value: unknown,
+  result: CorrelationAccumulator,
+  depth = 0
+): void {
+  if (depth > 8 || result.visited >= 500) return;
+  result.visited += 1;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 32)) collectCorrelation(item, result, depth + 1);
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) return;
+
+  const convId = asString(record.conversation_id);
+  if (convId && !result.conversationIds.includes(convId)) result.conversationIds.push(convId);
+
+  const parentId = asString(record.parent_id) || asString(record.parent);
+  if (parentId && !result.parentIds.includes(parentId)) result.parentIds.push(parentId);
+
+  const author = asRecord(record.author);
+  const msgId = asString(record.id);
+  if (author && msgId && !result.messageIds.includes(msgId)) {
+    result.messageIds.push(msgId);
+  }
+  const message = asRecord(record.message);
+  const innerMsgId = asString(message?.id);
+  if (innerMsgId && !result.messageIds.includes(innerMsgId)) {
+    result.messageIds.push(innerMsgId);
+  }
+
+  if (record.type === 'server_ste_metadata') {
+    result.terminal = true;
+  }
+
+  for (const nested of Object.values(record)) {
+    if (nested && typeof nested === 'object') collectCorrelation(nested, result, depth + 1);
+  }
 }
 
 export function mergeEvidence(
@@ -313,7 +316,6 @@ export class SseStreamParser {
     let evidence: RouteEvidence = { ...EMPTY_ROUTE_EVIDENCE };
 
     const lines = this.buffer.split(/\r?\n/);
-    // 最后一行可能是不完整行，保留在 buffer 中
     this.buffer = lines.pop() ?? '';
 
     for (const line of lines) {
@@ -354,25 +356,59 @@ export class SseStreamParser {
   }
 }
 
-export function parseWebSocketFrame(raw: string): RouteEvidence {
-  let evidence: RouteEvidence = { ...EMPTY_ROUTE_EVIDENCE };
-  if (!raw || raw.length > 2 * 1024 * 1024) return evidence;
+export function parseWebSocketFrame(raw: string): WebSocketRouteEvidence[] {
+  if (!raw || raw.length > 2 * 1024 * 1024) return [];
 
   const parsed = safeJsonParse(raw);
-  if (!Array.isArray(parsed)) return evidence;
+  if (!Array.isArray(parsed)) return [];
+
+  const results: WebSocketRouteEvidence[] = [];
 
   for (const envelope of parsed.slice(0, 16)) {
     const envRec = asRecord(envelope);
     const outerPayload = asRecord(envRec?.payload);
     const innerPayload = asRecord(outerPayload?.payload);
     const encodedItem = asString(innerPayload?.encoded_item);
-    if (encodedItem) {
-      const itemEvidence = parseSseChunk(encodedItem);
-      evidence = mergeEvidence(evidence, itemEvidence);
+    if (!encodedItem || encodedItem.length > 1024 * 1024) continue;
+
+    const correlation: CorrelationAccumulator = {
+      conversationIds: [],
+      messageIds: [],
+      parentIds: [],
+      terminal: false,
+      visited: 0,
+    };
+
+    for (const line of encodedItem.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === '[DONE]') {
+        correlation.terminal = true;
+        continue;
+      }
+      try {
+        collectCorrelation(safeJsonParse(payload), correlation);
+      } catch {
+        // 忽略
+      }
     }
+
+    const itemEvidence = parseSseChunk(encodedItem);
+    if (itemEvidence.conversationId && !correlation.conversationIds.includes(itemEvidence.conversationId)) {
+      correlation.conversationIds.push(itemEvidence.conversationId);
+    }
+
+    results.push({
+      evidence: itemEvidence,
+      conversationIds: correlation.conversationIds,
+      messageIds: correlation.messageIds,
+      parentIds: correlation.parentIds,
+      terminal: correlation.terminal,
+    });
   }
 
-  return evidence;
+  return results;
 }
 
 /**

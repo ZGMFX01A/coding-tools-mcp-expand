@@ -1,18 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import {
-  classifyUserTurnStart,
+  classifyEndpoint,
   conversationIdFromUrl,
   extractActualModel,
-  findNewestUserMessage,
   formatModelDisplayName,
-  isConversationEndpoint,
+  parseConversationCorrelation,
   parseSseChunk,
   parseWebSocketFrame,
   SseStreamParser,
 } from '../src/parsers';
 import { EMPTY_ROUTE_EVIDENCE } from '../src/types';
 
-describe('parsers & turn classification', () => {
+describe('parsers following chatgpt-route-inspector architecture', () => {
   describe('conversationIdFromUrl', () => {
     it('extracts conversation id from standard url', () => {
       expect(conversationIdFromUrl('https://chatgpt.com/c/67b93198-abc-123')).toBe('67b93198-abc-123');
@@ -30,186 +29,79 @@ describe('parsers & turn classification', () => {
     });
   });
 
-  describe('isConversationEndpoint', () => {
-    it('matches standard chatgpt conversation endpoints', () => {
-      expect(isConversationEndpoint('/backend-api/conversation')).toBe(true);
-      expect(isConversationEndpoint('/backend-api/conversations')).toBe(true);
-      expect(isConversationEndpoint('/backend-api/lat/r')).toBe(true);
-      expect(isConversationEndpoint('/backend-api/f/r')).toBe(true);
-      expect(isConversationEndpoint('/backend-api/f/conversation')).toBe(true);
-      expect(isConversationEndpoint('/backend-anon/conversation')).toBe(true);
-      expect(isConversationEndpoint('https://chatgpt.com/backend-api/conversation')).toBe(true);
+  describe('classifyEndpoint (Strict White-listing matching Route Inspector)', () => {
+    it('classifies conversation stream endpoints as conversation_stream', () => {
+      expect(classifyEndpoint('/backend-api/conversation').kind).toBe('conversation_stream');
+      expect(classifyEndpoint('/backend-api/conversations').kind).toBe('conversation_stream');
+      expect(classifyEndpoint('/backend-api/f/conversation').kind).toBe('conversation_stream');
+      expect(classifyEndpoint('/backend-api/f/conversations').kind).toBe('conversation_stream');
+      expect(classifyEndpoint('/backend-anon/conversation').kind).toBe('conversation_stream');
+      expect(classifyEndpoint('https://chatgpt.com/backend-api/f/conversation').kind).toBe('conversation_stream');
     });
 
-    it('rejects files, telemetry, and analytics endpoints', () => {
-      expect(isConversationEndpoint('/backend-api/files')).toBe(false);
-      expect(isConversationEndpoint('/backend-api/files/upload')).toBe(false);
-      expect(isConversationEndpoint('/backend-api/telemetry')).toBe(false);
-      expect(isConversationEndpoint('/ces/v1/t')).toBe(false);
-      expect(isConversationEndpoint('/backend-api/synthesize')).toBe(false);
-      expect(isConversationEndpoint('/backend-api/settings')).toBe(false);
-    });
-  });
-
-  describe('findNewestUserMessage', () => {
-    it('extracts newest message with role === user', () => {
-      const messages = [
-        { id: 'msg-sys', author: { role: 'system' } },
-        { id: 'msg-user-1', author: { role: 'user' } },
-        { id: 'msg-assistant-1', author: { role: 'assistant' } },
-        { id: 'msg-user-2', role: 'user' },
-      ];
-      const found = findNewestUserMessage(messages);
-      expect(found).not.toBeNull();
-      expect(found?.id).toBe('msg-user-2');
+    it('classifies conversation history reload as conversation_record', () => {
+      const match = classifyEndpoint('/backend-api/conversation/67b93198-1234');
+      expect(match.kind).toBe('conversation_record');
+      expect(match.conversationId).toBe('67b93198-1234');
     });
 
-    it('returns null if no user message exists', () => {
-      const messages = [
-        { id: 'msg-sys', author: { role: 'system' } },
-        { id: 'msg-assistant', author: { role: 'assistant' } },
-      ];
-      expect(findNewestUserMessage(messages)).toBeNull();
+    it('classifies copy telemetry, file uploads, synthesize and lat/r as other', () => {
+      // 复制 Assistant 回答产生的打点接口
+      expect(classifyEndpoint('/ces/v1/t').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/lat/r').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/telemetry').kind).toBe('other');
+      // 文件与图片上传接口
+      expect(classifyEndpoint('/backend-api/files').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/files/upload').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/attachment').kind).toBe('other');
+      // 语音合成与设置
+      expect(classifyEndpoint('/backend-api/synthesize').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/settings').kind).toBe('other');
+      expect(classifyEndpoint('/backend-api/models').kind).toBe('other');
     });
   });
 
-  describe('classifyUserTurnStart (Strict Turn Start Semantics)', () => {
-    it('classifies real user message submission as NEW_USER_TURN', () => {
-      const body = {
+  describe('parseConversationCorrelation (Strict Input Message Extraction)', () => {
+    it('extracts inputMessageId and requestedModel from real user send payload', () => {
+      const payload = {
         action: 'next',
         messages: [
           {
-            id: 'msg-user-100',
+            id: 'msg-user-submit-101',
             author: { role: 'user' },
             content: { content_type: 'text', parts: ['Hello Coding Tools'] },
           },
         ],
-        conversation_id: 'conv-real-1',
+        conversation_id: 'conv-real-99',
+        parent_message_id: 'parent-001',
         model: 'gpt-4o',
       };
 
-      const decision = classifyUserTurnStart(
-        '/backend-api/conversation',
-        'POST',
-        body,
-        null
-      );
-
-      expect(decision.type).toBe('NEW_USER_TURN');
-      if (decision.type === 'NEW_USER_TURN') {
-        expect(decision.userMessageId).toBe('msg-user-100');
-        expect(decision.requestedModel).toBe('gpt-4o');
-        expect(decision.conversationId).toBe('conv-real-1');
-      }
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.inputMessageId).toBe('msg-user-submit-101');
+      expect(correlation?.conversationId).toBe('conv-real-99');
+      expect(correlation?.parentMessageId).toBe('parent-001');
+      expect(correlation?.requestedModel).toBe('gpt-4o');
     });
 
-    it('rejects image upload requests (UPLOAD_ONLY)', () => {
-      const uploadBody = {
-        file_name: 'test.png',
-        file_size: 1024,
-        use_case: 'multimodal',
+    it('returns null for payload without inputMessageId and conversationId', () => {
+      const emptyPayload = {
+        action: 'dummy',
       };
-
-      const decision = classifyUserTurnStart(
-        '/backend-api/files',
-        'POST',
-        uploadBody,
-        null
-      );
-
-      expect(decision.type).toBe('NON_TURN_REQUEST');
-      if (decision.type === 'NON_TURN_REQUEST') {
-        expect(decision.reason).toBe('UPLOAD_ONLY');
-      }
+      expect(parseConversationCorrelation(emptyPayload)).toBeNull();
     });
 
-    it('rejects copy / telemetry requests (COPY_TELEMETRY)', () => {
-      const telemetryBody = {
-        events: [{ type: 'copy_text', message_id: 'msg-assistant-1' }],
-      };
-
-      const decision = classifyUserTurnStart(
-        '/ces/v1/t',
-        'POST',
-        telemetryBody,
-        null
-      );
-
-      expect(decision.type).toBe('NON_TURN_REQUEST');
-      if (decision.type === 'NON_TURN_REQUEST') {
-        expect(decision.reason).toBe('COPY_TELEMETRY');
-      }
-    });
-
-    it('rejects requests without user message (NO_USER_MESSAGE)', () => {
-      const noUserBody = {
-        action: 'get_metadata',
+    it('returns correlation when client_message_id exists on root', () => {
+      const payload = {
+        client_message_id: 'msg-client-root-1',
         conversation_id: 'conv-123',
+        model: 'o3-mini',
       };
-
-      const decision = classifyUserTurnStart(
-        '/backend-api/conversation',
-        'POST',
-        noUserBody,
-        null
-      );
-
-      expect(decision.type).toBe('NON_TURN_REQUEST');
-      if (decision.type === 'NON_TURN_REQUEST') {
-        expect(decision.reason).toBe('NO_USER_MESSAGE');
-      }
-    });
-
-    it('identifies SAME_TURN_CONTINUATION if userMessageId matches active turn', () => {
-      const body = {
-        action: 'next',
-        messages: [{ id: 'msg-user-active', role: 'user' }],
-        conversation_id: 'conv-123',
-      };
-
-      const decision = classifyUserTurnStart(
-        '/backend-api/conversation',
-        'POST',
-        body,
-        'msg-user-active'
-      );
-
-      expect(decision.type).toBe('SAME_TURN_CONTINUATION');
-    });
-
-    it('handles image + text combined sending: upload is non-turn, final send is exactly 1 NEW_USER_TURN', () => {
-      // 1. 上传图片阶段
-      const uploadDecision = classifyUserTurnStart(
-        '/backend-api/files',
-        'POST',
-        { file_id: 'file-123' },
-        null
-      );
-      expect(uploadDecision.type).toBe('NON_TURN_REQUEST');
-
-      // 2. 最终点击发送阶段
-      const sendDecision = classifyUserTurnStart(
-        '/backend-api/conversation',
-        'POST',
-        {
-          action: 'next',
-          messages: [
-            {
-              id: 'msg-combined-turn',
-              author: { role: 'user' },
-              content: { parts: ['explain this image'] },
-              metadata: { attachments: [{ id: 'file-123' }] },
-            },
-          ],
-          model: 'o3-mini',
-        },
-        null
-      );
-      expect(sendDecision.type).toBe('NEW_USER_TURN');
-      if (sendDecision.type === 'NEW_USER_TURN') {
-        expect(sendDecision.userMessageId).toBe('msg-combined-turn');
-        expect(sendDecision.requestedModel).toBe('o3-mini');
-      }
+      const correlation = parseConversationCorrelation(payload);
+      expect(correlation).not.toBeNull();
+      expect(correlation?.inputMessageId).toBe('msg-client-root-1');
+      expect(correlation?.requestedModel).toBe('o3-mini');
     });
   });
 
@@ -321,22 +213,25 @@ data: {"author": {"role": "assistant"}, "metadata": {"model_slug": "gpt-4o"}}
     });
   });
 
-  describe('parseWebSocketFrame', () => {
-    it('extracts model evidence from outer/inner websocket envelope', () => {
+  describe('parseWebSocketFrame with Correlation Extraction', () => {
+    it('extracts model evidence and message/conversation correlation IDs', () => {
       const wsFrame = JSON.stringify([
         {
           payload: {
             payload: {
-              encoded_item: 'data: {"metadata": {"resolved_model_slug": "o3-mini", "conversation_id": "conv-ws-1"}}\ndata: [DONE]\n',
+              encoded_item: 'data: {"id": "msg-user-ws", "conversation_id": "conv-ws-1", "author": {"role": "user"}}\ndata: {"metadata": {"resolved_model_slug": "o3-mini"}}\ndata: [DONE]\n',
             },
           },
         },
       ]);
 
-      const evidence = parseWebSocketFrame(wsFrame);
-      expect(evidence.resolvedModelSlug).toBe('o3-mini');
-      expect(evidence.conversationId).toBe('conv-ws-1');
-      expect(evidence.isStreamDone).toBe(true);
+      const results = parseWebSocketFrame(wsFrame);
+      expect(results.length).toBe(1);
+      const first = results[0];
+      expect(first.evidence.resolvedModelSlug).toBe('o3-mini');
+      expect(first.conversationIds).toContain('conv-ws-1');
+      expect(first.messageIds).toContain('msg-user-ws');
+      expect(first.terminal).toBe(true);
     });
   });
 });
