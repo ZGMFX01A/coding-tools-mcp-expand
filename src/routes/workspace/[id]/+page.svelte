@@ -604,6 +604,10 @@
         </div>
       </details>
 
+      <div class="mt-4">
+        <ChatGptSessionPrompt />
+      </div>
+
       <nav class="tx-service-tabs mt-5" aria-label="工作区服务">
         <button
           type="button"
@@ -668,7 +672,6 @@
               showEndpoint={false}
               {frpProfiles}
             />
-            <ChatGptSessionPrompt />
           </div>
 
           <div class="tx-panel mt-4">
