@@ -1,8 +1,10 @@
 import {
   conversationIdFromUrl,
+  generateUuid,
+  isConversationEndpoint,
   parseConversationRequest,
-  parseSseChunk,
   parseWebSocketFrame,
+  SseStreamParser,
 } from './parsers';
 import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
 
@@ -12,6 +14,18 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return;
   }
   (window as unknown as { __CT_PAGE_HOOK_INSTALLED__?: boolean }).__CT_PAGE_HOOK_INSTALLED__ = true;
+
+  function debugLog(...args: unknown[]) {
+    try {
+      if ((window as unknown as { __CT_DEBUG__?: boolean }).__CT_DEBUG__) {
+        console.log('[CT Observer]', ...args);
+      }
+    } catch {
+      // 忽略日志异常
+    }
+  }
+
+  debugLog('page-hook loaded');
 
   function safePost(type: PageHookMessage['type'], payload: PageHookMessage['payload']) {
     try {
@@ -34,6 +48,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
       if (currentUrl !== lastUrl) {
         lastUrl = currentUrl;
         const convId = conversationIdFromUrl(currentUrl);
+        debugLog('URL_CHANGE', { hasConvId: Boolean(convId) });
         safePost('URL_CHANGE', {
           url: currentUrl,
           conversationId: convId,
@@ -61,13 +76,42 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
   // 2. Fetch Hook
   const nativeFetch = window.fetch;
 
-  function isConversationEndpoint(urlStr: string): boolean {
-    return (
-      urlStr.includes('/backend-api/conversation') ||
-      urlStr.includes('/backend-api/lat/r') ||
-      urlStr.includes('/backend-api/f/r') ||
-      urlStr.includes('/backend-anon/conversation')
-    );
+  function handleRequestBody(
+    bodyText: string | null,
+    urlStr: string,
+    startedAt: number
+  ): string {
+    let turnId = generateUuid();
+    let requestedModel: string | null = null;
+    let reqConvId = conversationIdFromUrl(urlStr) || conversationIdFromUrl(location.href);
+
+    if (bodyText) {
+      try {
+        const parsed = parseConversationRequest(bodyText);
+        turnId = parsed.turnId;
+        requestedModel = parsed.requestedModel;
+        if (parsed.conversationId) {
+          reqConvId = parsed.conversationId;
+        }
+      } catch {
+        // 解析异常兜底
+      }
+    }
+
+    debugLog('REQUEST_START emitted', {
+      turnIdPrefix: turnId.slice(0, 8),
+      hasRequestedModel: Boolean(requestedModel),
+      hasConvId: Boolean(reqConvId),
+    });
+
+    safePost('REQUEST_START', {
+      turnId,
+      requestedModel,
+      conversationId: reqConvId,
+      startedAt,
+    });
+
+    return turnId;
   }
 
   async function inspectFetch(
@@ -76,33 +120,56 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     input: RequestInfo | URL,
     init?: RequestInit
   ): Promise<Response> {
-    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const isRequestObj = typeof Request !== 'undefined' && input instanceof Request;
+    const request = isRequestObj ? (input as Request) : null;
+
+    let urlStr = '';
+    if (typeof input === 'string') {
+      urlStr = input;
+    } else if (input instanceof URL) {
+      urlStr = input.href;
+    } else if (request) {
+      urlStr = request.url;
+    }
+
+    const method = (
+      init?.method ||
+      request?.method ||
+      'GET'
+    ).toUpperCase();
+
     const isConv = isConversationEndpoint(urlStr);
-
-    let startedAt = Date.now();
+    const startedAt = Date.now();
     let turnId: string | null = null;
-    let requestedModel: string | null = null;
-    let reqConvId: string | null = null;
 
-    if (isConv && init && init.method && init.method.toUpperCase() === 'POST') {
-      try {
-        if (typeof init.body === 'string') {
-          const parsed = parseConversationRequest(init.body);
-          turnId = parsed.turnId;
-          requestedModel = parsed.requestedModel;
-          reqConvId = parsed.conversationId || conversationIdFromUrl(location.href);
+    debugLog('fetch intercepted', {
+      url: urlStr.slice(0, 64),
+      method,
+      isConv,
+      isRequestObj,
+      hasInitBody: Boolean(init?.body),
+    });
 
-          if (turnId) {
-            safePost('REQUEST_START', {
-              turnId,
-              requestedModel,
-              conversationId: reqConvId,
-              startedAt,
+    if (isConv && method === 'POST') {
+      if (typeof init?.body === 'string') {
+        turnId = handleRequestBody(init.body, urlStr, startedAt);
+      } else if (request) {
+        try {
+          // 安全异步 clone Request 读取 body，绝不能直接消费原始 request
+          const clonedReq = request.clone();
+          clonedReq
+            .text()
+            .then((text) => {
+              turnId = handleRequestBody(text, urlStr, startedAt);
+            })
+            .catch(() => {
+              turnId = handleRequestBody(null, urlStr, startedAt);
             });
-          }
+        } catch {
+          turnId = handleRequestBody(null, urlStr, startedAt);
         }
-      } catch {
-        // 解析异常绝不影响正常发送
+      } else {
+        turnId = handleRequestBody(null, urlStr, startedAt);
       }
     }
 
@@ -119,20 +186,28 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
         const reader = cloned.body?.getReader();
         if (reader) {
           const decoder = new TextDecoder('utf-8');
+          const sseParser = new SseStreamParser();
+
           (async () => {
             try {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
+                  const flushed = sseParser.flush();
                   safePost('SSE_CHUNK', {
                     turnId,
+                    conversationId: flushed.conversationId,
+                    requestId: flushed.requestId,
+                    resolvedModelSlug: flushed.resolvedModelSlug,
+                    serverModelSlug: flushed.serverModelSlug,
+                    responseModelSlug: flushed.responseModelSlug,
                     isStreamDone: true,
                   });
                   break;
                 }
                 if (value) {
                   const text = decoder.decode(value, { stream: true });
-                  const evidence = parseSseChunk(text);
+                  const evidence = sseParser.feed(text);
                   if (
                     evidence.resolvedModelSlug ||
                     evidence.serverModelSlug ||

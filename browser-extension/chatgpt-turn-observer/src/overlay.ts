@@ -149,7 +149,7 @@ export class TurnObserverOverlay {
     }
 
     let statusClass = 'idle';
-    let statusLabel = '未连接';
+    let statusLabel = '待同步';
     if (state?.bridgeStatus === 'synced') {
       statusClass = 'synced';
       statusLabel = '已同步';
@@ -159,9 +159,12 @@ export class TurnObserverOverlay {
     } else if (state?.bridgeStatus === 'failed') {
       statusClass = 'failed';
       statusLabel = '同步失败';
-    } else if (state?.bridgeStatus === 'connecting') {
-      statusClass = 'sending';
-      statusLabel = '连接中';
+    } else if (state?.bridgeStatus === 'not_configured') {
+      statusClass = 'failed';
+      statusLabel = '未配置 Token';
+    } else if (state?.bridgeStatus === 'idle') {
+      statusClass = 'idle';
+      statusLabel = '待同步';
     }
 
     const durationText = this.formatDuration(this.timerSeconds);

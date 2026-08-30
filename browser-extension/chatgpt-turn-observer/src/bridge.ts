@@ -10,6 +10,18 @@ import {
 } from './types';
 
 (async function initBridge() {
+  function debugLog(...args: unknown[]) {
+    try {
+      if ((window as unknown as { __CT_DEBUG__?: boolean }).__CT_DEBUG__) {
+        console.log('[CT Observer Bridge]', ...args);
+      }
+    } catch {
+      // 忽略
+    }
+  }
+
+  debugLog('bridge loaded');
+
   const observerId = await getOrCreateObserverId();
   let settings: ObserverSettings = await loadSettings();
 
@@ -53,6 +65,9 @@ import {
     overlay.updateState(tabState);
   }
 
+  // 初始挂载 UI
+  updateUi();
+
   // 监听 Storage 变化动态刷新配置
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.ct_observer_settings) {
@@ -71,6 +86,12 @@ import {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+    debugLog('POST event start', {
+      url,
+      event: event.event,
+      turnIdPrefix: event.turn_id?.slice(0, 8),
+    });
+
     try {
       const resp = await fetch(url, {
         method: 'POST',
@@ -82,9 +103,11 @@ import {
         signal: controller.signal,
       });
       clearTimeout(timer);
+      debugLog('POST event done', { status: resp.status });
       return resp;
     } catch (err) {
       clearTimeout(timer);
+      debugLog('POST event error', err);
       throw err;
     }
   }
@@ -198,6 +221,8 @@ import {
     const msg = event.data as PageHookMessage;
     const { type, payload } = msg;
 
+    debugLog('received msg from MAIN', { type });
+
     if (type === 'REQUEST_START') {
       const newTurnId = payload.turnId;
       if (!newTurnId) return;
@@ -220,6 +245,7 @@ import {
         tabState.conversationId = payload.conversationId;
       }
 
+      // 立即更新 UI，让计时器在 0 延迟内开始走动！
       updateUi();
 
       dispatchTurnEvent({
@@ -292,33 +318,39 @@ import {
         });
       }
 
+      // 流结束信号：进入 stream_idle 并开启静默等待窗口
       if (payload.isStreamDone) {
-        tabState.state = 'stream_idle';
-        handleQuietWindow();
-        updateUi();
+        if (tabState.state === 'active') {
+          tabState.state = 'stream_idle';
+          handleQuietWindow();
+          updateUi();
+        }
       }
     } else if (type === 'URL_CHANGE') {
-      if (payload.conversationId && payload.conversationId !== tabState.conversationId) {
-        tabState.conversationId = payload.conversationId;
+      const oldConvId = tabState.conversationId;
+      const newConvId = payload.conversationId;
+
+      if (newConvId && newConvId !== oldConvId) {
+        tabState.conversationId = newConvId;
+
+        // 如果之前已有 turnId 但 conversationId 原来为空，说明新会话 ID 确认，派发 conversation_resolved
         if (tabState.turnId) {
           dispatchTurnEvent({
             schema_version: 1,
             observer_id: observerId,
             tab_id: tabId,
             event: 'conversation_resolved',
-            conversation_id: tabState.conversationId,
+            conversation_id: newConvId,
             turn_id: tabState.turnId,
             request_id: tabState.requestId,
             started_at: tabState.startedAt || Date.now(),
-            completed_at: null,
+            completed_at: tabState.completedAt,
             requested_model: tabState.requestedModel,
             actual_model: tabState.actualModel,
           });
         }
       }
+      updateUi();
     }
   });
-
-  // 初次加载挂载 UI
-  updateUi();
 })();
