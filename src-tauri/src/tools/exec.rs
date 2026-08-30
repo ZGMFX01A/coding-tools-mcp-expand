@@ -56,6 +56,22 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
+    let effective_timeout_ms = if let Some(budget_ms) = args.get("_runtime_budget_ms").and_then(Value::as_u64) {
+        let capped = timeout_ms.min(budget_ms);
+        if capped < timeout_ms {
+            crate::tunnel::append_profile_log(
+                &ctx.workspace_id,
+                "mcp-requests.log",
+                &format!(
+                    "[turn-budget] exec-timeout-capped cmd='{}' requested={}ms effective={}ms",
+                    cmd, timeout_ms, capped
+                ),
+            );
+        }
+        capped
+    } else {
+        timeout_ms
+    };
     let max_output = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -73,7 +89,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             ctx,
             cmd,
             &workdir.path,
-            Duration::from_millis(timeout_ms),
+            Duration::from_millis(effective_timeout_ms),
             Duration::from_millis(yield_ms),
             max_output,
             tty,

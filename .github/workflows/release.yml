@@ -89,10 +89,48 @@ jobs:
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
+  build-browser-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: browser-extension/chatgpt-turn-observer/package-lock.json
+
+      - name: 安装浏览器扩展依赖
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm ci
+
+      - name: 运行扩展测试与类型检查
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: |
+          npm test
+          npm run typecheck
+
+      - name: 构建浏览器扩展
+        working-directory: browser-extension/chatgpt-turn-observer
+        run: npm run build
+
+      - name: 打包浏览器扩展 ZIP
+        run: |
+          cd browser-extension/chatgpt-turn-observer/dist
+          zip -r ../../../chatgpt-turn-observer.zip .
+
+      - name: 上传浏览器扩展 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-extension-zip
+          path: chatgpt-turn-observer.zip
+          if-no-files-found: error
+
   publish-release:
     needs:
       - build-windows
       - build-universal-macos
+      - build-browser-extension
     runs-on: ubuntu-latest
     steps:
       - name: 下载 Windows EXE
@@ -107,7 +145,13 @@ jobs:
           name: macos-dmg
           path: dist/macos
 
-      - name: 创建 Release 并上传安装包
+      - name: 下载浏览器扩展 ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: browser-extension-zip
+          path: dist/extension
+
+      - name: 创建 Release 并上传安装包与浏览器扩展
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
@@ -117,3 +161,4 @@ jobs:
           files: |
             dist/windows/*.exe
             dist/macos/*.dmg
+            dist/extension/*.zip

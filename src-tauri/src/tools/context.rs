@@ -18,6 +18,9 @@ pub struct ToolContext {
     pub sessions: Arc<SessionStore>,
     pub workspace_id: String,
     pub external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
+    pub turn_budget: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>,
+    pub turn_registry: Arc<crate::mcp::BrowserTurnRegistry>,
+    pub turn_correlator: Arc<crate::mcp::TurnCorrelator>,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -122,7 +125,27 @@ impl ToolContext {
             sessions: Arc::new(SessionStore::new()),
             workspace_id,
             external_mcp,
+            turn_budget: Arc::new(crate::mcp::turn_budget::AgentTurnBudgetManager::new(
+                crate::mcp::turn_budget::AgentTurnBudgetConfig::default(),
+            )),
+            turn_registry: Arc::new(crate::mcp::BrowserTurnRegistry::default()),
+            turn_correlator: Arc::new(crate::mcp::TurnCorrelator::default()),
         }
+    }
+
+    pub fn with_turn_budget_manager(mut self, manager: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>) -> Self {
+        self.turn_budget = manager;
+        self
+    }
+
+    pub fn with_turn_registry_and_correlator(
+        mut self,
+        registry: Arc<crate::mcp::BrowserTurnRegistry>,
+        correlator: Arc<crate::mcp::TurnCorrelator>,
+    ) -> Self {
+        self.turn_registry = registry;
+        self.turn_correlator = correlator;
+        self
     }
 
     pub fn for_test(workspace_path: PathBuf, harness_root: PathBuf) -> Result<Self, String> {

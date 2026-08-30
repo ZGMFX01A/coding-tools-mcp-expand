@@ -5,6 +5,7 @@ export type WorkspaceSecretKey =
   | "oauth_password"
   | "oauth_token_secret"
   | "bearer_token"
+  | "browser_bridge_token"
   | "cloudflare_token"
   | "actions_cloudflare_token"
   | "actions_api_key"
@@ -53,6 +54,7 @@ export const regenerateSecret = regenerateWorkspaceSecret;
 export type SharedSecretKey =
   | "oauth_client_id"
   | "bearer_token"
+  | "browser_bridge_token"
   | "oauth_client_secret"
   | "oauth_password"
   | "oauth_token_secret"

@@ -1,0 +1,412 @@
+import {
+  classifyEndpoint,
+  conversationIdFromUrl,
+  generateUuid,
+  parseConversationCorrelation,
+  parseWebSocketFrame,
+  SseStreamParser,
+  type ConversationCorrelation,
+  type WebSocketRouteEvidence,
+} from './parsers';
+import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
+
+(function initPageHook() {
+  // 防止重复初始化
+  if ((window as unknown as { __CT_PAGE_HOOK_INSTALLED__?: boolean }).__CT_PAGE_HOOK_INSTALLED__) {
+    return;
+  }
+  (window as unknown as { __CT_PAGE_HOOK_INSTALLED__?: boolean }).__CT_PAGE_HOOK_INSTALLED__ = true;
+
+  function debugLog(...args: unknown[]) {
+    try {
+      if ((window as unknown as { __CT_DEBUG__?: boolean }).__CT_DEBUG__) {
+        console.log('[CT Observer]', ...args);
+      }
+    } catch {
+      // 忽略日志异常
+    }
+  }
+
+  debugLog('page-hook loaded');
+
+  function safePost(type: PageHookMessage['type'], payload: PageHookMessage['payload']) {
+    try {
+      const msg: PageHookMessage = {
+        source: CT_OBSERVER_MESSAGE_SOURCE,
+        type,
+        payload,
+      };
+      const targetOrigin = window.location.origin;
+      // opaque origin 无法安全限定接收方，宁可放弃上报也不广播到 '*'
+      if (!targetOrigin || targetOrigin === 'null') return;
+      window.postMessage(msg, targetOrigin);
+    } catch {
+      // 忽略 postMessage 异常
+    }
+  }
+
+  // 1. URL 监听（仅同步 conversationId，绝不创建/修改 Turn）
+  let lastUrl = location.href;
+  function checkUrlChange() {
+    try {
+      const currentUrl = location.href;
+      if (currentUrl !== lastUrl) {
+        lastUrl = currentUrl;
+        const convId = conversationIdFromUrl(currentUrl);
+        debugLog('URL_CHANGE', { hasConvId: Boolean(convId) });
+        safePost('URL_CHANGE', {
+          url: currentUrl,
+          conversationId: convId,
+        });
+      }
+    } catch {
+      // 忽略
+    }
+  }
+
+  window.addEventListener('popstate', checkUrlChange);
+  const rawPushState = history.pushState;
+  const rawReplaceState = history.replaceState;
+  history.pushState = function (...args) {
+    const res = rawPushState.apply(this, args);
+    checkUrlChange();
+    return res;
+  };
+  history.replaceState = function (...args) {
+    const res = rawReplaceState.apply(this, args);
+    checkUrlChange();
+    return res;
+  };
+
+  // 2. Pending Capture 与已见 Message ID LRU 管理
+  interface PendingLiveCapture extends ConversationCorrelation {
+    captureId: string;
+    turnId: string;
+    startedAt: number;
+    expiresAt: number;
+  }
+
+  const pendingLiveCaptures = new Map<string, PendingLiveCapture>();
+  const PENDING_CAPTURE_TTL_MS = 10 * 60 * 1000;
+
+  const seenUserMessageIds = new Set<string>();
+  const MAX_SEEN_MESSAGE_IDS = 256;
+
+  function markUserMessageIdSeen(id: string): void {
+    if (!id) return;
+    if (seenUserMessageIds.size >= MAX_SEEN_MESSAGE_IDS) {
+      const oldest = seenUserMessageIds.values().next().value as string | undefined;
+      if (oldest) seenUserMessageIds.delete(oldest);
+    }
+    seenUserMessageIds.add(id);
+  }
+
+  function prunePendingCaptures(now = Date.now()): void {
+    for (const [captureId, pending] of pendingLiveCaptures) {
+      if (pending.expiresAt <= now) pendingLiveCaptures.delete(captureId);
+    }
+  }
+
+  function registerPendingCapture(
+    captureId: string,
+    startedAt: number,
+    turnId: string,
+    correlation: ConversationCorrelation
+  ): void {
+    prunePendingCaptures();
+    while (pendingLiveCaptures.size >= 32) {
+      const oldest = pendingLiveCaptures.keys().next().value as string | undefined;
+      if (!oldest) break;
+      pendingLiveCaptures.delete(oldest);
+    }
+    pendingLiveCaptures.set(captureId, {
+      captureId,
+      turnId,
+      startedAt,
+      ...correlation,
+      expiresAt: Date.now() + PENDING_CAPTURE_TTL_MS,
+    });
+  }
+
+  function uniqueCandidate(candidates: PendingLiveCapture[]): PendingLiveCapture | null {
+    return candidates.length === 1 ? candidates[0] ?? null : null;
+  }
+
+  function pendingCaptureFor(evidence: WebSocketRouteEvidence): PendingLiveCapture | null {
+    prunePendingCaptures();
+    const pending = [...pendingLiveCaptures.values()];
+
+    const inputMatches = pending.filter(
+      (c) =>
+        Boolean(c.inputMessageId) &&
+        (evidence.messageIds.includes(c.inputMessageId ?? '') ||
+          evidence.parentIds.includes(c.inputMessageId ?? ''))
+    );
+    if (inputMatches.length > 0) return uniqueCandidate(inputMatches);
+
+    const parentMatches = pending.filter(
+      (c) =>
+        Boolean(c.parentMessageId) &&
+        evidence.parentIds.includes(c.parentMessageId ?? '') &&
+        (evidence.conversationIds.length === 0 ||
+          !c.conversationId ||
+          evidence.conversationIds.includes(c.conversationId))
+    );
+    if (parentMatches.length > 0) return uniqueCandidate(parentMatches);
+
+    const conversationMatches = pending.filter(
+      (c) =>
+        Boolean(c.conversationId) &&
+        evidence.conversationIds.includes(c.conversationId ?? '')
+    );
+    return uniqueCandidate(conversationMatches);
+  }
+
+  // 3. Fetch Hook (严格判定新用户 Turn，非新 Turn 绝不注册 Live Capture)
+  const nativeFetch = window.fetch;
+
+  function requestUrl(input: RequestInfo | URL): string {
+    if (typeof input === 'string') return input;
+    if (input instanceof URL) return input.href;
+    if (typeof Request !== 'undefined' && input instanceof Request) return input.url;
+    return String(input);
+  }
+
+  async function requestBody(input: RequestInfo | URL, init?: RequestInit): Promise<string | null> {
+    if (typeof init?.body === 'string') return init.body;
+    if (typeof Request !== 'undefined' && input instanceof Request) {
+      try {
+        return await input.clone().text();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  async function inspectFetch(
+    target: typeof window.fetch,
+    receiver: unknown,
+    input: RequestInfo | URL,
+    init?: RequestInit
+  ): Promise<Response> {
+    const url = requestUrl(input);
+    const method = (
+      init?.method ||
+      (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET')
+    ).toUpperCase();
+
+    const endpoint = classifyEndpoint(url, location.href);
+
+    debugLog('fetch observed', {
+      url: url.slice(0, 60),
+      method,
+      endpointKind: endpoint.kind,
+    });
+
+    if (endpoint.kind !== 'conversation_stream' || method !== 'POST') {
+      return target.call(receiver, input as RequestInfo, init);
+    }
+
+    const captureId = generateUuid();
+    const startedAt = Date.now();
+
+    const bodyPromise = requestBody(input, init);
+    const correlationPromise = bodyPromise.then((raw) => {
+      if (!raw) return null;
+      const correlation = parseConversationCorrelation(raw);
+      if (!correlation) return null;
+
+      // 严格检查是否为真正的新用户发送且未被重放
+      if (!correlation.isNewUserTurn) {
+        debugLog('Non-turn request observed, short-circuited', { action: correlation.action });
+        return null;
+      }
+
+      if (correlation.inputMessageId) {
+        if (seenUserMessageIds.has(correlation.inputMessageId)) {
+          debugLog('MessageId replayed, short-circuited', { msgId: correlation.inputMessageId });
+          return null;
+        }
+        markUserMessageIdSeen(correlation.inputMessageId);
+      }
+
+      const turnId = correlation.inputMessageId || generateUuid();
+      const reqConvId = correlation.conversationId || conversationIdFromUrl(location.href);
+
+      registerPendingCapture(captureId, startedAt, turnId, correlation);
+
+      debugLog('REQUEST_START emitted', {
+        captureIdPrefix: captureId.slice(0, 8),
+        turnIdPrefix: turnId.slice(0, 8),
+        hasRequestedModel: Boolean(correlation.requestedModel),
+        hasConvId: Boolean(reqConvId),
+      });
+
+      safePost('REQUEST_START', {
+        captureId,
+        turnId,
+        requestedModel: correlation.requestedModel,
+        conversationId: reqConvId,
+        startedAt,
+      });
+
+      return { turnId, correlation };
+    });
+
+    let response: Response;
+    try {
+      response = await target.call(receiver, input as RequestInfo, init);
+    } catch (err) {
+      throw err;
+    }
+
+    if (response && response.ok) {
+      try {
+        const cloned = response.clone();
+        const reader = cloned.body?.getReader();
+        if (reader) {
+          const decoder = new TextDecoder('utf-8');
+          const sseParser = new SseStreamParser();
+
+          void correlationPromise.then((ctx) => {
+            if (!ctx) return;
+            const boundTurnId = ctx.turnId;
+            (async () => {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) {
+                    const flushed = sseParser.flush();
+                    safePost('SSE_CHUNK', {
+                      captureId,
+                      turnId: boundTurnId,
+                      conversationId: flushed.conversationId,
+                      requestId: flushed.requestId,
+                      resolvedModelSlug: flushed.resolvedModelSlug,
+                      serverModelSlug: flushed.serverModelSlug,
+                      responseModelSlug: flushed.responseModelSlug,
+                      isStreamDone: true,
+                    });
+                    break;
+                  }
+                  if (value) {
+                    const text = decoder.decode(value, { stream: true });
+                    const ev = sseParser.feed(text);
+                    if (
+                      ev.resolvedModelSlug ||
+                      ev.serverModelSlug ||
+                      ev.responseModelSlug ||
+                      ev.conversationId ||
+                      ev.requestId ||
+                      ev.isStreamDone
+                    ) {
+                      safePost('SSE_CHUNK', {
+                        captureId,
+                        turnId: boundTurnId,
+                        conversationId: ev.conversationId,
+                        requestId: ev.requestId,
+                        resolvedModelSlug: ev.resolvedModelSlug,
+                        serverModelSlug: ev.serverModelSlug,
+                        responseModelSlug: ev.responseModelSlug,
+                        isStreamDone: Boolean(ev.isStreamDone),
+                      });
+                    }
+                  }
+                }
+              } catch {
+                // 忽略流读取异常
+              }
+            })();
+          });
+        }
+      } catch {
+        // 忽略 clone 异常
+      }
+    }
+
+    return response;
+  }
+
+  window.fetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+    return inspectFetch(nativeFetch, this, input, init);
+  } as typeof window.fetch;
+
+  // 4. WebSocket Hook
+  const nativeWebSocket = window.WebSocket;
+
+  function isTargetWs(url: string): boolean {
+    try {
+      const parsed = new URL(url);
+      const pathname = parsed.pathname;
+      return pathname.startsWith('/backend-api') || pathname.startsWith('/backend-anon');
+    } catch {
+      return false;
+    }
+  }
+
+  function handleWebSocketText(raw: string): void {
+    const evidenceItems = parseWebSocketFrame(raw);
+    for (const item of evidenceItems) {
+      const pending = pendingCaptureFor(item);
+      if (!pending) continue;
+
+      const ev = item.evidence;
+      if (
+        ev.resolvedModelSlug ||
+        ev.serverModelSlug ||
+        ev.responseModelSlug ||
+        ev.conversationId ||
+        ev.isStreamDone ||
+        item.terminal
+      ) {
+        safePost('WS_FRAME', {
+          captureId: pending.captureId,
+          turnId: pending.turnId,
+          conversationId: ev.conversationId || pending.conversationId,
+          requestId: ev.requestId || null,
+          resolvedModelSlug: ev.resolvedModelSlug,
+          serverModelSlug: ev.serverModelSlug,
+          responseModelSlug: ev.responseModelSlug,
+          isStreamDone: Boolean(ev.isStreamDone || item.terminal),
+        });
+      }
+      if (item.terminal) {
+        pendingLiveCaptures.delete(pending.captureId);
+      }
+    }
+  }
+
+  const ProxyWebSocket = function (
+    this: WebSocket,
+    url: string | URL,
+    protocols?: string | string[]
+  ) {
+    const targetUrl = typeof url === 'string' ? url : url.href;
+    const socket = Reflect.construct(nativeWebSocket, protocols !== undefined ? [url, protocols] : [url]);
+
+    if (isTargetWs(targetUrl)) {
+      try {
+        socket.addEventListener('message', (event: MessageEvent) => {
+          if (typeof event.data === 'string') {
+            queueMicrotask(() => handleWebSocketText(event.data));
+          }
+        });
+      } catch {
+        // 忽略
+      }
+    }
+    return socket;
+  } as unknown as typeof WebSocket;
+
+  try {
+    ProxyWebSocket.prototype = nativeWebSocket.prototype;
+    Object.defineProperty(window, 'WebSocket', {
+      value: ProxyWebSocket,
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    // 忽略
+  }
+})();

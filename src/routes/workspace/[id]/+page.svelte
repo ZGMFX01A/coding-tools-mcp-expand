@@ -14,9 +14,9 @@
     type RuntimePolicyDraft,
   } from "$lib/components/RuntimePolicyForm.svelte";
   import ChatGptSessionPrompt from "$lib/components/ChatGptSessionPrompt.svelte";
+  import McpConnectionCard from "$lib/components/McpConnectionCard.svelte";
   import ServicePanel from "$lib/components/ServicePanel.svelte";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
-  import CopyFieldRow from "$lib/components/CopyFieldRow.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
   import Tabs from "$lib/components/Tabs.svelte";
   import TunnelConfigForm, {
@@ -126,6 +126,30 @@
       default:
         return "已停止";
     }
+  }
+
+  function tunnelLabel(type: string): string {
+    if (type === "frp") return "FRP 公网隧道";
+    if (type === "cloudflare") return "Cloudflare 隧道";
+    return "仅本机";
+  }
+
+  function authLabel(type: string): string {
+    if (type === "oauth") return "OAuth";
+    if (type === "bearer") return "Bearer Token";
+    return "无认证";
+  }
+
+  function toolProfileLabel(profileName: string): string {
+    if (profileName === "advanced") return "高级工具";
+    if (profileName === "read-only") return "只读工具";
+    return "核心工具";
+  }
+
+  function permissionLabel(mode: string): string {
+    if (mode === "trusted") return "信任模式";
+    if (mode === "dangerous") return "危险模式";
+    return "安全模式";
   }
 
   function applyMcpRuntime(
@@ -558,43 +582,46 @@
         </button>
       </div>
 
-      <div class="mt-4 max-w-md">
-        <CopyFieldRow
-          label="工作区 ID"
-          value={profile.id}
-          hint="用于工作区访问地址与数据关联的稳定标识，可在下方修改。"
-        />
+      <div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-[var(--color-text-muted)]">
+        <span class="max-w-full truncate font-mono" title={profile.path}>{profile.path}</span>
+        <span class="text-xs">ID <span class="font-mono">{profile.id}</span></span>
       </div>
 
-      <div class="mt-4">
-        <WorkspaceMetaForm
-          id={profile.id}
-          name={profile.name}
-          path={profile.path}
-          onSave={saveWorkspaceName}
-          onUpdatePath={saveWorkspacePath}
-          onSaveId={saveWorkspaceId}
-        />
-      </div>
+      <details class="tx-panel mt-4">
+        <summary class="tx-panel-toggle">
+          <span>工作区信息</span>
+          <span class="text-xs text-[var(--color-text-muted)]">名称、路径、ID</span>
+        </summary>
+        <div class="tx-panel-body">
+          <WorkspaceMetaForm
+            id={profile.id}
+            name={profile.name}
+            path={profile.path}
+            onSave={saveWorkspaceName}
+            onUpdatePath={saveWorkspacePath}
+            onSaveId={saveWorkspaceId}
+          />
+        </div>
+      </details>
 
       <div class="mt-4">
         <ChatGptSessionPrompt />
       </div>
 
-      <div class="mt-4 flex flex-wrap items-center gap-2">
+      <nav class="tx-service-tabs mt-5" aria-label="工作区服务">
         <button
           type="button"
-          class="tx-status-pill"
+          class="tx-service-tab"
           class:active={activeService === "mcp"}
           onclick={() => (activeService = "mcp")}
         >
           <StatusOrb state={mcpStatus} />
-          <span class="font-medium">MCP</span>
+          <span class="font-medium">MCP 服务</span>
           <span class="text-[var(--color-text-muted)]">{stateLabel(mcpStatus)}</span>
         </button>
         <button
           type="button"
-          class="tx-status-pill"
+          class="tx-service-tab"
           class:active={activeService === "actions"}
           onclick={() => (activeService = "actions")}
         >
@@ -602,33 +629,26 @@
           <span class="font-medium">Actions</span>
           <span class="text-[var(--color-text-muted)]">{stateLabel(actionsStatus)}</span>
         </button>
-      </div>
+      </nav>
     </header>
 
     <div class="page-body">
       {#if activeService === "mcp"}
-        <div class="mt-4 flex flex-col gap-3">
-          <ServicePanel
-            title="MCP"
-            subtitle="Streamable HTTP · 工具运行时"
+        <div class="mt-4">
+          <McpConnectionCard
             status={mcpStatus}
             statusMessage={mcpStatusMessage}
             port={profile.runtime.local_port}
-            portEditable={true}
             busy={mcpBusy}
             tunnelType={profile.tunnel.type}
+            authType={profile.auth.type}
+            toolProfile={profile.runtime.tool_profile}
+            permissionMode={profile.runtime.permission_mode}
             localEndpoint={mcpLocal || mcpLocalEndpoint(profile.runtime.local_port)}
             publicEndpoint={mcpPublic}
-            publicLabel="公网 MCP"
             onToggle={toggleMcp}
             onPortChange={saveMcpPort}
-          />
-          <GptQuickCopy
-            workspaceId={workspaceId!}
-            service="mcp"
-            {profile}
-            publicMcpEndpoint={mcpPublic}
-            {frpProfiles}
+            onConfigure={() => (mcpSubTab = "config")}
           />
         </div>
 
@@ -643,42 +663,98 @@
         </div>
 
         {#if mcpSubTab === "config"}
-          <div class="tx-card mt-4 grid gap-6 p-5">
-            <div>
-              <ExternalMcpPanel
-                workspaceId={workspaceId!}
-                configs={profile.externalMcps}
-                onRefreshProfile={async () => { await refreshProfile(); }}
-              />
+          <div class="mt-4 flex flex-col gap-4">
+            <GptQuickCopy
+              workspaceId={workspaceId!}
+              service="mcp"
+              {profile}
+              publicMcpEndpoint={mcpPublic}
+              showEndpoint={false}
+              {frpProfiles}
+            />
+          </div>
+
+          <div class="tx-panel mt-4">
+            <div class="border-b border-[var(--color-border)] px-5 py-4">
+              <p class="tx-section-label">MCP 配置</p>
+              <p class="mt-1 text-sm text-[var(--color-text-muted)]">
+                常用连接设置直接展开，低频策略与第三方扩展按需打开。
+              </p>
             </div>
-            <div>
-              <p class="tx-section-label">隧道</p>
-              <TunnelConfigForm
-                workspaceId={workspaceId!}
-                service="mcp"
-                config={mcpTunnelForm}
-                onSave={saveMcpTunnel}
-              />
-            </div>
-            <div>
-              <p class="tx-section-label">认证</p>
-              <AuthConfigForm
-                workspaceId={workspaceId!}
-                auth={profile.auth}
-                onSaveProfile={saveMcpAuth}
-              />
-            </div>
-            <div>
-              <p class="tx-section-label">策略</p>
-              <RuntimePolicyForm
-                toolProfile={profile.runtime.tool_profile}
-                permissionMode={profile.runtime.permission_mode}
-                allowedCommands={profile.runtime.allowed_commands ?? ""}
-                workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
-                workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
-                onSave={saveMcpPolicy}
-              />
-            </div>
+
+            <details open class="tx-config-section">
+              <summary class="tx-config-toggle">
+                <span>
+                  <span class="tx-config-title">连接设置</span>
+                  <span class="tx-config-summary">端口 {profile.runtime.local_port} · {tunnelLabel(profile.tunnel.type)} · {authLabel(profile.auth.type)}</span>
+                </span>
+                <span class="tx-config-action">展开</span>
+              </summary>
+              <div class="tx-config-body">
+                <div class="grid gap-6 xl:grid-cols-2">
+                  <section>
+                    <p class="tx-section-label">隧道</p>
+                    <TunnelConfigForm
+                      workspaceId={workspaceId!}
+                      service="mcp"
+                      config={mcpTunnelForm}
+                      onSave={saveMcpTunnel}
+                    />
+                  </section>
+                  <section>
+                    <p class="tx-section-label">认证</p>
+                    <AuthConfigForm
+                      workspaceId={workspaceId!}
+                      auth={profile.auth}
+                      onSaveProfile={saveMcpAuth}
+                    />
+                  </section>
+                </div>
+              </div>
+            </details>
+
+            <details class="tx-config-section">
+              <summary class="tx-config-toggle">
+                <span>
+                  <span class="tx-config-title">运行策略</span>
+                  <span class="tx-config-summary">{toolProfileLabel(profile.runtime.tool_profile)} · {permissionLabel(profile.runtime.permission_mode)}</span>
+                </span>
+                <span class="tx-config-action">展开</span>
+              </summary>
+              <div class="tx-config-body">
+                <p class="mb-4 text-sm leading-6 text-[var(--color-text-muted)]">
+                  控制当前工作区可用的工具范围、命令权限和本地文件行为。
+                </p>
+                <RuntimePolicyForm
+                  toolProfile={profile.runtime.tool_profile}
+                  permissionMode={profile.runtime.permission_mode}
+                  allowedCommands={profile.runtime.allowed_commands ?? ""}
+                  workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
+                  workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
+                  onSave={saveMcpPolicy}
+                />
+              </div>
+            </details>
+
+            <details class="tx-config-section">
+              <summary class="tx-config-toggle">
+                <span>
+                  <span class="tx-config-title">扩展 MCP 工具</span>
+                  <span class="tx-config-summary">高级：连接第三方 stdio MCP</span>
+                </span>
+                <span class="tx-config-action">展开</span>
+              </summary>
+              <div class="tx-config-body">
+                <p class="mb-4 text-sm leading-6 text-[var(--color-text-muted)]">
+                  这里只用于聚合第三方 MCP 进程。日常使用标准 MCP 时，无需配置命令、参数或环境变量。
+                </p>
+                <ExternalMcpPanel
+                  workspaceId={workspaceId!}
+                  configs={profile.externalMcps}
+                  onRefreshProfile={async () => { await refreshProfile(); }}
+                />
+              </div>
+            </details>
           </div>
         {:else if mcpSubTab === "logs"}
           <div class="mt-4">

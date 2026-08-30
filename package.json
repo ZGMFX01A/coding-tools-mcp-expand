@@ -11,6 +11,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "extension:build": "npm --prefix browser-extension/chatgpt-turn-observer run build",
+    "extension:test": "npm --prefix browser-extension/chatgpt-turn-observer test",
+    "extension:check": "npm --prefix browser-extension/chatgpt-turn-observer run typecheck",
     "tauri": "tauri"
   },
   "license": "Apache-2.0",

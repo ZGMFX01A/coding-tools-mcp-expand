@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Form, Query, State};
 use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
@@ -35,6 +36,7 @@ struct ListenerState {
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
+    browser_bridge_token: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -72,6 +74,26 @@ pub fn spawn_listener(
     } else {
         None
     };
+    let browser_bridge_token = {
+        let key = "browser_bridge_token";
+        let existing = if auth.use_shared_secrets {
+            SecretStore::get_shared(key).unwrap_or(None)
+        } else {
+            SecretStore::get(&workspace_id, key).unwrap_or(None)
+        };
+        match existing {
+            Some(t) if !t.trim().is_empty() => Some(t),
+            _ => {
+                let generated = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "");
+                if auth.use_shared_secrets {
+                    let _ = SecretStore::set_shared(key, &generated);
+                } else {
+                    let _ = SecretStore::set(&workspace_id, key, &generated);
+                }
+                Some(generated)
+            }
+        }
+    };
     let configured_public_url = public_base_url.trim().to_string();
     let oauth = if auth.oauth_enabled() {
         let password = oauth_password.unwrap_or_default();
@@ -101,6 +123,7 @@ pub fn spawn_listener(
         bearer_token,
         oauth,
         oauth_client_secret,
+        browser_bridge_token,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -141,6 +164,8 @@ async fn serve(
         )
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
+        .route("/internal/chatgpt-turn-event", post(post_chatgpt_turn_event))
+        .route("/internal/chatgpt-turn-observer/status", get(get_chatgpt_turn_observer_status))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -373,6 +398,179 @@ fn oauth_not_configured() -> Response {
         Json(json!({ "error": "OAuth not configured" })),
     )
         .into_response()
+}
+
+async fn post_chatgpt_turn_event(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(err_resp) = verify_observer_token(&state, &headers) {
+        return err_resp;
+    }
+    if body.len() > 8192 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "ok": false, "error": "payload too large" })),
+        )
+            .into_response();
+    }
+    let event: crate::mcp::browser_turn::BrowserTurnEvent = match serde_json::from_slice(&body) {
+        Ok(ev) => ev,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("invalid json: {err}") })),
+            )
+                .into_response();
+        }
+    };
+    if event.schema_version != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": format!("unsupported schema_version: {}", event.schema_version) })),
+        )
+            .into_response();
+    }
+    if event.workspace_id != state.workspace_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": format!("workspace mismatch: expected {}, got {}", state.workspace_id, event.workspace_id) })),
+        )
+            .into_response();
+    }
+
+    // started_at/completed_at 只用于事件一致性校验；预算起算仍由服务端单调时钟负责。
+    // 过远的客户端时间戳不能参与状态推进，避免恶意或错误时钟污染生命周期。
+    let wall_now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let too_far_in_future = event.started_at > wall_now_ms.saturating_add(60_000);
+    let too_old = wall_now_ms.saturating_sub(event.started_at) > 2 * 60 * 60 * 1000;
+    let completed_before_started = event
+        .completed_at
+        .is_some_and(|completed_at| completed_at < event.started_at);
+    let completed_too_far_in_future = event
+        .completed_at
+        .is_some_and(|completed_at| completed_at > wall_now_ms.saturating_add(60_000));
+    if too_far_in_future || too_old || completed_before_started || completed_too_far_in_future {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "event timestamp is outside the accepted window"
+            })),
+        )
+            .into_response();
+    }
+
+    if event.sequence == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "sequence must be positive (> 0)" })),
+        )
+            .into_response();
+    }
+    if uuid::Uuid::parse_str(&event.event_id).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "event_id must be a valid UUID" })),
+        )
+            .into_response();
+    }
+    if uuid::Uuid::parse_str(&event.tab_instance_id).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "tab_instance_id must be a valid UUID" })),
+        )
+            .into_response();
+    }
+    if event.observer_id.trim().is_empty()
+        || event.observer_id.len() > 128
+        || event.turn_id.trim().is_empty()
+        || event.turn_id.len() > 256
+        || event.conversation_id.as_ref().map_or(false, |c| c.len() > 256)
+        || event.request_id.as_ref().map_or(false, |r| r.len() > 256)
+        || event.actual_model.as_ref().map_or(false, |m| m.len() > 128)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "field validation failed" })),
+        )
+            .into_response();
+    }
+
+    let now = state.mcp.turn_budget.clock().now();
+    state
+        .mcp
+        .turn_registry
+        .record_event(&state.workspace_id, event, now);
+
+    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+async fn get_chatgpt_turn_observer_status(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(err_resp) = verify_observer_token(&state, &headers) {
+        return err_resp;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "service": "chatgpt_turn_observer",
+            "version": env!("CARGO_PKG_VERSION"),
+            "workspace_id": state.workspace_id,
+        })),
+    )
+        .into_response()
+}
+
+fn verify_observer_token(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
+    let expected_token = match &state.browser_bridge_token {
+        Some(t) if !t.trim().is_empty() => t.trim(),
+        _ => {
+            return Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "ok": false, "error": "Observer token not configured on server" })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-coding-tools-observer-token").and_then(|v| v.to_str().ok()));
+
+    match auth_header {
+        Some(header_val) => {
+            let token = header_val.trim_start_matches("Bearer ").trim();
+            if token == expected_token {
+                None
+            } else {
+                Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "ok": false, "error": "Invalid observer token" })),
+                    )
+                        .into_response(),
+                )
+            }
+        }
+        None => Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "error": "Missing Authorization header" })),
+            )
+                .into_response(),
+        ),
+    }
 }
 
 #[cfg(test)]
