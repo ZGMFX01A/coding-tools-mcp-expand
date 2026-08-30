@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Coding Tools ChatGPT Turn Observer 设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="options-container">
+    <header class="options-header">
+      <div class="logo-row">
+        <span class="logo-dot"></span>
+        <h1>Coding Tools ChatGPT Turn Observer</h1>
+      </div>
+      <p class="subtitle">配置浏览器观察端与 Coding Tools MCP 服务的连接桥梁</p>
+    </header>
+
+    <main class="options-main">
+      <section class="form-group">
+        <label for="bridge-mode" class="form-label">上报模式 (Bridge Mode)</label>
+        <select id="bridge-mode" class="form-select">
+          <option value="auto">Auto (优先本地，失败自动切换远程)</option>
+          <option value="local">Local (仅请求本地服务)</option>
+          <option value="remote">Remote (仅请求远程隧道服务)</option>
+        </select>
+        <p class="help-text">推荐使用 Auto 模式，本地离线时自动切换至已配置的公网隧道。</p>
+      </section>
+
+      <section class="form-group">
+        <label for="local-base-url" class="form-label">Local Base URL</label>
+        <input type="text" id="local-base-url" class="form-input" placeholder="http://127.0.0.1:28766">
+        <p class="help-text">本地 Coding Tools MCP 监听的基础地址。</p>
+      </section>
+
+      <section class="form-group">
+        <label for="remote-base-url" class="form-label">Remote Base URL</label>
+        <input type="text" id="remote-base-url" class="form-input" placeholder="https://xxxx.example.com">
+        <p class="help-text">远程隧道地址（复用 Cloudflare / FRP 隧道），无需带路径。</p>
+      </section>
+
+      <section class="form-group">
+        <label for="bridge-token" class="form-label">Browser Bridge Token</label>
+        <div class="input-with-action">
+          <input type="password" id="bridge-token" class="form-input" placeholder="在 Coding Tools Desktop 设置中获取">
+          <button type="button" id="toggle-token-btn" class="btn btn-secondary">显示</button>
+        </div>
+        <p class="help-text">在 Coding Tools 桌面端「设置」→「共享密钥」或工作区配置中生成并复制。</p>
+      </section>
+
+      <div class="actions-row">
+        <button type="button" id="save-btn" class="btn btn-primary">保存配置</button>
+        <button type="button" id="test-btn" class="btn btn-secondary">测试连接</button>
+        <span id="save-status" class="status-msg"></span>
+      </div>
+
+      <div id="test-result-box" class="test-result-box hidden">
+        <div class="test-result-title" id="test-result-title">测试结果</div>
+        <div class="test-result-detail" id="test-result-detail"></div>
+      </div>
+    </main>
+
+    <footer class="options-footer">
+      <p>💡 隐私保护说明：本扩展仅观测会话 ID、Turn ID 与模型元数据，绝不采集、上传聊天正文与助手回答。</p>
+    </footer>
+  </div>
+  <script src="../options.js"></script>
+</body>
+</html>

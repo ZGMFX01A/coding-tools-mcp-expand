@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Coding Tools ChatGPT Turn Observer",
+  "version": "0.1.0",
+  "description": "Observes ChatGPT conversation boundaries and turn lifecycles for Coding Tools MCP.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["bridge.js"],
+      "css": ["styles/overlay.css"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ],
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  }
+}
