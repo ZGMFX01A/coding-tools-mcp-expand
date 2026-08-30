@@ -498,7 +498,7 @@ pub enum CallDecision {
         error_payload: Value,
         content_text: String,
     },
-    /// 未托管（无 session 时降级）
+    /// 未托管（仅在预算显式禁用时返回）
     Unmanaged,
 }
 
@@ -544,6 +544,181 @@ impl AgentTurnBudgetManager {
             return format!("{}***", &trimmed[..trimmed.len().min(4)]);
         }
         format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
+    }
+
+    /// 对尚未建立状态的 Browser Turn 也执行完整的阶段门禁。
+    ///
+    /// Browser 事件可能先于第一次 MCP 调用到达，因此新建状态时的
+    /// `effective_started_at` 可能已经位于 WRAP_UP/FINALIZATION 甚至 HARD_STOP。
+    /// 这里不能把首次调用无条件视为 NORMAL，否则换 key、延迟首调或状态淘汰
+    /// 都会形成预算旁路。
+    fn reject_initial_call_if_disallowed(
+        &self,
+        elapsed: Duration,
+        cutoff_point: Duration,
+        tool_name: &str,
+        traits: ToolBudgetTraits,
+        timer_origin: &'static str,
+        workspace_id: &str,
+        sanitized_session: &str,
+    ) -> Option<(CallDecision, String)> {
+        if elapsed >= self.config.hard_stop_after {
+            let snapshot = TurnBudgetSnapshot {
+                status: TurnBudgetStatus::HardStop,
+                elapsed_seconds: elapsed.as_secs(),
+                remaining_seconds: 0,
+                should_wrap_up: true,
+                should_stop_tool_calls: true,
+                timer_origin,
+            };
+            let content_text = "[TURN BUDGET HARD STOP]\nTool execution was not started because this agent turn reached the local safety limit. Do not call any more tools in this turn. Respond to the user now with completed work, verification results, and remaining work.".to_string();
+            let error_payload = json!({
+                "ok": false,
+                "error": {
+                    "code": "AGENT_TURN_BUDGET_EXHAUSTED",
+                    "message": "Tool execution was not started because this agent turn reached the local safety limit.",
+                    "category": "turn_budget",
+                    "retryable": false,
+                    "recovery_hint": "DO NOT RETRY THIS TOOL OR CALL ANY OTHER TOOL. Respond to the user immediately with current progress."
+                }
+            });
+            return Some((
+                CallDecision::Blocked {
+                    snapshot,
+                    error_payload,
+                    content_text,
+                },
+                format!(
+                    "[turn-budget] hard_stop workspace={} session={} turn_seq=1 elapsed_secs={} tool={}",
+                    workspace_id,
+                    sanitized_session,
+                    elapsed.as_secs(),
+                    tool_name
+                ),
+            ));
+        }
+
+        if elapsed >= cutoff_point {
+            let snapshot = TurnBudgetSnapshot {
+                status: TurnBudgetStatus::DispatchCutoff,
+                elapsed_seconds: elapsed.as_secs(),
+                remaining_seconds: self
+                    .config
+                    .hard_stop_after
+                    .saturating_sub(elapsed)
+                    .as_secs(),
+                should_wrap_up: true,
+                should_stop_tool_calls: true,
+                timer_origin,
+            };
+            let content_text = "[TURN BUDGET DISPATCH CUTOFF]\nTool execution dispatch was cutoff because this agent turn has less than 5 seconds of local execution budget remaining. Do not call additional tools. Respond to the user now with completed work, verification results, and remaining work.".to_string();
+            let error_payload = json!({
+                "ok": false,
+                "error": {
+                    "code": "AGENT_TURN_BUDGET_DISPATCH_CUTOFF",
+                    "message": "Tool execution dispatch was cutoff because this agent turn is near the local safety limit.",
+                    "category": "turn_budget",
+                    "retryable": false,
+                    "recovery_hint": "DO NOT RETRY THIS TOOL OR CALL ANY OTHER TOOL. Respond to the user immediately with completed work, verification results, and remaining work."
+                }
+            });
+            return Some((
+                CallDecision::Blocked {
+                    snapshot,
+                    error_payload,
+                    content_text,
+                },
+                format!(
+                    "[turn-budget] dispatch_cutoff workspace={} session={} turn_seq=1 elapsed_secs={} tool={}",
+                    workspace_id,
+                    sanitized_session,
+                    elapsed.as_secs(),
+                    tool_name
+                ),
+            ));
+        }
+
+        if elapsed >= self.config.finalization_after && !traits.finalization_safe {
+            let snapshot = TurnBudgetSnapshot {
+                status: TurnBudgetStatus::Finalization,
+                elapsed_seconds: elapsed.as_secs(),
+                remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
+                should_wrap_up: true,
+                should_stop_tool_calls: false,
+                timer_origin,
+            };
+            let content_text = format!(
+                "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in finalization mode (elapsed: {}s). Code changes, new executions, searches, and external tools are no longer allowed. Use only finalization-safe tools (e.g. read_file, git_status, git_diff, history_session_checkpoint, finish_task) to verify the current state, then respond to the user immediately.",
+                tool_name,
+                elapsed.as_secs()
+            );
+            let error_payload = json!({
+                "ok": false,
+                "error": {
+                    "code": "AGENT_TURN_WRAP_UP_RESTRICTED",
+                    "message": format!("Tool '{}' is blocked in finalization mode.", tool_name),
+                    "category": "turn_budget",
+                    "retryable": false,
+                    "recovery_hint": "Do not retry this tool. This turn is in finalization mode. Code changes, new executions, searches, and external tools are no longer allowed. Use only finalization-safe tools to verify the current state, then respond to the user immediately."
+                }
+            });
+            return Some((
+                CallDecision::Restricted {
+                    snapshot,
+                    error_payload,
+                    content_text,
+                },
+                format!(
+                    "[turn-budget] tool_rejected_by_finalization workspace={} session={} turn_seq=1 elapsed_secs={} tool={}",
+                    workspace_id,
+                    sanitized_session,
+                    elapsed.as_secs(),
+                    tool_name
+                ),
+            ));
+        }
+
+        if elapsed >= self.config.wrap_up_after && !traits.wrap_up_allowed {
+            let snapshot = TurnBudgetSnapshot {
+                status: TurnBudgetStatus::WrapUp,
+                elapsed_seconds: elapsed.as_secs(),
+                remaining_seconds: cutoff_point.saturating_sub(elapsed).as_secs(),
+                should_wrap_up: true,
+                should_stop_tool_calls: false,
+                timer_origin,
+            };
+            let content_text = format!(
+                "[TURN BUDGET RESTRICTED]\nTool execution of '{}' was blocked because this turn is in wrap-up mode (elapsed: {}s). New investigation and task expansion are no longer allowed. Finish only the already identified work using finalization-safe tools, then respond to the user.",
+                tool_name,
+                elapsed.as_secs()
+            );
+            let error_payload = json!({
+                "ok": false,
+                "error": {
+                    "code": "AGENT_TURN_WRAP_UP_RESTRICTED",
+                    "message": format!("Tool '{}' is blocked in wrap-up mode.", tool_name),
+                    "category": "turn_budget",
+                    "retryable": false,
+                    "recovery_hint": "Do not retry this tool. This turn is in wrap-up mode. New investigation is no longer allowed. Finish only the already identified work using finalization-safe tools, then respond to the user."
+                }
+            });
+            return Some((
+                CallDecision::Restricted {
+                    snapshot,
+                    error_payload,
+                    content_text,
+                },
+                format!(
+                    "[turn-budget] tool_rejected_by_wrap_up workspace={} session={} turn_seq=1 elapsed_secs={} tool={}",
+                    workspace_id,
+                    sanitized_session,
+                    elapsed.as_secs(),
+                    tool_name
+                ),
+            ));
+        }
+
+        None
     }
 
     /// 根据解析后的 TurnIdentity 进行评估与状态登记
@@ -650,48 +825,61 @@ impl AgentTurnBudgetManager {
                     now
                 };
 
-                // 首个观测到的调用，创建新 Turn
-                let new_state = AgentTurnState {
-                    turn_seq: 1,
-                    phase: TurnLifecyclePhase::Active,
-                    started_at: start_time,
-                    timer_origin: initial_timer_origin,
-                    last_call_started_at: now,
-                    last_call_completed_at: None,
-                    active_calls: 1,
-                    warning_emitted: false,
-                    wrap_up_emitted: false,
-                    finalization_emitted: false,
-                    hard_stopped_at: None,
-                };
-                states.insert(key.clone(), new_state);
-
                 let elapsed = now.saturating_duration_since(start_time);
                 let cutoff = self.config.hard_stop_after.saturating_sub(self.config.deadline_reserve);
-                let runtime_budget = cutoff.saturating_sub(elapsed);
-                let snapshot = TurnBudgetSnapshot {
-                    status: TurnBudgetStatus::Normal,
-                    elapsed_seconds: elapsed.as_secs(),
-                    remaining_seconds: runtime_budget.as_secs(),
-                    should_wrap_up: false,
-                    should_stop_tool_calls: false,
-                    timer_origin: initial_timer_origin,
-                };
+                if let Some((decision, log_line)) = self.reject_initial_call_if_disallowed(
+                    elapsed,
+                    cutoff,
+                    tool_name,
+                    traits,
+                    initial_timer_origin,
+                    &workspace_id,
+                    &sanitized_session,
+                ) {
+                    (decision, Some(log_line))
+                } else {
 
-                let guard = TurnCallGuard::new(self.clone(), key.clone());
-                (
-                    CallDecision::Allowed {
-                        guard,
-                        runtime_budget,
-                        snapshot,
-                        emit_full_warning: false,
-                        emit_urgent: false,
-                    },
-                    Some(format!(
-                        "[turn-budget] start workspace={} session={} turn_seq=1 origin={}",
-                        workspace_id, sanitized_session, initial_timer_origin
-                    )),
-                )
+                    // 首个观测到的调用，创建新 Turn
+                    let new_state = AgentTurnState {
+                        turn_seq: 1,
+                        phase: TurnLifecyclePhase::Active,
+                        started_at: start_time,
+                        timer_origin: initial_timer_origin,
+                        last_call_started_at: now,
+                        last_call_completed_at: None,
+                        active_calls: 1,
+                        warning_emitted: false,
+                        wrap_up_emitted: false,
+                        finalization_emitted: false,
+                        hard_stopped_at: None,
+                    };
+                    states.insert(key.clone(), new_state);
+
+                    let runtime_budget = cutoff.saturating_sub(elapsed);
+                    let snapshot = TurnBudgetSnapshot {
+                        status: TurnBudgetStatus::Normal,
+                        elapsed_seconds: elapsed.as_secs(),
+                        remaining_seconds: runtime_budget.as_secs(),
+                        should_wrap_up: false,
+                        should_stop_tool_calls: false,
+                        timer_origin: initial_timer_origin,
+                    };
+
+                    let guard = TurnCallGuard::new(self.clone(), key.clone());
+                    (
+                        CallDecision::Allowed {
+                            guard,
+                            runtime_budget,
+                            snapshot,
+                            emit_full_warning: false,
+                            emit_urgent: false,
+                        },
+                        Some(format!(
+                            "[turn-budget] start workspace={} session={} turn_seq=1 origin={}",
+                            workspace_id, sanitized_session, initial_timer_origin
+                        )),
+                    )
+                }
             }
             Some(state) => {
                 if state.phase == TurnLifecyclePhase::Closing {
@@ -1103,7 +1291,8 @@ impl AgentTurnBudgetManager {
         decision
     }
 
-    /// 在工具调用前进行评估与状态登记（兼容旧 SessionFallback 调用）
+    /// 在工具调用前进行评估与状态登记（兼容旧调用方）。
+    /// 缺失 session 也必须进入工作区级 fallback，不能返回 Unmanaged 绕过预算。
     pub fn start_call(
         self: &Arc<Self>,
         workspace_id: &str,
@@ -1112,19 +1301,17 @@ impl AgentTurnBudgetManager {
         is_external: bool,
         args: &Value,
     ) -> CallDecision {
-        let session = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(s) => s.to_string(),
-            None => return CallDecision::Unmanaged,
-        };
-        self.start_call_with_identity(
-            TurnIdentity::SessionFallback {
+        let identity = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => TurnIdentity::SessionFallback {
                 workspace_id: workspace_id.to_string(),
-                session_id: session,
+                session_id: s.to_string(),
             },
-            tool_name,
-            is_external,
-            args,
-        )
+            None => TurnIdentity::WorkspaceFallback {
+                workspace_id: workspace_id.to_string(),
+                fallback_id: format!("unmanaged_ws_{}", workspace_id),
+            },
+        };
+        self.start_call_with_identity(identity, tool_name, is_external, args)
     }
 
     /// 在工具调用完成时更新 active_calls 和 last_call_completed_at，并在 Closing 状态完全结束时安全回收

@@ -572,7 +572,47 @@ impl TurnCorrelator {
             );
         }
 
-        // 4. 没有候选 (candidates.len() == 0)
+        // 4. 没有当前活跃候选：如果 session 已经建立了可靠 binding，不能因为
+        // stream 静默/长工具执行导致 Browser Turn 被重置为一个更年轻的
+        // SessionFallback。只要注册表中的原上下文尚未显式关闭、被下一轮替换
+        // 或过期，就继续复用原始 Browser 起始时间。
+        if let Some(binding) = bindings.get_mut(&binding_key) {
+            let binding_is_fresh = now.saturating_duration_since(binding.last_used_at) <= self.binding_ttl;
+            if binding_is_fresh {
+                if let Some(ctx) = registry.get_turn_context_by_instance(
+                    workspace_id,
+                    &binding.observer_id,
+                    &binding.tab_instance_id,
+                ) {
+                    let context_matches = ctx.tab_id == binding.tab_id
+                        && ctx.turn_id == binding.turn_id
+                        && ctx.status != BrowserTurnStatus::CompletedByNextTurn
+                        && ctx.status != BrowserTurnStatus::Closed
+                        && ctx.status != BrowserTurnStatus::Expired;
+                    if context_matches {
+                        binding.last_used_at = now;
+                        binding.conversation_id = ctx.conversation_id.clone();
+                        let conv_id = ctx
+                            .conversation_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown_conv".to_string());
+                        return (
+                            CorrelationConfidence::ExistingBinding,
+                            TurnIdentity::Browser {
+                                workspace_id: workspace_id.to_string(),
+                                session_id: session_id.to_string(),
+                                conversation_id: conv_id,
+                                turn_id: ctx.turn_id,
+                                effective_started_at: ctx.effective_started_at,
+                                timer_origin: ctx.timer_origin,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // 5. 没有候选且没有可复用的 binding，才允许 fallback。
         bindings.remove(&binding_key);
         (
             CorrelationConfidence::None,

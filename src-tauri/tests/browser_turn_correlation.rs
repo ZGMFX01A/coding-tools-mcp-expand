@@ -96,6 +96,81 @@ fn test_single_active_candidate_and_binding_reuse() {
 }
 
 #[test]
+fn test_established_binding_survives_stream_idle_without_budget_fallback() {
+    let registry = BrowserTurnRegistry::default();
+    let correlator = TurnCorrelator::default();
+    let clock = Arc::new(TestClock::new());
+    let now = clock.now();
+
+    registry.record_event(
+        "ws_test",
+        BrowserTurnEvent {
+            schema_version: 1,
+            event_id: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb7e".to_string(),
+            tab_instance_id: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string(),
+            observer_id: "obs_idle".to_string(),
+            tab_id: 110,
+            sequence: 1,
+            event: BrowserTurnEventKind::TurnStarted,
+            workspace_id: "ws_test".to_string(),
+            conversation_id: Some("conv_idle".to_string()),
+            turn_id: "turn_idle".to_string(),
+            request_id: Some("req_idle".to_string()),
+            started_at: 1000,
+            completed_at: None,
+            requested_model: None,
+            actual_model: None,
+        },
+        now,
+    );
+
+    let (initial_confidence, _) = correlator.correlate("ws_test", "sess_idle", &registry, now);
+    assert_eq!(initial_confidence, CorrelationConfidence::SingleActiveCandidate);
+
+    registry.record_event(
+        "ws_test",
+        BrowserTurnEvent {
+            schema_version: 1,
+            event_id: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb7f".to_string(),
+            tab_instance_id: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".to_string(),
+            observer_id: "obs_idle".to_string(),
+            tab_id: 110,
+            sequence: 2,
+            event: BrowserTurnEventKind::StreamCompleted,
+            workspace_id: "ws_test".to_string(),
+            conversation_id: Some("conv_idle".to_string()),
+            turn_id: "turn_idle".to_string(),
+            request_id: Some("req_idle".to_string()),
+            started_at: 1000,
+            completed_at: Some(2000),
+            requested_model: None,
+            actual_model: None,
+        },
+        now,
+    );
+
+    // 超过 15 秒静默候选窗口后，不得因为没有“活跃候选”而切换到新预算起点。
+    clock.advance(Duration::from_secs(16));
+    assert!(registry.get_active_candidates("ws_test", clock.now()).is_empty());
+
+    let (confidence, identity) = correlator.correlate("ws_test", "sess_idle", &registry, clock.now());
+    assert_eq!(confidence, CorrelationConfidence::ExistingBinding);
+    match identity {
+        TurnIdentity::Browser {
+            conversation_id,
+            turn_id,
+            timer_origin,
+            ..
+        } => {
+            assert_eq!(conversation_id, "conv_idle");
+            assert_eq!(turn_id, "turn_idle");
+            assert_eq!(timer_origin, "server_skew_fallback");
+        }
+        _ => panic!("Expected established Browser binding to survive stream idle"),
+    }
+}
+
+#[test]
 fn test_ambiguous_multiple_candidates_falls_back_safely() {
     let registry = BrowserTurnRegistry::default();
     let correlator = TurnCorrelator::default();

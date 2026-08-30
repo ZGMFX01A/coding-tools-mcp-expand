@@ -112,6 +112,58 @@ fn test_turn_budget_initialization_and_first_turn() {
 }
 
 #[test]
+fn test_browser_first_call_honors_elapsed_stage() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock.clone()));
+    let identity = coding_tools_mcp_desktop_lib::mcp::browser_turn::TurnIdentity::Browser {
+        workspace_id: "ws-browser".to_string(),
+        session_id: "session-browser".to_string(),
+        conversation_id: "conversation-browser".to_string(),
+        turn_id: "turn-browser".to_string(),
+        effective_started_at: t0,
+        timer_origin: "browser_observed_turn_start",
+    };
+
+    // 即使这是该 Turn 的第一次 MCP 调用，预算起点也已经进入 FINALIZATION。
+    clock.advance(Duration::from_millis(2100));
+    let finalization = manager.start_call_with_identity(
+        identity.clone(),
+        "list_files",
+        false,
+        &json!({}),
+    );
+    match finalization {
+        CallDecision::Restricted { snapshot, .. } => {
+            assert_eq!(snapshot.status, TurnBudgetStatus::Finalization);
+            assert_eq!(snapshot.elapsed_seconds, 2);
+        }
+        _ => panic!("Expected first Browser call to be restricted in FINALIZATION"),
+    }
+
+    // 被拒绝的首次调用不得创建一个可以绕过门禁的状态。
+    clock.advance(Duration::from_millis(1000));
+    let hard_stop = manager.start_call_with_identity(identity, "list_files", false, &json!({}));
+    assert!(matches!(hard_stop, CallDecision::Blocked { .. }));
+}
+
+#[test]
+fn test_legacy_missing_session_is_workspace_managed() {
+    let t0 = Instant::now();
+    let clock = Arc::new(MockBudgetClock::new(t0));
+    let config = AgentTurnBudgetConfig::for_test_ms(
+        1000, 1500, 2000, 3000, 200, 500, 800, 4000, 500,
+    );
+    let manager = Arc::new(AgentTurnBudgetManager::with_clock(config, clock));
+
+    let decision = manager.start_call("ws-legacy", None, "list_files", false, &json!({}));
+    assert!(matches!(decision, CallDecision::Allowed { .. }));
+}
+
+#[test]
 fn test_raii_guard_guarantees_active_calls_cleanup() {
     let t0 = Instant::now();
     let clock = Arc::new(MockBudgetClock::new(t0));

@@ -321,11 +321,34 @@ export class TurnObserverOverlay {
     return row;
   }
 
-  private async openSettings() {
-    if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
-      chrome.runtime.openOptionsPage();
-    } else {
-      this.openInlineSettingsModal();
+  private openSettings() {
+    // 设置入口必须在当前页面可用。Edge 可能拦截 chrome-extension:// 的
+    // Options 页面，因此不能把它作为唯一入口。
+    this.openInlineSettingsModal();
+  }
+
+  private openExtensionOptionsPage() {
+    const runtime = typeof chrome !== 'undefined' ? chrome.runtime : undefined;
+    const optionsUrl = runtime?.getURL?.('options/options.html');
+
+    if (runtime?.openOptionsPage) {
+      try {
+        const result = runtime.openOptionsPage();
+        // openOptionsPage 在不同浏览器版本中可能返回 void 或 Promise。
+        // Promise 被拒绝时再尝试直接打开正确的扩展资源路径。
+        if (result && typeof (result as Promise<void>).catch === 'function') {
+          (result as Promise<void>).catch(() => {
+            if (optionsUrl) window.open(optionsUrl, '_blank', 'noopener,noreferrer');
+          });
+        }
+        return;
+      } catch {
+        // 继续走直接 URL 备用路径。
+      }
+    }
+
+    if (optionsUrl) {
+      window.open(optionsUrl, '_blank', 'noopener,noreferrer');
     }
   }
 
@@ -438,13 +461,48 @@ export class TurnObserverOverlay {
     fgRemote.appendChild(inputRemote);
     body.appendChild(fgRemote);
 
-    // 安全提示：Token 仅在独立扩展选项页中配置
+    // Browser Bridge Token
+    const fgToken = document.createElement('div');
+    fgToken.className = 'ct-form-group';
+    const lblToken = document.createElement('label');
+    lblToken.className = 'ct-form-label';
+    lblToken.htmlFor = 'ct-modal-token';
+    lblToken.textContent = 'Browser Bridge Token';
+
+    const tokenWrap = document.createElement('div');
+    tokenWrap.className = 'ct-input-password-wrap';
+    const inputToken = document.createElement('input');
+    inputToken.type = 'password';
+    inputToken.className = 'ct-input';
+    inputToken.id = 'ct-modal-token';
+    inputToken.autocomplete = 'off';
+    inputToken.value = current.bridgeToken;
+    inputToken.placeholder = '从 Coding Tools Desktop 设置中复制';
+
+    const toggleTokenBtn = document.createElement('button');
+    toggleTokenBtn.type = 'button';
+    toggleTokenBtn.className = 'ct-eye-btn';
+    toggleTokenBtn.id = 'ct-modal-toggle-token';
+    toggleTokenBtn.title = '显示/隐藏 Token';
+    toggleTokenBtn.textContent = '显示';
+    tokenWrap.appendChild(inputToken);
+    tokenWrap.appendChild(toggleTokenBtn);
+    fgToken.appendChild(lblToken);
+    fgToken.appendChild(tokenWrap);
+
+    const tokenHint = document.createElement('span');
+    tokenHint.className = 'ct-form-hint';
+    tokenHint.textContent = '密钥不会显示在页面文字中，保存后写入扩展本地存储。';
+    fgToken.appendChild(tokenHint);
+    body.appendChild(fgToken);
+
+    // 独立选项页作为辅助入口；当前页无法打开时仍可直接在上面的密码框配置。
     const fgSecurity = document.createElement('div');
     fgSecurity.className = 'ct-form-group';
     const securityTip = document.createElement('div');
     securityTip.className = 'ct-form-hint';
     securityTip.style.color = '#38bdf8';
-    securityTip.textContent = '🔒 安全提示：Browser Bridge 密钥在扩展独立选项页（Options Page）中安全存储与管理，绝不暴露给 ChatGPT 网页 DOM。';
+    securityTip.textContent = '需要完整配置时，也可以打开扩展独立选项页。';
     fgSecurity.appendChild(securityTip);
     body.appendChild(fgSecurity);
 
@@ -455,13 +513,13 @@ export class TurnObserverOverlay {
     openOptionsBtn.type = 'button';
     openOptionsBtn.className = 'ct-btn ct-btn-secondary';
     openOptionsBtn.id = 'ct-modal-open-options';
-    openOptionsBtn.textContent = '⚙️ 打开选项页配置密钥';
+    openOptionsBtn.textContent = '⚙️ 打开独立选项页';
 
     const saveBtn = document.createElement('button');
     saveBtn.type = 'button';
     saveBtn.className = 'ct-btn ct-btn-primary';
     saveBtn.id = 'ct-modal-save-btn';
-    saveBtn.textContent = '保存模式与地址';
+    saveBtn.textContent = '保存配置';
 
     actionsWrap.appendChild(openOptionsBtn);
     actionsWrap.appendChild(saveBtn);
@@ -494,6 +552,8 @@ export class TurnObserverOverlay {
     const openOptionsBtn = this.modalContainer.querySelector('#ct-modal-open-options') as HTMLButtonElement | null;
     const saveBtn = this.modalContainer.querySelector('#ct-modal-save-btn') as HTMLButtonElement | null;
     const statusEl = this.modalContainer.querySelector('#ct-modal-status') as HTMLDivElement | null;
+    const tokenInput = this.modalContainer.querySelector('#ct-modal-token') as HTMLInputElement | null;
+    const toggleTokenBtn = this.modalContainer.querySelector('#ct-modal-toggle-token') as HTMLButtonElement | null;
 
     backdrop?.addEventListener('click', (e) => {
       if (e.target === backdrop) {
@@ -506,11 +566,14 @@ export class TurnObserverOverlay {
     });
 
     openOptionsBtn?.addEventListener('click', () => {
-      if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
-        chrome.runtime.openOptionsPage();
-      } else {
-        window.open(chrome.runtime.getURL('options.html'), '_blank');
-      }
+      this.openExtensionOptionsPage();
+    });
+
+    toggleTokenBtn?.addEventListener('click', () => {
+      if (!tokenInput) return;
+      const isVisible = tokenInput.type === 'text';
+      tokenInput.type = isVisible ? 'password' : 'text';
+      toggleTokenBtn.textContent = isVisible ? '显示' : '隐藏';
     });
 
     const getFormData = () => {
@@ -518,12 +581,13 @@ export class TurnObserverOverlay {
       const mode = (modeRadio?.value || 'auto') as BridgeMode;
       const localUrl = (this.modalContainer?.querySelector('#ct-modal-local-url') as HTMLInputElement)?.value?.trim() || `http://127.0.0.1:${DEFAULT_LOCAL_PORT}`;
       const remoteUrl = (this.modalContainer?.querySelector('#ct-modal-remote-url') as HTMLInputElement)?.value?.trim() || '';
-      return { mode, localUrl, remoteUrl };
+      const bridgeToken = (this.modalContainer?.querySelector('#ct-modal-token') as HTMLInputElement)?.value?.trim() || '';
+      return { mode, localUrl, remoteUrl, bridgeToken };
     };
 
     saveBtn?.addEventListener('click', async () => {
       if (!statusEl) return;
-      const { mode, localUrl, remoteUrl } = getFormData();
+      const { mode, localUrl, remoteUrl, bridgeToken } = getFormData();
       statusEl.className = 'ct-test-status info';
       statusEl.textContent = '💾 正在保存配置…';
       try {
@@ -531,6 +595,7 @@ export class TurnObserverOverlay {
           bridgeMode: mode,
           localBaseUrl: localUrl,
           remoteBaseUrl: remoteUrl,
+          bridgeToken,
         });
         statusEl.className = 'ct-test-status success';
         statusEl.textContent = '✅ 配置已保存！';
