@@ -39,7 +39,15 @@ import {
         settings.overlayPosition,
         settings.overlayCollapsed,
         (pos) => saveSettings({ overlayPosition: pos }),
-        (collapsed) => saveSettings({ overlayCollapsed: collapsed })
+        (collapsed) => saveSettings({ overlayCollapsed: collapsed }),
+        async () => {
+          settings = await loadSettings();
+          if (settings.bridgeToken) {
+            tabState.bridgeStatus = 'idle';
+            tabState.bridgeMessage = null;
+          }
+          updateUi();
+        }
       );
     }
     overlay.updateState(tabState);

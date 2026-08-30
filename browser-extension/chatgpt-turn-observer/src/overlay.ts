@@ -1,12 +1,15 @@
 import { formatModelDisplayName } from './parsers';
-import type { TabTurnState } from './types';
+import { loadSettings, saveSettings } from './settings';
+import type { BridgeMode, ObserverSettings, TabTurnState } from './types';
 
 export class TurnObserverOverlay {
   private container: HTMLDivElement | null = null;
+  private modalContainer: HTMLDivElement | null = null;
   private isCollapsed = false;
   private position = { x: 0, y: 0 };
   private onPositionChange?: (pos: { x: number; y: number }) => void;
   private onCollapsedChange?: (collapsed: boolean) => void;
+  public onSettingsSaved?: () => void;
 
   // 计时器状态
   private timerInterval: number | null = null;
@@ -17,11 +20,13 @@ export class TurnObserverOverlay {
     initialPos: { x: number; y: number } | null,
     initialCollapsed: boolean,
     onPositionChange?: (pos: { x: number; y: number }) => void,
-    onCollapsedChange?: (collapsed: boolean) => void
+    onCollapsedChange?: (collapsed: boolean) => void,
+    onSettingsSaved?: () => void
   ) {
     this.isCollapsed = initialCollapsed;
     this.onPositionChange = onPositionChange;
     this.onCollapsedChange = onCollapsedChange;
+    this.onSettingsSaved = onSettingsSaved;
 
     // 默认放在右上角
     const defaultX = Math.max(20, window.innerWidth - 240);
@@ -209,16 +214,212 @@ export class TurnObserverOverlay {
     this.bindEvents();
   }
 
-  private openSettings() {
-    try {
-      if (typeof chrome !== 'undefined' && chrome.runtime?.openOptionsPage) {
-        chrome.runtime.openOptionsPage();
-      } else if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
-        window.open(chrome.runtime.getURL('options/options.html'), '_blank');
-      }
-    } catch (e) {
-      console.warn('[TurnObserver] 打开设置页失败:', e);
+  private async openSettings() {
+    this.openInlineSettingsModal();
+  }
+
+  private async openInlineSettingsModal() {
+    if (this.modalContainer) {
+      this.closeInlineSettingsModal();
     }
+
+    const current = await loadSettings();
+
+    this.modalContainer = document.createElement('div');
+    this.modalContainer.className = 'ct-modal-root';
+    this.modalContainer.innerHTML = `
+      <div class="ct-modal-backdrop" id="ct-modal-backdrop">
+        <div class="ct-modal-card">
+          <div class="ct-modal-header">
+            <div class="ct-modal-title">
+              <span class="ct-turn-observer-logo-dot"></span>
+              <span>Coding Tools 桥接设置</span>
+            </div>
+            <button type="button" class="ct-modal-close-btn" id="ct-modal-close" title="关闭">✕</button>
+          </div>
+          <div class="ct-modal-body">
+            <div class="ct-form-group">
+              <label class="ct-form-label">上报模式 (Bridge Mode)</label>
+              <div class="ct-radio-group">
+                <label class="ct-radio-label">
+                  <input type="radio" name="ct-modal-mode" value="auto" ${current.bridgeMode === 'auto' ? 'checked' : ''}>
+                  <span>Auto (自动探测，推荐)</span>
+                </label>
+                <label class="ct-radio-label">
+                  <input type="radio" name="ct-modal-mode" value="local" ${current.bridgeMode === 'local' ? 'checked' : ''}>
+                  <span>Local (仅本地)</span>
+                </label>
+                <label class="ct-radio-label">
+                  <input type="radio" name="ct-modal-mode" value="remote" ${current.bridgeMode === 'remote' ? 'checked' : ''}>
+                  <span>Remote (仅远端公网)</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="ct-form-group">
+              <label class="ct-form-label" for="ct-modal-local-url">Local Base URL</label>
+              <input type="text" class="ct-input" id="ct-modal-local-url" value="${current.localBaseUrl}" placeholder="http://127.0.0.1:40111" />
+            </div>
+
+            <div class="ct-form-group">
+              <label class="ct-form-label" for="ct-modal-remote-url">Remote Base URL</label>
+              <input type="text" class="ct-input" id="ct-modal-remote-url" value="${current.remoteBaseUrl}" placeholder="https://mcp-myws.example.com" />
+            </div>
+
+            <div class="ct-form-group">
+              <label class="ct-form-label" for="ct-modal-token">Browser Bridge Token (必填)</label>
+              <div class="ct-input-password-wrap">
+                <input type="password" class="ct-input" id="ct-modal-token" value="${current.bridgeToken}" placeholder="在 Desktop 桌面端设置 -> 共享密钥中复制" />
+                <button type="button" class="ct-eye-btn" id="ct-modal-toggle-token" title="显示/隐藏 Token">👁️</button>
+              </div>
+              <span class="ct-form-hint">在 Coding Tools 桌面端“设置 -> 共享密钥 -> ChatGPT Observer 桥接密钥”中复制</span>
+            </div>
+
+            <div class="ct-modal-actions">
+              <button type="button" class="ct-btn ct-btn-secondary" id="ct-modal-test-btn">测试连接</button>
+              <button type="button" class="ct-btn ct-btn-primary" id="ct-modal-save-btn">保存配置</button>
+            </div>
+
+            <div class="ct-test-status" id="ct-modal-status"></div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(this.modalContainer);
+    this.bindModalEvents();
+  }
+
+  private closeInlineSettingsModal() {
+    if (this.modalContainer) {
+      this.modalContainer.remove();
+      this.modalContainer = null;
+    }
+  }
+
+  private bindModalEvents() {
+    if (!this.modalContainer) return;
+
+    const backdrop = this.modalContainer.querySelector('#ct-modal-backdrop');
+    const closeBtn = this.modalContainer.querySelector('#ct-modal-close');
+    const toggleTokenBtn = this.modalContainer.querySelector('#ct-modal-toggle-token');
+    const tokenInput = this.modalContainer.querySelector('#ct-modal-token') as HTMLInputElement | null;
+    const testBtn = this.modalContainer.querySelector('#ct-modal-test-btn') as HTMLButtonElement | null;
+    const saveBtn = this.modalContainer.querySelector('#ct-modal-save-btn') as HTMLButtonElement | null;
+    const statusEl = this.modalContainer.querySelector('#ct-modal-status') as HTMLDivElement | null;
+
+    backdrop?.addEventListener('click', (e) => {
+      if (e.target === backdrop) {
+        this.closeInlineSettingsModal();
+      }
+    });
+
+    closeBtn?.addEventListener('click', () => {
+      this.closeInlineSettingsModal();
+    });
+
+    toggleTokenBtn?.addEventListener('click', () => {
+      if (!tokenInput) return;
+      tokenInput.type = tokenInput.type === 'password' ? 'text' : 'password';
+    });
+
+    const getFormData = () => {
+      const modeRadio = this.modalContainer?.querySelector('input[name="ct-modal-mode"]:checked') as HTMLInputElement | null;
+      const mode = (modeRadio?.value || 'auto') as BridgeMode;
+      const localUrl = (this.modalContainer?.querySelector('#ct-modal-local-url') as HTMLInputElement)?.value?.trim() || 'http://127.0.0.1:40111';
+      const remoteUrl = (this.modalContainer?.querySelector('#ct-modal-remote-url') as HTMLInputElement)?.value?.trim() || '';
+      const token = (this.modalContainer?.querySelector('#ct-modal-token') as HTMLInputElement)?.value?.trim() || '';
+      return { mode, localUrl, remoteUrl, token };
+    };
+
+    testBtn?.addEventListener('click', async () => {
+      if (!statusEl) return;
+      const { mode, localUrl, remoteUrl, token } = getFormData();
+      if (!token) {
+        statusEl.className = 'ct-test-status error';
+        statusEl.textContent = '❌ 请先填写 Browser Bridge Token';
+        return;
+      }
+
+      statusEl.className = 'ct-test-status info';
+      statusEl.textContent = '⏳ 正在测试连接…';
+
+      const endpointsToTry: string[] = [];
+      if (mode === 'local') {
+        endpointsToTry.push(localUrl);
+      } else if (mode === 'remote') {
+        if (!remoteUrl) {
+          statusEl.className = 'ct-test-status error';
+          statusEl.textContent = '❌ 远程模式下必须填写 Remote Base URL';
+          return;
+        }
+        endpointsToTry.push(remoteUrl);
+      } else {
+        endpointsToTry.push(localUrl);
+        if (remoteUrl) endpointsToTry.push(remoteUrl);
+      }
+
+      let success = false;
+      let lastErr = '';
+
+      for (const base of endpointsToTry) {
+        const cleanBase = base.replace(/\/+$/, '');
+        const target = `${cleanBase}/internal/chatgpt-turn-observer/status`;
+        try {
+          const resp = await fetch(target, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+            },
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            statusEl.className = 'ct-test-status success';
+            statusEl.textContent = `✅ 连接成功: ${cleanBase} (v${data.version || '0.1.30'}, 工作区: ${data.workspace_id || 'default'})`;
+            success = true;
+            break;
+          } else {
+            const txt = await resp.text();
+            lastErr = `${cleanBase} 响应 HTTP ${resp.status}: ${txt}`;
+          }
+        } catch (e: any) {
+          lastErr = `${cleanBase} 请求失败: ${e.message || String(e)}`;
+        }
+      }
+
+      if (!success) {
+        statusEl.className = 'ct-test-status error';
+        statusEl.textContent = `❌ 测试连接失败: ${lastErr}`;
+      }
+    });
+
+    saveBtn?.addEventListener('click', async () => {
+      if (!statusEl) return;
+      const { mode, localUrl, remoteUrl, token } = getFormData();
+      saveBtn.disabled = true;
+
+      try {
+        await saveSettings({
+          bridgeMode: mode,
+          localBaseUrl: localUrl,
+          remoteBaseUrl: remoteUrl,
+          bridgeToken: token,
+        });
+
+        statusEl.className = 'ct-test-status success';
+        statusEl.textContent = '✅ 配置保存成功！';
+
+        this.onSettingsSaved?.();
+
+        setTimeout(() => {
+          this.closeInlineSettingsModal();
+        }, 600);
+      } catch (e: any) {
+        statusEl.className = 'ct-test-status error';
+        statusEl.textContent = `❌ 保存失败: ${e.message || String(e)}`;
+        saveBtn.disabled = false;
+      }
+    });
   }
 
   private bindEvents() {
