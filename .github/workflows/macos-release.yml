@@ -15,9 +15,9 @@ jobs:
   build-universal-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
@@ -44,7 +44,7 @@ jobs:
         run: npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
 
       - name: 上传 Actions 构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coding-tools-mcp-${{ github.ref_name }}-macos-universal
           path: |
@@ -60,7 +60,7 @@ jobs:
       contents: write
     steps:
       - name: 下载 macOS 构建产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: coding-tools-mcp-${{ github.ref_name }}-macos-universal
           path: dist/macos

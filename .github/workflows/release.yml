@@ -18,9 +18,9 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
@@ -50,7 +50,7 @@ jobs:
           Compress-Archive -Path src-tauri/target/release/coding-tools-mcp-desktop.exe -DestinationPath src-tauri/target/release/Coding.Tools.MCP_x64-portable.zip
 
       - name: 上传 Windows 产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-exe
           path: |
@@ -61,9 +61,9 @@ jobs:
   build-universal-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
@@ -90,7 +90,7 @@ jobs:
         run: npm run tauri -- build --target universal-apple-darwin --bundles dmg
 
       - name: 上传 macOS DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-dmg
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
@@ -99,9 +99,9 @@ jobs:
   build-browser-extension:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
@@ -127,7 +127,7 @@ jobs:
           zip -r ../../../chatgpt-turn-observer.zip .
 
       - name: 上传浏览器扩展 ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: browser-extension-zip
           path: chatgpt-turn-observer.zip
@@ -141,31 +141,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 下载 Windows EXE
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: windows-exe
           path: dist/windows
 
       - name: 下载 macOS DMG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: macos-dmg
           path: dist/macos
 
       - name: 下载浏览器扩展 ZIP
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: browser-extension-zip
           path: dist/extension
 
       - name: 创建 Release 并上传安装包与浏览器扩展
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           name: Coding Tools MCP ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          overwrite_files: true
           files: |
-            dist/windows/*.exe
-            dist/macos/*.dmg
-            dist/extension/*.zip
+            dist/windows/**/*.exe
+            dist/windows/**/*.zip
+            dist/macos/**/*.dmg
+            dist/extension/**/*.zip
