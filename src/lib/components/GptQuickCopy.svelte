@@ -15,10 +15,18 @@
     service: "mcp" | "actions";
     profile: WorkspaceProfile;
     publicMcpEndpoint?: string;
+    showEndpoint?: boolean;
     frpProfiles?: { id: string; name: string; server: string; serverPort: number }[];
   }
 
-  let { workspaceId, service, profile, publicMcpEndpoint = "", frpProfiles = [] }: Props = $props();
+  let {
+    workspaceId,
+    service,
+    profile,
+    publicMcpEndpoint = "",
+    showEndpoint = true,
+    frpProfiles = [],
+  }: Props = $props();
 
   let loading = $state(true);
   let secrets = $state<Record<string, string>>({});
@@ -95,21 +103,25 @@
 
 <article class="tx-card p-5">
   <div class="mb-4">
-    <p class="tx-section-label">GPT 配置</p>
+    <p class="tx-section-label">{service === "mcp" && !showEndpoint ? "连接凭据" : "GPT 配置"}</p>
     <p class="mt-1 text-xs text-[var(--color-text-muted)]">
       {service === "mcp"
-        ? "复制以下内容到 ChatGPT → 设置 → 连接器 / MCP"
+        ? showEndpoint
+          ? "复制以下内容到 ChatGPT → 设置 → 连接器 / MCP"
+          : "复制凭据到需要认证的 AI 客户端；MCP 地址见上方标准连接卡片"
         : "复制以下内容到 GPT 编辑器 → Actions"}
     </p>
   </div>
 
   <div class="grid gap-3">
     {#if service === "mcp"}
-      <CopyFieldRow
-        label="公网 MCP 地址"
-        value={publicMcpEndpoint}
-        hint="GPT 连接器里填这个 URL"
-      />
+      {#if showEndpoint}
+        <CopyFieldRow
+          label="公网 MCP 地址"
+          value={publicMcpEndpoint}
+          hint="GPT 连接器里填这个 URL"
+        />
+      {/if}
       {#if auth.type === "oauth"}
         <CopyFieldRow label="OAuth Client ID" value={secrets.oauth_client_id ?? auth.oauth_client_id} {loading} />
         <CopyFieldRow
