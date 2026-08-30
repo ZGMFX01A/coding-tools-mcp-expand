@@ -1,8 +1,7 @@
 import {
+  classifyUserTurnStart,
   conversationIdFromUrl,
   generateUuid,
-  isConversationEndpoint,
-  parseConversationRequest,
   parseWebSocketFrame,
   SseStreamParser,
 } from './parsers';
@@ -14,6 +13,8 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return;
   }
   (window as unknown as { __CT_PAGE_HOOK_INSTALLED__?: boolean }).__CT_PAGE_HOOK_INSTALLED__ = true;
+
+  let currentTurnId: string | null = null;
 
   function debugLog(...args: unknown[]) {
     try {
@@ -40,7 +41,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     }
   }
 
-  // 1. URL 监听
+  // 1. URL 监听（仅同步 conversationId，绝不启动 Turn）
   let lastUrl = location.href;
   function checkUrlChange() {
     try {
@@ -76,42 +77,46 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
   // 2. Fetch Hook
   const nativeFetch = window.fetch;
 
-  function handleRequestBody(
-    bodyText: string | null,
+  function processTurnDecision(
     urlStr: string,
-    startedAt: number
-  ): string {
-    let turnId = generateUuid();
-    let requestedModel: string | null = null;
-    let reqConvId = conversationIdFromUrl(urlStr) || conversationIdFromUrl(location.href);
+    method: string,
+    bodyText: string | null,
+    startedAt: number,
+    captureId: string
+  ): { isTurnStart: boolean; turnId: string | null } {
+    const decision = classifyUserTurnStart(urlStr, method, bodyText, currentTurnId);
 
-    if (bodyText) {
-      try {
-        const parsed = parseConversationRequest(bodyText);
-        turnId = parsed.turnId;
-        requestedModel = parsed.requestedModel;
-        if (parsed.conversationId) {
-          reqConvId = parsed.conversationId;
-        }
-      } catch {
-        // 解析异常兜底
-      }
+    debugLog('request classified', {
+      url: urlStr.slice(0, 60),
+      method,
+      decision: decision.type,
+      reason: decision.type === 'NON_TURN_REQUEST' ? decision.reason : undefined,
+      userMessageIdPresent: decision.type !== 'NON_TURN_REQUEST',
+    });
+
+    if (decision.type === 'NEW_USER_TURN') {
+      currentTurnId = decision.userMessageId;
+      const reqConvId =
+        decision.conversationId ||
+        conversationIdFromUrl(urlStr) ||
+        conversationIdFromUrl(location.href);
+
+      safePost('REQUEST_START', {
+        captureId,
+        turnId: decision.userMessageId,
+        requestedModel: decision.requestedModel,
+        conversationId: reqConvId,
+        startedAt,
+      });
+
+      return { isTurnStart: true, turnId: decision.userMessageId };
     }
 
-    debugLog('REQUEST_START emitted', {
-      turnIdPrefix: turnId.slice(0, 8),
-      hasRequestedModel: Boolean(requestedModel),
-      hasConvId: Boolean(reqConvId),
-    });
+    if (decision.type === 'SAME_TURN_CONTINUATION') {
+      return { isTurnStart: false, turnId: decision.userMessageId };
+    }
 
-    safePost('REQUEST_START', {
-      turnId,
-      requestedModel,
-      conversationId: reqConvId,
-      startedAt,
-    });
-
-    return turnId;
+    return { isTurnStart: false, turnId: null };
   }
 
   async function inspectFetch(
@@ -138,21 +143,16 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
       'GET'
     ).toUpperCase();
 
-    const isConv = isConversationEndpoint(urlStr);
+    const captureId = `cap-${Date.now()}-${generateUuid().slice(0, 8)}`;
     const startedAt = Date.now();
-    let turnId: string | null = null;
+    let turnContext: { isTurnStart: boolean; turnId: string | null } = {
+      isTurnStart: false,
+      turnId: null,
+    };
 
-    debugLog('fetch intercepted', {
-      url: urlStr.slice(0, 64),
-      method,
-      isConv,
-      isRequestObj,
-      hasInitBody: Boolean(init?.body),
-    });
-
-    if (isConv && method === 'POST') {
+    if (method === 'POST') {
       if (typeof init?.body === 'string') {
-        turnId = handleRequestBody(init.body, urlStr, startedAt);
+        turnContext = processTurnDecision(urlStr, method, init.body, startedAt, captureId);
       } else if (request) {
         try {
           // 安全异步 clone Request 读取 body，绝不能直接消费原始 request
@@ -160,16 +160,12 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
           clonedReq
             .text()
             .then((text) => {
-              turnId = handleRequestBody(text, urlStr, startedAt);
+              turnContext = processTurnDecision(urlStr, method, text, startedAt, captureId);
             })
-            .catch(() => {
-              turnId = handleRequestBody(null, urlStr, startedAt);
-            });
+            .catch(() => {});
         } catch {
-          turnId = handleRequestBody(null, urlStr, startedAt);
+          // 忽略
         }
-      } else {
-        turnId = handleRequestBody(null, urlStr, startedAt);
       }
     }
 
@@ -180,7 +176,9 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
       throw err;
     }
 
-    if (isConv && response && response.ok) {
+    // 只有属于有效 Turn 的响应才处理 SSE 流，非 Turn 请求绝不发送 SSE_CHUNK 污染状态
+    if (response && response.ok && (turnContext.isTurnStart || turnContext.turnId || currentTurnId)) {
+      const boundTurnId = turnContext.turnId || currentTurnId;
       try {
         const cloned = response.clone();
         const reader = cloned.body?.getReader();
@@ -195,7 +193,8 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                 if (done) {
                   const flushed = sseParser.flush();
                   safePost('SSE_CHUNK', {
-                    turnId,
+                    captureId,
+                    turnId: boundTurnId,
                     conversationId: flushed.conversationId,
                     requestId: flushed.requestId,
                     resolvedModelSlug: flushed.resolvedModelSlug,
@@ -217,7 +216,8 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                     evidence.isStreamDone
                   ) {
                     safePost('SSE_CHUNK', {
-                      turnId,
+                      captureId,
+                      turnId: boundTurnId,
                       conversationId: evidence.conversationId,
                       requestId: evidence.requestId,
                       resolvedModelSlug: evidence.resolvedModelSlug,
@@ -274,7 +274,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     if (isTargetWs(targetUrl)) {
       try {
         socket.addEventListener('message', (event: MessageEvent) => {
-          if (typeof event.data === 'string') {
+          if (typeof event.data === 'string' && currentTurnId) {
             try {
               const evidence = parseWebSocketFrame(event.data);
               if (
@@ -285,6 +285,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                 evidence.isStreamDone
               ) {
                 safePost('WS_FRAME', {
+                  turnId: currentTurnId,
                   conversationId: evidence.conversationId,
                   resolvedModelSlug: evidence.resolvedModelSlug,
                   serverModelSlug: evidence.serverModelSlug,

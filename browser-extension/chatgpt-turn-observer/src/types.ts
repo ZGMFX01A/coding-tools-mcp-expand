@@ -63,6 +63,7 @@ export interface RouteEvidence {
   conversationId: string | null;
   requestId: string | null;
   turnId: string | null;
+  captureId?: string | null;
   isStreamDone: boolean;
 }
 
@@ -74,13 +75,39 @@ export const EMPTY_ROUTE_EVIDENCE: RouteEvidence = {
   conversationId: null,
   requestId: null,
   turnId: null,
+  captureId: null,
   isStreamDone: false,
 };
+
+export type TurnStartDecision =
+  | {
+      type: 'NEW_USER_TURN';
+      userMessageId: string;
+      requestedModel: string | null;
+      conversationId: string | null;
+      parentMessageId: string | null;
+    }
+  | {
+      type: 'SAME_TURN_CONTINUATION';
+      userMessageId: string;
+      conversationId: string | null;
+    }
+  | {
+      type: 'NON_TURN_REQUEST';
+      reason:
+        | 'UPLOAD_ONLY'
+        | 'COPY_TELEMETRY'
+        | 'NO_USER_MESSAGE'
+        | 'SAME_USER_MESSAGE'
+        | 'UNRELATED_ENDPOINT'
+        | 'INVALID_STRUCTURE';
+    };
 
 export interface TabTurnState {
   tabId: number;
   conversationId: string | null;
   turnId: string | null;
+  activeCaptureId?: string | null;
   requestId: string | null;
   startedAt: number | null;
   completedAt: number | null;
@@ -99,6 +126,7 @@ export interface PageHookMessage {
   source: typeof CT_OBSERVER_MESSAGE_SOURCE;
   type: 'REQUEST_START' | 'SSE_CHUNK' | 'WS_FRAME' | 'URL_CHANGE';
   payload: {
+    captureId?: string | null;
     turnId?: string | null;
     conversationId?: string | null;
     requestId?: string | null;

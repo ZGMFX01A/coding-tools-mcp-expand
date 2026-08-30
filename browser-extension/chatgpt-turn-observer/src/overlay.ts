@@ -139,13 +139,19 @@ export class TurnObserverOverlay {
       : null;
 
     let modelRowLabel = '模型：';
-    let modelRowValue = '检测中…';
+    let modelRowValue = '—';
     if (actualModelText) {
       modelRowLabel = '模型：';
       modelRowValue = actualModelText;
     } else if (requestedModelText) {
       modelRowLabel = '请求：';
       modelRowValue = `${requestedModelText} (实际: 未知)`;
+    } else if (state?.state === 'active' || state?.state === 'turn_starting') {
+      modelRowLabel = '模型：';
+      modelRowValue = '检测中…';
+    } else {
+      modelRowLabel = '模型：';
+      modelRowValue = '—';
     }
 
     let statusClass = 'idle';
@@ -175,7 +181,7 @@ export class TurnObserverOverlay {
           <span class="ct-turn-observer-logo-dot"></span>
           <span>CT</span>
           <span>·</span>
-          <span>${actualModelText || requestedModelText || '检测中'}</span>
+          <span>${actualModelText || requestedModelText || '—'}</span>
           <span>·</span>
           <span class="ct-mini-timer">${durationText}</span>
           <span class="ct-turn-observer-status-dot ${statusClass}"></span>

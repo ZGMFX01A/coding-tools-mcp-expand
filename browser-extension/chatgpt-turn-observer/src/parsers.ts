@@ -1,4 +1,8 @@
-import { EMPTY_ROUTE_EVIDENCE, type RouteEvidence } from './types';
+import {
+  EMPTY_ROUTE_EVIDENCE,
+  type RouteEvidence,
+  type TurnStartDecision,
+} from './types';
 
 const STANDARD_CONVERSATION_PATH = /^\/c\/([^/?#]+)(?=[/?#]|$)/;
 const GIZMO_CONVERSATION_PATH = /^\/g\/[^/?#]+\/c\/([^/?#]+)(?=[/?#]|$)/;
@@ -26,6 +30,20 @@ export function isConversationEndpoint(urlStr: string): boolean {
   try {
     const parsed = new URL(urlStr, typeof location !== 'undefined' ? location.origin : 'https://chatgpt.com');
     const p = parsed.pathname.toLowerCase();
+
+    // 排除明确的非对话交互端点（遥测、文件上传、语音合成等）
+    if (
+      p.includes('/files') ||
+      p.includes('/synthesize') ||
+      p.includes('/telemetry') ||
+      p.includes('/analytics') ||
+      p.includes('/ces/') ||
+      p.includes('/settings') ||
+      p.includes('/models')
+    ) {
+      return false;
+    }
+
     return (
       p.includes('/backend-api/conversation') ||
       p.includes('/backend-api/conversations') ||
@@ -37,6 +55,14 @@ export function isConversationEndpoint(urlStr: string): boolean {
     );
   } catch {
     const lower = urlStr.toLowerCase();
+    if (
+      lower.includes('/files') ||
+      lower.includes('/synthesize') ||
+      lower.includes('/telemetry') ||
+      lower.includes('/ces/')
+    ) {
+      return false;
+    }
     return (
       lower.includes('/backend-api/conversation') ||
       lower.includes('/backend-api/lat/r') ||
@@ -75,58 +101,98 @@ function asString(val: unknown): string | null {
   return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null;
 }
 
-export function parseConversationRequest(rawBody: string | Record<string, unknown>): {
-  turnId: string;
-  conversationId: string | null;
-  requestedModel: string | null;
-  parentMessageId: string | null;
-} {
-  const root = typeof rawBody === 'string' ? asRecord(safeJsonParse(rawBody)) : asRecord(rawBody);
-  if (!root) {
-    return {
-      turnId: generateUuid(),
-      conversationId: null,
-      requestedModel: null,
-      parentMessageId: null,
-    };
-  }
-
-  // 1. 尝试从 messages 列表中寻找 turnId (message id)
-  let turnId: string | null = null;
-  if (Array.isArray(root.messages)) {
-    // 优先从最后一条 user 消息或第一条消息中提取 id
-    for (let i = root.messages.length - 1; i >= 0; i--) {
-      const msg = asRecord(root.messages[i]);
-      const id = asString(msg?.id);
+/**
+ * 扫描 messages 数组，找到明确 role === 'user' 且带有有效 id 的最新用户消息
+ */
+export function findNewestUserMessage(messages: unknown): { id: string } | null {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = asRecord(messages[i]);
+    if (!msg) continue;
+    const author = asRecord(msg.author);
+    const role = asString(author?.role) || asString(msg.role);
+    if (role === 'user') {
+      const id = asString(msg.id);
       if (id) {
-        turnId = id;
-        break;
+        return { id };
       }
     }
   }
+  return null;
+}
 
-  // 2. 备选根字段
-  if (!turnId) {
-    turnId =
-      asString(root.client_message_id) ||
-      asString(root.message_id) ||
-      asString(root.id) ||
-      asString(root.turn_id);
+/**
+ * 严格消息语义判定：仅当检测到明确的 user-authored message 时才允许 NEW_USER_TURN。
+ * 杜绝图片上传预请求、复制文本遥测请求、后台轮询等造成的 False Positive。
+ */
+export function classifyUserTurnStart(
+  urlStr: string,
+  method: string,
+  rawBody: string | Record<string, unknown> | null,
+  currentTurnId: string | null
+): TurnStartDecision {
+  const upperMethod = (method || 'GET').toUpperCase();
+  if (upperMethod !== 'POST') {
+    return { type: 'NON_TURN_REQUEST', reason: 'UNRELATED_ENDPOINT' };
   }
 
-  // 3. 兜底生成有效 UUID，绝不返回 null
-  if (!turnId) {
-    turnId = generateUuid();
+  // 1. 拦截明确的遥测/上传/非对话接口
+  const lowerUrl = urlStr.toLowerCase();
+  if (lowerUrl.includes('/files') || lowerUrl.includes('/attachment') || lowerUrl.includes('/upload')) {
+    return { type: 'NON_TURN_REQUEST', reason: 'UPLOAD_ONLY' };
+  }
+  if (lowerUrl.includes('/ces/') || lowerUrl.includes('/telemetry') || lowerUrl.includes('/analytics')) {
+    return { type: 'NON_TURN_REQUEST', reason: 'COPY_TELEMETRY' };
+  }
+
+  if (!isConversationEndpoint(urlStr)) {
+    return { type: 'NON_TURN_REQUEST', reason: 'UNRELATED_ENDPOINT' };
+  }
+
+  // 2. 检查 Request Body 结构
+  if (!rawBody) {
+    return { type: 'NON_TURN_REQUEST', reason: 'INVALID_STRUCTURE' };
+  }
+
+  const root = typeof rawBody === 'string' ? asRecord(safeJsonParse(rawBody)) : asRecord(rawBody);
+  if (!root) {
+    return { type: 'NON_TURN_REQUEST', reason: 'INVALID_STRUCTURE' };
+  }
+
+  // 3. 严格扫描 user-authored message
+  const userMsg = findNewestUserMessage(root.messages);
+  let userMessageId: string | null = userMsg?.id ?? null;
+
+  // 兼容根字段上的 client_message_id / message_id（仅当 action 为 next/create 时）
+  if (!userMessageId && (root.action === 'next' || root.action === 'create' || !root.action)) {
+    userMessageId =
+      asString(root.client_message_id) ||
+      asString(root.message_id) ||
+      asString(root.user_message_id);
+  }
+
+  if (!userMessageId) {
+    return { type: 'NON_TURN_REQUEST', reason: 'NO_USER_MESSAGE' };
   }
 
   const conversationId = asString(root.conversation_id);
   const requestedModel = asString(root.model);
   const parentMessageId = asString(root.parent_message_id);
 
+  // 4. 比对当前 TurnId
+  if (currentTurnId && userMessageId === currentTurnId) {
+    return {
+      type: 'SAME_TURN_CONTINUATION',
+      userMessageId,
+      conversationId,
+    };
+  }
+
   return {
-    turnId,
-    conversationId,
+    type: 'NEW_USER_TURN',
+    userMessageId,
     requestedModel,
+    conversationId,
     parentMessageId,
   };
 }
@@ -143,6 +209,7 @@ export function mergeEvidence(
     conversationId: incoming.conversationId ?? base.conversationId,
     requestId: incoming.requestId ?? base.requestId,
     turnId: incoming.turnId ?? base.turnId,
+    captureId: incoming.captureId ?? base.captureId,
     isStreamDone: incoming.isStreamDone ?? base.isStreamDone,
   };
 }
@@ -324,7 +391,7 @@ export function extractActualModel(evidence: RouteEvidence): string | null {
  * 将模型 slug 格式化为美观的展示名称
  */
 export function formatModelDisplayName(slug: string | null): string {
-  if (!slug) return '未知';
+  if (!slug) return '—';
   const lower = slug.toLowerCase();
   if (lower.includes('gpt-5.6') || lower.includes('sol')) return 'GPT-5.6 Sol';
   if (lower.includes('o3-mini')) return 'o3-mini';

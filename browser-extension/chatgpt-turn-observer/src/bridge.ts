@@ -31,6 +31,7 @@ import {
     tabId,
     conversationId: conversationIdFromUrl(location.href),
     turnId: null,
+    activeCaptureId: null,
     requestId: null,
     startedAt: null,
     completedAt: null,
@@ -232,8 +233,9 @@ import {
         quietTimer = null;
       }
 
-      // 新 Turn 开始
+      // 新 Turn 开始：绑定 captureId 和 turnId
       tabState.turnId = newTurnId;
+      tabState.activeCaptureId = payload.captureId || null;
       tabState.startedAt = payload.startedAt || Date.now();
       tabState.completedAt = null;
       tabState.requestedModel = payload.requestedModel || null;
@@ -262,6 +264,24 @@ import {
         actual_model: null,
       });
     } else if (type === 'SSE_CHUNK' || type === 'WS_FRAME') {
+      // 严格检查：如果没有 active Turn 或当前处于 idle，忽略任何流/WS 证据，防止非 Turn 请求污染 Overlay
+      if (!tabState.turnId || tabState.state === 'idle') {
+        debugLog('dropped evidence: no active turn');
+        return;
+      }
+
+      // 如果属于 SSE_CHUNK，验证是否匹配当前 activeCaptureId 或 turnId
+      if (type === 'SSE_CHUNK') {
+        if (payload.captureId && tabState.activeCaptureId && payload.captureId !== tabState.activeCaptureId) {
+          debugLog('dropped evidence: captureId mismatch');
+          return;
+        }
+        if (payload.turnId && payload.turnId !== tabState.turnId) {
+          debugLog('dropped evidence: turnId mismatch');
+          return;
+        }
+      }
+
       tabState.lastActiveAt = Date.now();
 
       // 若处于 stream_idle，有新数据到来则恢复 active

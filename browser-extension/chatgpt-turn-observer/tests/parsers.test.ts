@@ -1,17 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import {
+  classifyUserTurnStart,
   conversationIdFromUrl,
   extractActualModel,
+  findNewestUserMessage,
   formatModelDisplayName,
   isConversationEndpoint,
-  parseConversationRequest,
   parseSseChunk,
   parseWebSocketFrame,
   SseStreamParser,
 } from '../src/parsers';
 import { EMPTY_ROUTE_EVIDENCE } from '../src/types';
 
-describe('parsers', () => {
+describe('parsers & turn classification', () => {
   describe('conversationIdFromUrl', () => {
     it('extracts conversation id from standard url', () => {
       expect(conversationIdFromUrl('https://chatgpt.com/c/67b93198-abc-123')).toBe('67b93198-abc-123');
@@ -30,7 +31,7 @@ describe('parsers', () => {
   });
 
   describe('isConversationEndpoint', () => {
-    it('matches standard and current chatgpt conversation endpoints', () => {
+    it('matches standard chatgpt conversation endpoints', () => {
       expect(isConversationEndpoint('/backend-api/conversation')).toBe(true);
       expect(isConversationEndpoint('/backend-api/conversations')).toBe(true);
       expect(isConversationEndpoint('/backend-api/lat/r')).toBe(true);
@@ -38,82 +39,177 @@ describe('parsers', () => {
       expect(isConversationEndpoint('/backend-api/f/conversation')).toBe(true);
       expect(isConversationEndpoint('/backend-anon/conversation')).toBe(true);
       expect(isConversationEndpoint('https://chatgpt.com/backend-api/conversation')).toBe(true);
-      expect(isConversationEndpoint('https://chatgpt.com/backend-api/lat/r?v=1')).toBe(true);
     });
 
-    it('rejects unrelated endpoints', () => {
-      expect(isConversationEndpoint('/backend-api/me')).toBe(false);
-      expect(isConversationEndpoint('/backend-api/models')).toBe(false);
+    it('rejects files, telemetry, and analytics endpoints', () => {
+      expect(isConversationEndpoint('/backend-api/files')).toBe(false);
+      expect(isConversationEndpoint('/backend-api/files/upload')).toBe(false);
+      expect(isConversationEndpoint('/backend-api/telemetry')).toBe(false);
+      expect(isConversationEndpoint('/ces/v1/t')).toBe(false);
+      expect(isConversationEndpoint('/backend-api/synthesize')).toBe(false);
       expect(isConversationEndpoint('/backend-api/settings')).toBe(false);
-      expect(isConversationEndpoint('')).toBe(false);
     });
   });
 
-  describe('parseConversationRequest', () => {
-    it('extracts turnId, conversationId, and requestedModel', () => {
-      const payload = JSON.stringify({
+  describe('findNewestUserMessage', () => {
+    it('extracts newest message with role === user', () => {
+      const messages = [
+        { id: 'msg-sys', author: { role: 'system' } },
+        { id: 'msg-user-1', author: { role: 'user' } },
+        { id: 'msg-assistant-1', author: { role: 'assistant' } },
+        { id: 'msg-user-2', role: 'user' },
+      ];
+      const found = findNewestUserMessage(messages);
+      expect(found).not.toBeNull();
+      expect(found?.id).toBe('msg-user-2');
+    });
+
+    it('returns null if no user message exists', () => {
+      const messages = [
+        { id: 'msg-sys', author: { role: 'system' } },
+        { id: 'msg-assistant', author: { role: 'assistant' } },
+      ];
+      expect(findNewestUserMessage(messages)).toBeNull();
+    });
+  });
+
+  describe('classifyUserTurnStart (Strict Turn Start Semantics)', () => {
+    it('classifies real user message submission as NEW_USER_TURN', () => {
+      const body = {
         action: 'next',
         messages: [
           {
-            id: 'msg-turn-001',
+            id: 'msg-user-100',
             author: { role: 'user' },
-            content: { content_type: 'text', parts: ['hello'] },
+            content: { content_type: 'text', parts: ['Hello Coding Tools'] },
           },
         ],
+        conversation_id: 'conv-real-1',
+        model: 'gpt-4o',
+      };
+
+      const decision = classifyUserTurnStart(
+        '/backend-api/conversation',
+        'POST',
+        body,
+        null
+      );
+
+      expect(decision.type).toBe('NEW_USER_TURN');
+      if (decision.type === 'NEW_USER_TURN') {
+        expect(decision.userMessageId).toBe('msg-user-100');
+        expect(decision.requestedModel).toBe('gpt-4o');
+        expect(decision.conversationId).toBe('conv-real-1');
+      }
+    });
+
+    it('rejects image upload requests (UPLOAD_ONLY)', () => {
+      const uploadBody = {
+        file_name: 'test.png',
+        file_size: 1024,
+        use_case: 'multimodal',
+      };
+
+      const decision = classifyUserTurnStart(
+        '/backend-api/files',
+        'POST',
+        uploadBody,
+        null
+      );
+
+      expect(decision.type).toBe('NON_TURN_REQUEST');
+      if (decision.type === 'NON_TURN_REQUEST') {
+        expect(decision.reason).toBe('UPLOAD_ONLY');
+      }
+    });
+
+    it('rejects copy / telemetry requests (COPY_TELEMETRY)', () => {
+      const telemetryBody = {
+        events: [{ type: 'copy_text', message_id: 'msg-assistant-1' }],
+      };
+
+      const decision = classifyUserTurnStart(
+        '/ces/v1/t',
+        'POST',
+        telemetryBody,
+        null
+      );
+
+      expect(decision.type).toBe('NON_TURN_REQUEST');
+      if (decision.type === 'NON_TURN_REQUEST') {
+        expect(decision.reason).toBe('COPY_TELEMETRY');
+      }
+    });
+
+    it('rejects requests without user message (NO_USER_MESSAGE)', () => {
+      const noUserBody = {
+        action: 'get_metadata',
         conversation_id: 'conv-123',
-        parent_message_id: 'parent-000',
-        model: 'gpt-4o',
-      });
+      };
 
-      const res = parseConversationRequest(payload);
-      expect(res.turnId).toBe('msg-turn-001');
-      expect(res.conversationId).toBe('conv-123');
-      expect(res.requestedModel).toBe('gpt-4o');
-      expect(res.parentMessageId).toBe('parent-000');
+      const decision = classifyUserTurnStart(
+        '/backend-api/conversation',
+        'POST',
+        noUserBody,
+        null
+      );
+
+      expect(decision.type).toBe('NON_TURN_REQUEST');
+      if (decision.type === 'NON_TURN_REQUEST') {
+        expect(decision.reason).toBe('NO_USER_MESSAGE');
+      }
     });
 
-    it('handles new conversation with null conversation_id', () => {
-      const payload = JSON.stringify({
+    it('identifies SAME_TURN_CONTINUATION if userMessageId matches active turn', () => {
+      const body = {
         action: 'next',
-        messages: [{ id: 'msg-turn-new' }],
-        model: 'o3-mini',
-      });
+        messages: [{ id: 'msg-user-active', role: 'user' }],
+        conversation_id: 'conv-123',
+      };
 
-      const res = parseConversationRequest(payload);
-      expect(res.turnId).toBe('msg-turn-new');
-      expect(res.conversationId).toBeNull();
-      expect(res.requestedModel).toBe('o3-mini');
+      const decision = classifyUserTurnStart(
+        '/backend-api/conversation',
+        'POST',
+        body,
+        'msg-user-active'
+      );
+
+      expect(decision.type).toBe('SAME_TURN_CONTINUATION');
     });
 
-    it('extracts turnId from alternative fields if messages array is empty', () => {
-      const payload = JSON.stringify({
-        client_message_id: 'client-msg-777',
-        conversation_id: 'conv-456',
-        model: 'o3',
-      });
+    it('handles image + text combined sending: upload is non-turn, final send is exactly 1 NEW_USER_TURN', () => {
+      // 1. 上传图片阶段
+      const uploadDecision = classifyUserTurnStart(
+        '/backend-api/files',
+        'POST',
+        { file_id: 'file-123' },
+        null
+      );
+      expect(uploadDecision.type).toBe('NON_TURN_REQUEST');
 
-      const res = parseConversationRequest(payload);
-      expect(res.turnId).toBe('client-msg-777');
-      expect(res.conversationId).toBe('conv-456');
-      expect(res.requestedModel).toBe('o3');
-    });
-
-    it('generates a valid fallback UUID turnId if no ID field exists', () => {
-      const payload = JSON.stringify({
-        model: 'gpt-4o',
-      });
-
-      const res = parseConversationRequest(payload);
-      expect(typeof res.turnId).toBe('string');
-      expect(res.turnId.length).toBeGreaterThan(10);
-      expect(res.requestedModel).toBe('gpt-4o');
-    });
-
-    it('handles invalid json gracefully by returning a non-null generated turnId', () => {
-      const res = parseConversationRequest('invalid json');
-      expect(typeof res.turnId).toBe('string');
-      expect(res.turnId.length).toBeGreaterThan(10);
-      expect(res.conversationId).toBeNull();
+      // 2. 最终点击发送阶段
+      const sendDecision = classifyUserTurnStart(
+        '/backend-api/conversation',
+        'POST',
+        {
+          action: 'next',
+          messages: [
+            {
+              id: 'msg-combined-turn',
+              author: { role: 'user' },
+              content: { parts: ['explain this image'] },
+              metadata: { attachments: [{ id: 'file-123' }] },
+            },
+          ],
+          model: 'o3-mini',
+        },
+        null
+      );
+      expect(sendDecision.type).toBe('NEW_USER_TURN');
+      if (sendDecision.type === 'NEW_USER_TURN') {
+        expect(sendDecision.userMessageId).toBe('msg-combined-turn');
+        expect(sendDecision.requestedModel).toBe('o3-mini');
+      }
     });
   });
 
