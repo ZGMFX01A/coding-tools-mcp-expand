@@ -642,15 +642,15 @@ fn test_workspace_fallback_accumulates_budget_and_triggers_hard_stop() {
     clock.advance_ms(100);
     drop(g1);
 
-    // 第二次调用：时间推进 1100ms（进入 soft_wrap 阶段），正常放行但 status 应为 SoftWrap
+    // 第二次调用：时间推进 1100ms（进入 warning 阶段），正常放行但 status 应为 Warning
     clock.advance_ms(1000);
     let d2 = manager.start_call_with_identity(identity.clone(), "list_files", false, &json!({}));
     let g2 = match d2 {
-        CallDecision::Allowed { guard, meta, .. } => {
-            assert_eq!(meta.status, TurnBudgetStatus::SoftWrap);
+        CallDecision::Allowed { guard, snapshot, .. } => {
+            assert_eq!(snapshot.status, TurnBudgetStatus::Warning);
             guard
         }
-        _ => panic!("Expected allowed with SoftWrap"),
+        _ => panic!("Expected allowed with Warning"),
     };
     clock.advance_ms(100);
     drop(g2);
@@ -659,8 +659,8 @@ fn test_workspace_fallback_accumulates_budget_and_triggers_hard_stop() {
     clock.advance_ms(2000);
     let d3 = manager.start_call_with_identity(identity.clone(), "list_files", false, &json!({}));
     match d3 {
-        CallDecision::Blocked { meta, .. } => {
-            assert_eq!(meta.status, TurnBudgetStatus::HardStop);
+        CallDecision::Blocked { snapshot, .. } => {
+            assert_eq!(snapshot.status, TurnBudgetStatus::HardStop);
         }
         _ => panic!("Expected Blocked with HardStop for accumulated WorkspaceFallback"),
     }

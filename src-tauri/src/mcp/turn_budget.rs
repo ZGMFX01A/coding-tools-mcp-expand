@@ -41,6 +41,10 @@ impl MockBudgetClock {
         let mut guard = self.current.write().expect("mock clock lock poisoned");
         *guard += duration;
     }
+
+    pub fn advance_ms(&self, ms: u64) {
+        self.advance(Duration::from_millis(ms));
+    }
 }
 
 impl BudgetClock for MockBudgetClock {

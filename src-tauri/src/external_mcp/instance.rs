@@ -72,6 +72,7 @@ pub struct ExternalMcpInstance {
     transport: RwLock<Option<StdioTransport>>,
     discovered_tools: RwLock<Vec<McpTool>>,
     error_message: RwLock<Option<String>>,
+    #[allow(dead_code)]
     restart_attempts: RwLock<Vec<Instant>>,
 }
 

@@ -161,7 +161,9 @@ fn resolve_windows_command(command: &str) -> String {
 }
 
 pub struct StdioTransport {
+    #[allow(dead_code)]
     workspace_id: String,
+    #[allow(dead_code)]
     config_name: String,
     child_pid: Option<u32>,
     stdin_tx: mpsc::Sender<String>,

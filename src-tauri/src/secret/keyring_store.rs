@@ -47,6 +47,7 @@ impl SecretStore {
         })
     }
 
+    #[allow(dead_code)]
     pub fn regenerate_shared(key: &str) -> AppResult<String> {
         let value = random_secret();
         Self::set_shared(key, &value)?;
