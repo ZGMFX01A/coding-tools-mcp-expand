@@ -8,7 +8,12 @@ import {
   type ConversationCorrelation,
   type WebSocketRouteEvidence,
 } from './parsers';
-import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
+import {
+  CT_OBSERVER_CONTROL_SOURCE,
+  CT_OBSERVER_MESSAGE_SOURCE,
+  type PageHookControlMessage,
+  type PageHookMessage,
+} from './types';
 
 (function initPageHook() {
   // 防止重复初始化
@@ -87,6 +92,9 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
   }
 
   const pendingLiveCaptures = new Map<string, PendingLiveCapture>();
+  const activeRequestControllers = new Map<string, AbortController>();
+  const socketCaptures = new Map<WebSocket, Set<string>>();
+  const targetSockets = new Set<WebSocket>();
   const PENDING_CAPTURE_TTL_MS = 10 * 60 * 1000;
 
   const seenUserMessageIds = new Set<string>();
@@ -162,6 +170,44 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     return uniqueCandidate(conversationMatches);
   }
 
+  function reportTurnAborted(pending: PendingLiveCapture, reason: string): void {
+    if (pending.inputMessageId) {
+      // 失败/中止的请求允许 ChatGPT 重新提交同一用户消息，不把失败误记成 replay。
+      seenUserMessageIds.delete(pending.inputMessageId);
+    }
+    safePost('TURN_ABORTED', {
+      captureId: pending.captureId,
+      turnId: pending.turnId,
+      reason,
+    });
+    pendingLiveCaptures.delete(pending.captureId);
+  }
+
+  // Bridge 在预算到点或用户离开页面时通过 postMessage 请求 MAIN world 中止实际请求。
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || event.origin !== window.location.origin || window.location.origin === 'null') {
+      return;
+    }
+    const data = event.data as PageHookControlMessage | undefined;
+    if (!data || data.source !== CT_OBSERVER_CONTROL_SOURCE || data.type !== 'STOP_TURN') return;
+
+    const captureId = data.payload?.captureId || null;
+    const turnId = data.payload?.turnId || null;
+    for (const [id, controller] of activeRequestControllers) {
+      const pending = pendingLiveCaptures.get(id);
+      if ((!captureId && !turnId) || (captureId && id === captureId) || (turnId && pending?.turnId === turnId)) {
+        controller.abort();
+      }
+    }
+    for (const socket of targetSockets) {
+      try {
+        socket.close(4000, data.payload?.reason || 'turn stopped');
+      } catch {
+        // 忽略已关闭的 WebSocket
+      }
+    }
+  });
+
   // 3. Fetch Hook (严格判定新用户 Turn，非新 Turn 绝不注册 Live Capture)
   const nativeFetch = window.fetch;
 
@@ -182,6 +228,24 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
       }
     }
     return null;
+  }
+
+  function addStopSignal(
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    stopController: AbortController,
+  ): RequestInit {
+    const existingSignal =
+      init?.signal ||
+      (typeof Request !== 'undefined' && input instanceof Request ? input.signal : undefined);
+    if (existingSignal) {
+      if (existingSignal.aborted) {
+        stopController.abort();
+      } else {
+        existingSignal.addEventListener('abort', () => stopController.abort(), { once: true });
+      }
+    }
+    return { ...(init || {}), signal: stopController.signal };
   }
 
   async function inspectFetch(
@@ -210,22 +274,33 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
 
     const captureId = generateUuid();
     const startedAt = Date.now();
+    const stopController = new AbortController();
+    activeRequestControllers.set(captureId, stopController);
+    const requestInit = addStopSignal(input, init, stopController);
 
     const bodyPromise = requestBody(input, init);
     const correlationPromise = bodyPromise.then((raw) => {
-      if (!raw) return null;
+      if (!raw) {
+        activeRequestControllers.delete(captureId);
+        return null;
+      }
       const correlation = parseConversationCorrelation(raw);
-      if (!correlation) return null;
+      if (!correlation) {
+        activeRequestControllers.delete(captureId);
+        return null;
+      }
 
       // 严格检查是否为真正的新用户发送且未被重放
       if (!correlation.isNewUserTurn) {
         debugLog('Non-turn request observed, short-circuited', { action: correlation.action });
+        activeRequestControllers.delete(captureId);
         return null;
       }
 
       if (correlation.inputMessageId) {
         if (seenUserMessageIds.has(correlation.inputMessageId)) {
           debugLog('MessageId replayed, short-circuited', { msgId: correlation.inputMessageId });
+          activeRequestControllers.delete(captureId);
           return null;
         }
         markUserMessageIdSeen(correlation.inputMessageId);
@@ -256,9 +331,27 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
 
     let response: Response;
     try {
-      response = await target.call(receiver, input as RequestInfo, init);
+      response = await target.call(receiver, input as RequestInfo, requestInit);
     } catch (err) {
+      void correlationPromise.then((ctx) => {
+        if (ctx) {
+          const pending = pendingLiveCaptures.get(captureId);
+          if (pending) reportTurnAborted(pending, 'request_failed');
+        }
+        activeRequestControllers.delete(captureId);
+      });
       throw err;
+    }
+
+    if (response && !response.ok) {
+      void correlationPromise.then((ctx) => {
+        if (ctx) {
+          const pending = pendingLiveCaptures.get(captureId);
+          if (pending) reportTurnAborted(pending, `http_${response.status}`);
+        }
+        activeRequestControllers.delete(captureId);
+      });
+      return response;
     }
 
     if (response && response.ok) {
@@ -270,7 +363,10 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
           const sseParser = new SseStreamParser();
 
           void correlationPromise.then((ctx) => {
-            if (!ctx) return;
+            if (!ctx) {
+              activeRequestControllers.delete(captureId);
+              return;
+            }
             const boundTurnId = ctx.turnId;
             (async () => {
               try {
@@ -288,6 +384,7 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                       responseModelSlug: flushed.responseModelSlug,
                       isStreamDone: true,
                     });
+                    pendingLiveCaptures.delete(captureId);
                     break;
                   }
                   if (value) {
@@ -315,13 +412,30 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
                   }
                 }
               } catch {
-                // 忽略流读取异常
+                const pending = pendingLiveCaptures.get(captureId);
+                if (pending) reportTurnAborted(pending, 'stream_read_failed');
+              } finally {
+                activeRequestControllers.delete(captureId);
               }
             })();
           });
+        } else {
+          void correlationPromise.then((ctx) => {
+            if (ctx) {
+              const pending = pendingLiveCaptures.get(captureId);
+              if (pending) reportTurnAborted(pending, 'stream_body_missing');
+            }
+            activeRequestControllers.delete(captureId);
+          });
         }
       } catch {
-        // 忽略 clone 异常
+        void correlationPromise.then((ctx) => {
+          if (ctx) {
+            const pending = pendingLiveCaptures.get(captureId);
+            if (pending) reportTurnAborted(pending, 'stream_clone_failed');
+          }
+          activeRequestControllers.delete(captureId);
+        });
       }
     }
 
@@ -345,11 +459,17 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     }
   }
 
-  function handleWebSocketText(raw: string): void {
+  function handleWebSocketText(raw: string, socket?: WebSocket): void {
     const evidenceItems = parseWebSocketFrame(raw);
     for (const item of evidenceItems) {
       const pending = pendingCaptureFor(item);
       if (!pending) continue;
+
+      if (socket) {
+        const captures = socketCaptures.get(socket) || new Set<string>();
+        captures.add(pending.captureId);
+        socketCaptures.set(socket, captures);
+      }
 
       const ev = item.evidence;
       if (
@@ -386,12 +506,25 @@ import { CT_OBSERVER_MESSAGE_SOURCE, type PageHookMessage } from './types';
     const socket = Reflect.construct(nativeWebSocket, protocols !== undefined ? [url, protocols] : [url]);
 
     if (isTargetWs(targetUrl)) {
+      targetSockets.add(socket);
       try {
         socket.addEventListener('message', (event: MessageEvent) => {
           if (typeof event.data === 'string') {
-            queueMicrotask(() => handleWebSocketText(event.data));
+            queueMicrotask(() => handleWebSocketText(event.data, socket));
           }
         });
+        const onSocketEnd = () => {
+          targetSockets.delete(socket);
+          const captures = socketCaptures.get(socket);
+          socketCaptures.delete(socket);
+          if (!captures) return;
+          for (const captureId of captures) {
+            const pending = pendingLiveCaptures.get(captureId);
+            if (pending) reportTurnAborted(pending, 'websocket_closed');
+          }
+        };
+        socket.addEventListener('error', onSocketEnd, { once: true });
+        socket.addEventListener('close', onSocketEnd, { once: true });
       } catch {
         // 忽略
       }

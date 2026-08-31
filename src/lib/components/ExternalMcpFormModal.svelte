@@ -13,26 +13,15 @@
 
   let { workspaceId, config, onSave, onClose }: Props = $props();
 
-  let name = $state(config?.name ?? "fast-context");
-  let enabled = $state(config?.enabled ?? true);
-  let command = $state(config?.command ?? "");
-  let argsList = $state<string[]>(config?.args ? [...config.args] : []);
-  let envPairs = $state<Array<{ key: string; value: string; isSecret: boolean }>>(
-    config?.env
-      ? Object.entries(config.env).map(([k, v]) => ({
-          key: k,
-          value: v,
-          isSecret: isSecretKey(k),
-        }))
-      : [
-          { key: "FC_INCLUDE_SNIPPETS", value: "true", isSecret: false },
-          { key: "WINDSURF_API_KEY", value: "", isSecret: true },
-        ],
-  );
-  let allowedToolsText = $state((config?.allowedTools ?? ["extract_windsurf_key", "fast_context_search"]).join(", "));
-  let autoRestart = $state(config?.autoRestart ?? true);
-  let initializeTimeoutSeconds = $state(config?.initializeTimeoutSeconds ?? 30);
-  let callTimeoutSeconds = $state(config?.callTimeoutSeconds ?? 120);
+  let name = $state("");
+  let enabled = $state(true);
+  let command = $state("");
+  let argsList = $state<string[]>([]);
+  let envPairs = $state<Array<{ key: string; value: string; isSecret: boolean }>>([]);
+  let allowedToolsText = $state("");
+  let autoRestart = $state(true);
+  let initializeTimeoutSeconds = $state(30);
+  let callTimeoutSeconds = $state(120);
 
   let presetMode = $state<"local_cmd" | "local_file" | "npx" | "unselected">("unselected");
   let detectionInfo = $state<FastContextDetectionResult | null>(null);
@@ -56,6 +45,36 @@
     const k = key.toUpperCase();
     return ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "AUTH", "CREDENTIAL"].some((kw) => k.includes(kw));
   }
+
+  function defaultEnvPairs(): Array<{ key: string; value: string; isSecret: boolean }> {
+    return [
+      { key: "FC_INCLUDE_SNIPPETS", value: "true", isSecret: false },
+      { key: "WINDSURF_API_KEY", value: "", isSecret: true },
+    ];
+  }
+
+  // Props 变化时重新装载表单；避免在 $state 初始化表达式中捕获 config 的初始值。
+  let lastLoadedConfig: ExternalMcpConfig | null | undefined;
+  $effect(() => {
+    if (config === lastLoadedConfig) return;
+    lastLoadedConfig = config;
+
+    name = config?.name ?? "fast-context";
+    enabled = config?.enabled ?? true;
+    command = config?.command ?? "";
+    argsList = config?.args ? [...config.args] : [];
+    envPairs = config?.env
+      ? Object.entries(config.env).map(([k, v]) => ({
+          key: k,
+          value: v,
+          isSecret: isSecretKey(k),
+        }))
+      : defaultEnvPairs();
+    allowedToolsText = (config?.allowedTools ?? ["extract_windsurf_key", "fast_context_search"]).join(", ");
+    autoRestart = config?.autoRestart ?? true;
+    initializeTimeoutSeconds = config?.initializeTimeoutSeconds ?? 30;
+    callTimeoutSeconds = config?.callTimeoutSeconds ?? 120;
+  });
 
   $effect(() => {
     if (!config && name === "fast-context") {

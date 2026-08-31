@@ -126,4 +126,23 @@ describe('BridgeOutbox real queue behavior and retry logic', () => {
     expect(outbox.getQueueLength()).toBe(1);
     expect(outbox.getQueue()[0].attempts).toBe(1);
   });
+
+  it('restores pending events and persists removal after a successful send', async () => {
+    const saved: OutboxItem[][] = [];
+    const persistence = {
+      load: vi.fn().mockResolvedValue([{ event: sampleEvent, attempts: 1, nextRetryAt: 0 }]),
+      save: vi.fn(async (items: readonly OutboxItem[]) => {
+        saved.push([...items]);
+      }),
+    };
+    const sendFn = vi.fn().mockResolvedValue({ ok: true, status: 200, retryable: false });
+    const outbox = new BridgeOutbox(sendFn, undefined, persistence);
+
+    await outbox.restore();
+    await outbox.process();
+
+    expect(persistence.load).toHaveBeenCalledTimes(1);
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(saved.at(-1)).toEqual([]);
+  });
 });

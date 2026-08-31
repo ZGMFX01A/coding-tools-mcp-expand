@@ -28,7 +28,7 @@
 │                   ChatGPT Web 浏览器                    │
 │                                                        │
 │  ┌───────────────────────┐   postMessage   ┌─────────┐ │
-│  │ MAIN World            │ ──────────────> │ ISOLATED│ │
+│  │ MAIN World            │ <─────────────> │ ISOLATED│ │
 │  │ (page-hook.js)        │                 │ (bridge)│ │
 │  │ • 拦截 fetch / WS     │                 │ • 状态机 │ │
 │  │ • SSE / JSON 帧解析   │                 │ • UI 浮窗│ │
@@ -42,7 +42,7 @@
 │  ┌──────────────────────────────────────────────────┐  │
 │  │ Listener: POST /internal/chatgpt-turn-event      │  │
 │  │          GET  /internal/chatgpt-turn-observer/   │  │
-│  │               status                             │  │
+│  │               status / control                   │  │
 │  └──────────────────────────┬───────────────────────┘  │
 │                             ▼                          │
 │  ┌──────────────────────────────────────────────────┐  │
@@ -91,9 +91,9 @@ npm run build
 2. 配置项说明：
    - **上报模式 (Bridge Mode)**：
      - `Auto`（推荐）：优先尝试 Local Base URL，若不可用自动降级至 Remote Base URL。
-     - `Local`：强制仅使用本地地址（如 `http://127.0.0.1:40111`）。
+     - `Local`：强制仅使用本地地址（如 `http://127.0.0.1:28766`）。
      - `Remote`：强制仅使用公网隧道地址（如 `https://mcp-myws.example.com`）。
-   - **Local Base URL**：本地 MCP 监听基准地址（默认 `http://127.0.0.1:40111`）。
+   - **Local Base URL**：本地 MCP 监听基准地址（默认 `http://127.0.0.1:28766`）。
    - **Remote Base URL**：远端公网隧道基准地址（在 Desktop 工作区概览或 FRP / Cloudflare 设置中复制）。
    - **Browser Bridge Token**：在 Coding Tools Desktop 的 **“设置 -> 共享密钥 -> ChatGPT Observer 桥接密钥”** 中复制。
 3. 点击 **“测试连接”**，验证是否显示 `连接成功` 并正确显示远端工作区 ID 与版本号。
@@ -116,6 +116,9 @@ npm run build
 - **交互**：
   - 支持全视口自由拖拽，自动记住上次拖拽位置。
   - 支持点击折叠/展开微型徽标模式。
+- **超时停止**：
+  - 握手会读取后端返回的预算阈值；达到 warning 阈值时悬浮窗提示，达到 hard-stop 阈值时通过反向 `postMessage` 请求 MAIN world 中止实际请求，并补发 `turn_closed`。
+  - 页面请求异常、SSE 读取中断或目标 WebSocket 非正常关闭也会上报 `turn_closed`，避免后端保留悬挂 Turn。
 
 ---
 
@@ -130,7 +133,11 @@ npm run build
     "ok": true,
     "service": "chatgpt_turn_observer",
     "version": "0.1.30",
-    "workspace_id": "my_workspace_id"
+    "workspace_id": "my_workspace_id",
+    "turn_budget": {
+      "warning_after_seconds": 1500,
+      "hard_stop_after_seconds": 1740
+    }
   }
   ```
 
@@ -158,3 +165,10 @@ npm run build
   - `turn_updated`：解析到更新的会话或模型信息。
   - `stream_completed`：单次 SSE 流或 ReadableStream 结束，进入静默窗口。
   - `conversation_resolved`：新建会话完成后分配到真正的 `conversationId`。
+  - `turn_closed`：页面关闭、切换会话、新 Turn 开始或生成中止。
+- **处理结果**：成功应用返回 `200 {"ok":true,"applied":true}`；重复的同一 `event_id` 返回 `200` 且 `duplicate=true`；序号过期、Turn 不匹配等未应用事件返回 `409 EVENT_NOT_APPLIED`。
+
+### 3. 超时控制校准接口
+- **路径**：`GET /internal/chatgpt-turn-observer/control`
+- **查询参数**：`observer_id`、`tab_instance_id`、`tab_id`、`turn_id`。
+- **返回**：活动 Turn 达到后端预算 warning 阈值时返回 `command: "warn"`，达到 hard-stop 阈值时返回 `command: "stop_turn"`；未命中时返回 `command: null`。扩展在活动 Turn 期间通过 Local 或 Remote Base URL 轮询该接口。

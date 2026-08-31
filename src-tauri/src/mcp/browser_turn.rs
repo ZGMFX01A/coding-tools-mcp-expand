@@ -36,6 +36,14 @@ pub struct BrowserTurnEvent {
     pub actual_model: Option<String>,
 }
 
+/// 后端处理事件后的应用结果，不能只用 HTTP 200 表示“请求已到达”。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserTurnEventOutcome {
+    Applied,
+    Duplicate,
+    Ignored(&'static str),
+}
+
 /// 浏览器 Turn 状态机流转
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,8 +58,6 @@ pub enum BrowserTurnStatus {
     CompletedByNextTurn,
     /// 页面关闭或显式关闭
     Closed,
-    /// 超时过期
-    Expired,
 }
 
 /// 浏览器 Turn 注册表上下文
@@ -109,9 +115,9 @@ impl BrowserTurnRegistry {
         workspace_id: &str,
         event: BrowserTurnEvent,
         now: Instant,
-    ) {
+    ) -> BrowserTurnEventOutcome {
         if event.workspace_id != workspace_id {
-            return;
+            return BrowserTurnEventOutcome::Ignored("workspace_mismatch");
         }
 
         // 1. 事件 ID 去重检查与清理
@@ -121,7 +127,7 @@ impl BrowserTurnRegistry {
             seen.retain(|_, ts| now.saturating_duration_since(*ts) <= event_ttl);
             if seen.contains_key(&event.event_id) {
                 // 已处理过的事件，幂等忽略
-                return;
+                return BrowserTurnEventOutcome::Duplicate;
             }
             if seen.len() >= 1024 {
                 if let Some(oldest_key) = seen.iter().min_by_key(|(_, ts)| **ts).map(|(k, _)| k.clone()) {
@@ -151,18 +157,23 @@ impl BrowserTurnRegistry {
                         ctx.status = BrowserTurnStatus::Closed;
                         ctx.last_seen_at = now;
                         ctx.last_applied_sequence = event.sequence;
+                        BrowserTurnEventOutcome::Applied
+                    } else {
+                        BrowserTurnEventOutcome::Ignored("stale_or_mismatched_turn_close")
                     }
+                } else {
+                    BrowserTurnEventOutcome::Ignored("turn_context_not_found")
                 }
             }
             BrowserTurnEventKind::TurnStarted => {
                 if let Some(existing) = map.get_mut(&key) {
                     // 同实例 sequence 单调校验
                     if existing.tab_instance_id == event.tab_instance_id && event.sequence <= existing.last_applied_sequence {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("sequence_not_increasing");
                     }
                     if event.started_at < existing.browser_started_at_ms {
                         // 收到旧 Turn 的延迟启动事件，拒绝覆盖新 Turn
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("older_turn_start");
                     }
                     // 旧 Turn 标记为已被下一轮替换
                     existing.status = BrowserTurnStatus::CompletedByNextTurn;
@@ -223,14 +234,15 @@ impl BrowserTurnRegistry {
                     actual_model: event.actual_model,
                 };
                 map.insert(key, ctx);
+                BrowserTurnEventOutcome::Applied
             }
             BrowserTurnEventKind::TurnUpdated => {
                 if let Some(ctx) = map.get_mut(&key) {
                     if ctx.tab_instance_id != event.tab_instance_id {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("tab_instance_mismatch");
                     }
                     if event.sequence <= ctx.last_applied_sequence {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("sequence_not_increasing");
                     }
                     if ctx.turn_id == event.turn_id {
                         if event.conversation_id.is_some() {
@@ -252,16 +264,21 @@ impl BrowserTurnRegistry {
                             ctx.status = BrowserTurnStatus::Active;
                             ctx.stream_idle_since = None;
                         }
+                        BrowserTurnEventOutcome::Applied
+                    } else {
+                        BrowserTurnEventOutcome::Ignored("turn_id_mismatch")
                     }
+                } else {
+                    BrowserTurnEventOutcome::Ignored("turn_context_not_found")
                 }
             }
             BrowserTurnEventKind::ConversationResolved => {
                 if let Some(ctx) = map.get_mut(&key) {
                     if ctx.tab_instance_id != event.tab_instance_id {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("tab_instance_mismatch");
                     }
                     if event.sequence <= ctx.last_applied_sequence {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("sequence_not_increasing");
                     }
                     if ctx.turn_id == event.turn_id {
                         // 仅当原始 conversation_id 为空时允许 resolve，绝不允许历史导航覆盖已有 ID
@@ -274,23 +291,33 @@ impl BrowserTurnRegistry {
                             ctx.status = BrowserTurnStatus::Active;
                             ctx.stream_idle_since = None;
                         }
+                        BrowserTurnEventOutcome::Applied
+                    } else {
+                        BrowserTurnEventOutcome::Ignored("turn_id_mismatch")
                     }
+                } else {
+                    BrowserTurnEventOutcome::Ignored("turn_context_not_found")
                 }
             }
             BrowserTurnEventKind::StreamCompleted => {
                 if let Some(ctx) = map.get_mut(&key) {
                     if ctx.tab_instance_id != event.tab_instance_id {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("tab_instance_mismatch");
                     }
                     if event.sequence <= ctx.last_applied_sequence {
-                        return;
+                        return BrowserTurnEventOutcome::Ignored("sequence_not_increasing");
                     }
                     if ctx.turn_id == event.turn_id {
                         ctx.status = BrowserTurnStatus::StreamIdle;
                         ctx.stream_idle_since = Some(now);
                         ctx.last_seen_at = now;
                         ctx.last_applied_sequence = event.sequence;
+                        BrowserTurnEventOutcome::Applied
+                    } else {
+                        BrowserTurnEventOutcome::Ignored("turn_id_mismatch")
                     }
+                } else {
+                    BrowserTurnEventOutcome::Ignored("turn_context_not_found")
                 }
             }
         }
@@ -325,8 +352,7 @@ impl BrowserTurnRegistry {
                     }
                     BrowserTurnStatus::Stale
                     | BrowserTurnStatus::CompletedByNextTurn
-                    | BrowserTurnStatus::Closed
-                    | BrowserTurnStatus::Expired => false,
+                    | BrowserTurnStatus::Closed => false,
                 }
             })
             .cloned()
@@ -587,8 +613,7 @@ impl TurnCorrelator {
                     let context_matches = ctx.tab_id == binding.tab_id
                         && ctx.turn_id == binding.turn_id
                         && ctx.status != BrowserTurnStatus::CompletedByNextTurn
-                        && ctx.status != BrowserTurnStatus::Closed
-                        && ctx.status != BrowserTurnStatus::Expired;
+                        && ctx.status != BrowserTurnStatus::Closed;
                     if context_matches {
                         binding.last_used_at = now;
                         binding.conversation_id = ctx.conversation_id.clone();

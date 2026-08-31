@@ -165,6 +165,14 @@ export class TurnObserverOverlay {
       statusLabel = '待同步';
     }
 
+    if (state?.budgetStatus === 'warning') {
+      statusClass = 'warning';
+      statusLabel = '即将自动停止';
+    } else if (state?.budgetStatus === 'stopped') {
+      statusClass = 'failed';
+      statusLabel = '已自动停止';
+    }
+
     const durationText = this.formatDuration(this.timerSeconds);
 
     if (this.isCollapsed) {

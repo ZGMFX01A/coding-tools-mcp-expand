@@ -29,3 +29,6 @@ src-tauri/icons/icons/
 src-tauri/icons/logo-design.png
 
 docs/history-session/
+
+# 本地发布归档
+/release_dist/

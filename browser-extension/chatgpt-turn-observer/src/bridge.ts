@@ -1,4 +1,5 @@
 import { conversationIdFromUrl, extractActualModel, generateUuid } from './parsers';
+import { normalizeObserverBaseUrl, validateObserverStatusPayload } from './observer-protocol';
 import { TurnObserverOverlay } from './overlay';
 import { getOrCreateObserverId, loadSettings, saveSettings } from './settings';
 import {
@@ -7,6 +8,8 @@ import {
   type BrowserTurnEvent,
   type EventKind,
   type ObserverSettings,
+  type PageHookControlMessage,
+  CT_OBSERVER_CONTROL_SOURCE,
   type PageHookMessage,
   type TabTurnState,
 } from './types';
@@ -17,6 +20,11 @@ export interface OutboxItem {
   nextRetryAt: number;
 }
 
+export interface OutboxPersistence {
+  load: () => Promise<OutboxItem[]>;
+  save: (items: readonly OutboxItem[]) => Promise<void>;
+}
+
 function isCriticalEvent(kind: EventKind): boolean {
   return kind === 'turn_started' || kind === 'stream_completed' || kind === 'turn_closed';
 }
@@ -25,18 +33,53 @@ function isNonRetryableClientStatus(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 409 || status === 422;
 }
 
+const DEFAULT_TURN_WARNING_MS = 25 * 60 * 1000;
+const DEFAULT_TURN_HARD_STOP_MS = 29 * 60 * 1000;
+
 export class BridgeOutbox {
   private queue: OutboxItem[] = [];
-  private isProcessing = false;
+  private processingPromise: Promise<void> | null = null;
   private maxAttempts = 5;
   private maxCapacity = 128;
   private onStatusChange?: (status: TabTurnState['bridgeStatus'], message: string | null) => void;
+  private restored = false;
 
   constructor(
     private sendFn: (item: OutboxItem) => Promise<{ ok: boolean; status?: number; retryable: boolean; error?: string }>,
-    onStatusChange?: (status: TabTurnState['bridgeStatus'], message: string | null) => void
+    onStatusChange?: (status: TabTurnState['bridgeStatus'], message: string | null) => void,
+    private persistence?: OutboxPersistence,
   ) {
     this.onStatusChange = onStatusChange;
+  }
+
+  public async restore(): Promise<void> {
+    if (this.restored) return;
+    this.restored = true;
+    if (!this.persistence) return;
+
+    try {
+      const persisted = await this.persistence.load();
+      const currentIds = new Set(this.queue.map((item) => item.event.event_id));
+      this.queue = [
+        ...persisted.filter((item) => {
+          if (!item?.event?.event_id || currentIds.has(item.event.event_id)) return false;
+          currentIds.add(item.event.event_id);
+          return true;
+        }),
+        ...this.queue,
+      ];
+    } catch {
+      // 持久化不可用时仍保留内存队列，不阻断当前页面的观测。
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.persistence) return;
+    try {
+      await this.persistence.save(this.queue);
+    } catch {
+      // 发送链路仍按内存队列继续，下一次生命周期事件会再次尝试保存。
+    }
   }
 
   public enqueue(event: BrowserTurnEvent): boolean {
@@ -54,6 +97,8 @@ export class BridgeOutbox {
       attempts: 0,
       nextRetryAt: 0,
     });
+    // 立即启动持久化，不等待网络发送；页面在 pagehide 后可能很快被销毁。
+    void this.persist();
     void this.process();
     return true;
   }
@@ -68,13 +113,15 @@ export class BridgeOutbox {
 
   public clear(): void {
     this.queue = [];
+    void this.persist();
   }
 
-  public async process(): Promise<void> {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
+  public process(): Promise<void> {
+    if (this.processingPromise) return this.processingPromise;
 
-    try {
+    const run = (async () => {
+      await this.restore();
+      await this.persist();
       while (this.queue.length > 0) {
         const item = this.queue[0];
         const now = Date.now();
@@ -103,31 +150,70 @@ export class BridgeOutbox {
         if (result.ok) {
           // 发送成功，出队
           this.queue.shift();
+          await this.persist();
           this.onStatusChange?.('synced', '已同步');
         } else if (!result.retryable) {
           // 不可重试的业务错误 (400, 403, 422)，直接出队并记录错误
           this.queue.shift();
+          await this.persist();
           this.onStatusChange?.('failed', result.error || `HTTP ${result.status}`);
         } else {
           // 可重试错误 (网络连接断开、超时、5xx、429)
           if (item.attempts >= this.maxAttempts) {
             // 超过最大重试次数，出队丢弃
             this.queue.shift();
+            await this.persist();
             this.onStatusChange?.('failed', `重试超限丢弃: ${result.error || '网络异常'}`);
           } else {
             // 指数退避：500ms, 1000ms, 2000ms, 4000ms, 最大 10s
             const backoffMs = Math.min(500 * Math.pow(2, item.attempts - 1), 10_000);
             item.nextRetryAt = Date.now() + backoffMs;
+            await this.persist();
             this.onStatusChange?.('failed', `网络重试中 (${item.attempts}/${this.maxAttempts})`);
             setTimeout(() => void this.process(), backoffMs);
             break;
           }
         }
       }
-    } finally {
-      this.isProcessing = false;
-    }
+    })();
+    this.processingPromise = run.finally(() => {
+      this.processingPromise = null;
+    });
+    return this.processingPromise;
   }
+}
+
+export function getStableTabId(): number {
+  const storageKey = 'ct_observer_tab_id';
+  try {
+    const existing = window.sessionStorage.getItem(storageKey);
+    const parsed = existing ? Number.parseInt(existing, 10) : NaN;
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+
+    const generated = Math.floor(Math.random() * 1000000) + 1;
+    window.sessionStorage.setItem(storageKey, String(generated));
+    return generated;
+  } catch {
+    // sessionStorage 被策略禁用时仍允许观测运行；后端会通过 tab_instance_id 隔离实例。
+    return Math.floor(Math.random() * 1000000) + 1;
+  }
+}
+
+function createChromeOutboxPersistence(tabId: number): OutboxPersistence {
+  const storageKey = `ct_observer_outbox_${tabId}`;
+  return {
+    load: () =>
+      new Promise((resolve) => {
+        chrome.storage.local.get([storageKey], (result) => {
+          const value = result[storageKey];
+          resolve(Array.isArray(value) ? (value as OutboxItem[]) : []);
+        });
+      }),
+    save: (items) =>
+      new Promise((resolve) => {
+        chrome.storage.local.set({ [storageKey]: items }, () => resolve());
+      }),
+  };
 }
 
 export async function initBridge() {
@@ -147,13 +233,18 @@ export async function initBridge() {
   let settings: ObserverSettings = await loadSettings();
 
   const tabInstanceId = generateUuid();
-  const tabId = Math.floor(Math.random() * 1000000) + 1;
+  // sessionStorage 在同一浏览器 Tab 的 reload 中保持不变，避免后端无法识别“刷新后的同一 Tab”。
+  const tabId = getStableTabId();
   let sequence = 0;
 
   let localWorkspaceId: string | null = null;
   let remoteWorkspaceId: string | null = null;
   let localHandshakeDone = false;
   let remoteHandshakeDone = false;
+  let localWarningAfterMs = DEFAULT_TURN_WARNING_MS;
+  let localHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
+  let remoteWarningAfterMs = DEFAULT_TURN_WARNING_MS;
+  let remoteHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
   let handshakePromise: Promise<void> | null = null;
   let handshakeRevision = 0;
 
@@ -170,11 +261,16 @@ export async function initBridge() {
     state: 'idle',
     bridgeStatus: settings.bridgeToken ? 'idle' : 'not_configured',
     bridgeMessage: settings.bridgeToken ? null : '未配置 Token',
+    budgetStatus: 'normal',
     lastActiveAt: Date.now(),
   };
 
   let overlay: TurnObserverOverlay | null = null;
   let quietTimer: number | null = null;
+  let warningTimer: number | null = null;
+  let hardStopTimer: number | null = null;
+  let controlPollTimer: number | null = null;
+  let controlPollInFlight = false;
   const completedStreamIds = new Set<string>();
 
   function updateUi() {
@@ -212,8 +308,16 @@ export async function initBridge() {
     }
   });
 
-  async function queryStatus(baseUrl: string, timeoutMs = 2000): Promise<{ ok: boolean; workspaceId?: string; status?: number }> {
-    const url = `${baseUrl.trim().replace(/\/+$/, '')}/internal/chatgpt-turn-observer/status`;
+  async function queryStatus(baseUrl: string, timeoutMs = 2000): Promise<{
+    ok: boolean;
+    workspaceId?: string;
+    warningAfterMs?: number;
+    hardStopAfterMs?: number;
+    status?: number;
+  }> {
+    const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
+    if (!normalizedBaseUrl) return { ok: false };
+    const url = `${normalizedBaseUrl}/internal/chatgpt-turn-observer/status`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -224,15 +328,22 @@ export async function initBridge() {
         },
         signal: controller.signal,
       });
-      clearTimeout(timer);
       if (resp.ok) {
-        const data = await resp.json() as { workspace_id?: string };
-        return { ok: true, workspaceId: data.workspace_id };
+        const check = validateObserverStatusPayload(await resp.json());
+        return check.ok
+          ? {
+              ok: true,
+              workspaceId: check.workspaceId,
+              warningAfterMs: check.warningAfterMs,
+              hardStopAfterMs: check.hardStopAfterMs,
+            }
+          : { ok: false, status: resp.status };
       }
       return { ok: false, status: resp.status };
     } catch {
-      clearTimeout(timer);
       return { ok: false };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -251,6 +362,10 @@ export async function initBridge() {
     localHandshakeDone = false;
     remoteWorkspaceId = null;
     remoteHandshakeDone = false;
+    localWarningAfterMs = DEFAULT_TURN_WARNING_MS;
+    localHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
+    remoteWarningAfterMs = DEFAULT_TURN_WARNING_MS;
+    remoteHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
 
     handshakePromise = (async () => {
       if (!token) return;
@@ -268,6 +383,8 @@ export async function initBridge() {
       if (localResult.ok && localResult.workspaceId) {
         localWorkspaceId = localResult.workspaceId;
         localHandshakeDone = true;
+        localWarningAfterMs = localResult.warningAfterMs || DEFAULT_TURN_WARNING_MS;
+        localHardStopAfterMs = localResult.hardStopAfterMs || DEFAULT_TURN_HARD_STOP_MS;
       } else {
         localWorkspaceId = null;
         localHandshakeDone = false;
@@ -276,6 +393,8 @@ export async function initBridge() {
       if (remoteResult.ok && remoteResult.workspaceId) {
         remoteWorkspaceId = remoteResult.workspaceId;
         remoteHandshakeDone = true;
+        remoteWarningAfterMs = remoteResult.warningAfterMs || DEFAULT_TURN_WARNING_MS;
+        remoteHardStopAfterMs = remoteResult.hardStopAfterMs || DEFAULT_TURN_HARD_STOP_MS;
       } else {
         remoteWorkspaceId = null;
         remoteHandshakeDone = false;
@@ -297,8 +416,17 @@ export async function initBridge() {
 
   void handshakeWorkspaces();
 
-  async function postEvent(baseUrl: string, event: BrowserTurnEvent, timeoutMs = 2500): Promise<Response> {
-    const url = `${baseUrl.trim().replace(/\/+$/, '')}/internal/chatgpt-turn-event`;
+  async function postEvent(
+    baseUrl: string,
+    event: BrowserTurnEvent,
+    timeoutMs = 2500,
+    keepalive = false,
+  ): Promise<{ response: Response; accepted: boolean; message?: string }> {
+    const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
+    if (!normalizedBaseUrl) {
+      throw new Error('Observer Base URL 为空');
+    }
+    const url = `${normalizedBaseUrl}/internal/chatgpt-turn-event`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -311,12 +439,53 @@ export async function initBridge() {
         },
         body: JSON.stringify(event),
         signal: controller.signal,
+        keepalive,
       });
-      clearTimeout(timer);
-      return resp;
+      if (!resp.ok) {
+        let message: string | undefined;
+        try {
+          const payload = await resp.clone().json() as {
+            error?: unknown;
+          };
+          if (typeof payload.error === 'string') {
+            message = payload.error;
+          } else if (payload.error && typeof payload.error === 'object') {
+            const detail = payload.error as { code?: unknown; reason?: unknown };
+            message = [detail.code, detail.reason]
+              .filter((value): value is string => typeof value === 'string' && value.length > 0)
+              .join(': ') || undefined;
+          }
+        } catch {
+          // 保留 HTTP 状态作为错误信息。
+        }
+        return { response: resp, accepted: false, message };
+      }
+
+      try {
+        const payload = await resp.json() as { ok?: boolean; applied?: boolean; duplicate?: boolean; error?: unknown };
+        const accepted = payload.ok === true && (payload.applied === true || payload.duplicate === true);
+        const error = payload.error && typeof payload.error === 'object'
+          ? payload.error as { code?: unknown; reason?: unknown }
+          : null;
+        const message = typeof payload.error === 'string'
+          ? payload.error
+          : [error?.code, error?.reason]
+            .filter((value): value is string => typeof value === 'string' && value.length > 0)
+            .join(': ') || undefined;
+        return {
+          response: resp,
+          accepted,
+          message: accepted
+            ? undefined
+            : message || '服务端未确认事件已应用',
+        };
+      } catch {
+        return { response: resp, accepted: false, message: '服务端 ACK 不是有效 JSON' };
+      }
     } catch (err) {
-      clearTimeout(timer);
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -337,10 +506,15 @@ export async function initBridge() {
       if (!localWorkspaceId) return { ok: false, retryable: true, error: 'Local workspace 未完成握手' };
       item.event.workspace_id = localWorkspaceId;
       try {
-        const resp = await postEvent(settings.localBaseUrl, item.event, 3000);
-        if (resp.ok) return { ok: true, status: 200, retryable: false };
-        const isClientError = isNonRetryableClientStatus(resp.status);
-        return { ok: false, status: resp.status, retryable: !isClientError, error: `Local HTTP ${resp.status}` };
+        const ack = await postEvent(settings.localBaseUrl, item.event, 3000);
+        if (ack.accepted) return { ok: true, status: ack.response.status, retryable: false };
+        const isClientError = isNonRetryableClientStatus(ack.response.status) || ack.response.ok;
+        return {
+          ok: false,
+          status: ack.response.status,
+          retryable: !isClientError,
+          error: ack.message || `Local HTTP ${ack.response.status}`,
+        };
       } catch (err) {
         return { ok: false, retryable: true, error: err instanceof Error ? err.message : 'Local 网络错误' };
       }
@@ -353,10 +527,15 @@ export async function initBridge() {
       if (!remoteWorkspaceId) return { ok: false, retryable: true, error: 'Remote workspace 未完成握手' };
       item.event.workspace_id = remoteWorkspaceId;
       try {
-        const resp = await postEvent(settings.remoteBaseUrl, item.event, 4000);
-        if (resp.ok) return { ok: true, status: 200, retryable: false };
-        const isClientError = isNonRetryableClientStatus(resp.status);
-        return { ok: false, status: resp.status, retryable: !isClientError, error: `Remote HTTP ${resp.status}` };
+        const ack = await postEvent(settings.remoteBaseUrl, item.event, 4000);
+        if (ack.accepted) return { ok: true, status: ack.response.status, retryable: false };
+        const isClientError = isNonRetryableClientStatus(ack.response.status) || ack.response.ok;
+        return {
+          ok: false,
+          status: ack.response.status,
+          retryable: !isClientError,
+          error: ack.message || `Remote HTTP ${ack.response.status}`,
+        };
       } catch (err) {
         return { ok: false, retryable: true, error: err instanceof Error ? err.message : 'Remote 网络错误' };
       }
@@ -368,11 +547,16 @@ export async function initBridge() {
         if (localHandshakeDone && localWorkspaceId) {
           item.event.workspace_id = localWorkspaceId;
           try {
-            const resp = await postEvent(settings.localBaseUrl, item.event, 800);
-            if (resp.ok) return { ok: true, status: 200, retryable: false };
-            const isClientError = isNonRetryableClientStatus(resp.status);
+            const ack = await postEvent(settings.localBaseUrl, item.event, 800);
+            if (ack.accepted) return { ok: true, status: ack.response.status, retryable: false };
+            const isClientError = isNonRetryableClientStatus(ack.response.status) || ack.response.ok;
             if (isClientError) {
-              return { ok: false, status: resp.status, retryable: false, error: `Local HTTP ${resp.status}` };
+              return {
+                ok: false,
+                status: ack.response.status,
+                retryable: false,
+                error: ack.message || `Local HTTP ${ack.response.status}`,
+              };
             }
             // Local 网关故障也允许 Auto 尝试 Remote；业务 4xx 已在上面终止。
             localFailedWithNetwork = true;
@@ -391,10 +575,15 @@ export async function initBridge() {
         if (remoteHandshakeDone && remoteWorkspaceId) {
           item.event.workspace_id = remoteWorkspaceId;
           try {
-            const resp = await postEvent(settings.remoteBaseUrl, item.event, 4000);
-            if (resp.ok) return { ok: true, status: 200, retryable: false };
-            const isClientError = isNonRetryableClientStatus(resp.status);
-            return { ok: false, status: resp.status, retryable: !isClientError, error: `Remote HTTP ${resp.status}` };
+            const ack = await postEvent(settings.remoteBaseUrl, item.event, 4000);
+            if (ack.accepted) return { ok: true, status: ack.response.status, retryable: false };
+            const isClientError = isNonRetryableClientStatus(ack.response.status) || ack.response.ok;
+            return {
+              ok: false,
+              status: ack.response.status,
+              retryable: !isClientError,
+              error: ack.message || `Remote HTTP ${ack.response.status}`,
+            };
           } catch (err) {
             return { ok: false, retryable: true, error: err instanceof Error ? err.message : 'Remote 网络错误' };
           }
@@ -407,7 +596,10 @@ export async function initBridge() {
     tabState.bridgeStatus = status;
     tabState.bridgeMessage = msg;
     updateUi();
-  });
+  }, createChromeOutboxPersistence(tabId));
+
+  // 先恢复持久化队列，再开始接收页面事件，避免刷新时旧生命周期事件被新事件覆盖。
+  await outbox.restore();
 
   function getReadyEndpoint(): { baseUrl: string; workspaceId: string } | null {
     if (settings.bridgeMode === 'local') {
@@ -430,7 +622,7 @@ export async function initBridge() {
   }
 
   function dispatchTurnEvent(kind: EventKind, extra?: Partial<BrowserTurnEvent>) {
-    if (!tabState.turnId && kind !== 'turn_closed') return;
+    if (!tabState.turnId) return null;
 
     sequence += 1;
     const event: BrowserTurnEvent = {
@@ -453,6 +645,184 @@ export async function initBridge() {
     };
 
     outbox.enqueue(event);
+    return event;
+  }
+
+  function clearTurnTimers(): void {
+    if (warningTimer !== null) {
+      clearTimeout(warningTimer);
+      warningTimer = null;
+    }
+    if (hardStopTimer !== null) {
+      clearTimeout(hardStopTimer);
+      hardStopTimer = null;
+    }
+  }
+
+  function resetTurnState(budgetStatus: 'normal' | 'warning' | 'stopped' = 'normal'): void {
+    tabState.turnId = null;
+    tabState.activeCaptureId = null;
+    tabState.requestId = null;
+    tabState.startedAt = null;
+    tabState.completedAt = null;
+    tabState.requestedModel = null;
+    tabState.actualModel = null;
+    tabState.state = 'idle';
+    tabState.budgetStatus = budgetStatus;
+    completedStreamIds.clear();
+    clearTurnTimers();
+    stopControlPolling();
+  }
+
+  function requestPageHookStop(reason: string): void {
+    const targetOrigin = window.location.origin;
+    if (!targetOrigin || targetOrigin === 'null') return;
+    const message: PageHookControlMessage = {
+      source: CT_OBSERVER_CONTROL_SOURCE,
+      type: 'STOP_TURN',
+      payload: {
+        captureId: tabState.activeCaptureId,
+        turnId: tabState.turnId,
+        reason,
+      },
+    };
+    try {
+      window.postMessage(message, targetOrigin);
+    } catch {
+      // 页面即将终止或 origin 不可用时，仍由 turn_closed 事件告知后端。
+    }
+  }
+
+  function closeCurrentTurn(reason?: string): BrowserTurnEvent | null {
+    if (!tabState.turnId) return null;
+    if (reason) requestPageHookStop(reason);
+
+    const completedAt = Date.now();
+    tabState.completedAt = completedAt;
+    const event = dispatchTurnEvent('turn_closed', { completed_at: completedAt });
+    resetTurnState(reason === 'turn_budget_hard_stop' ? 'stopped' : 'normal');
+    return event;
+  }
+
+  function getTurnBudgetDurations(): { warningAfterMs: number; hardStopAfterMs: number } {
+    if (settings.bridgeMode === 'local') {
+      return { warningAfterMs: localWarningAfterMs, hardStopAfterMs: localHardStopAfterMs };
+    }
+    if (settings.bridgeMode === 'remote') {
+      return { warningAfterMs: remoteWarningAfterMs, hardStopAfterMs: remoteHardStopAfterMs };
+    }
+    if (localHandshakeDone) {
+      return { warningAfterMs: localWarningAfterMs, hardStopAfterMs: localHardStopAfterMs };
+    }
+    if (remoteHandshakeDone) {
+      return { warningAfterMs: remoteWarningAfterMs, hardStopAfterMs: remoteHardStopAfterMs };
+    }
+    return { warningAfterMs: DEFAULT_TURN_WARNING_MS, hardStopAfterMs: DEFAULT_TURN_HARD_STOP_MS };
+  }
+
+  function scheduleTurnTimers(): void {
+    clearTurnTimers();
+    if (!tabState.turnId || !tabState.startedAt) return;
+
+    const scheduledTurnId = tabState.turnId;
+    const startedAt = tabState.startedAt;
+    const { warningAfterMs, hardStopAfterMs } = getTurnBudgetDurations();
+    const warnIn = Math.max(0, startedAt + warningAfterMs - Date.now());
+    const stopIn = Math.max(0, startedAt + hardStopAfterMs - Date.now());
+
+    warningTimer = window.setTimeout(() => {
+      if (tabState.turnId !== scheduledTurnId) return;
+      tabState.budgetStatus = 'warning';
+      tabState.bridgeMessage = '本轮接近 29 分钟上限，将在到点自动停止';
+      updateUi();
+    }, warnIn);
+
+    hardStopTimer = window.setTimeout(() => {
+      if (tabState.turnId !== scheduledTurnId) return;
+      tabState.budgetStatus = 'stopped';
+      tabState.bridgeMessage = '本轮已达到 29 分钟上限，正在停止网页生成';
+      closeCurrentTurn('turn_budget_hard_stop');
+      updateUi();
+    }, stopIn);
+  }
+
+  async function queryTurnControl(baseUrl: string, turnId: string): Promise<{ command?: string; reason?: string } | null> {
+    const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
+    if (!normalizedBaseUrl || !settings.bridgeToken.trim()) return null;
+
+    const query = new URLSearchParams({
+      observer_id: observerId,
+      tab_instance_id: tabInstanceId,
+      tab_id: String(tabId),
+      turn_id: turnId,
+    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const resp = await fetch(`${normalizedBaseUrl}/internal/chatgpt-turn-observer/control?${query.toString()}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${settings.bridgeToken.trim()}` },
+        signal: controller.signal,
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json() as { ok?: boolean; command?: unknown; reason?: unknown };
+      if (data.ok !== true) return null;
+      return {
+        command: typeof data.command === 'string' ? data.command : undefined,
+        reason: typeof data.reason === 'string' ? data.reason : undefined,
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function pollTurnControl(expectedTurnId: string): Promise<void> {
+    if (controlPollInFlight || tabState.turnId !== expectedTurnId) return;
+    const endpoint = getReadyEndpoint();
+    if (!endpoint) return;
+
+    controlPollInFlight = true;
+    try {
+      const command = await queryTurnControl(endpoint.baseUrl, expectedTurnId);
+      if (tabState.turnId !== expectedTurnId || !command) return;
+      if (command.command === 'warn') {
+        tabState.budgetStatus = 'warning';
+        tabState.bridgeMessage = '后端报告本轮接近时间上限';
+        updateUi();
+      } else if (command.command === 'stop_turn') {
+        tabState.budgetStatus = 'stopped';
+        tabState.bridgeMessage = '后端已通知停止网页生成';
+        closeCurrentTurn('turn_budget_hard_stop');
+        updateUi();
+      }
+    } finally {
+      controlPollInFlight = false;
+    }
+  }
+
+  function stopControlPolling(): void {
+    if (controlPollTimer !== null) {
+      clearTimeout(controlPollTimer);
+      controlPollTimer = null;
+    }
+  }
+
+  function scheduleControlPolling(): void {
+    stopControlPolling();
+    if (!tabState.turnId) return;
+
+    const expectedTurnId = tabState.turnId;
+    const tick = () => {
+      if (tabState.turnId !== expectedTurnId) return;
+      void pollTurnControl(expectedTurnId).finally(() => {
+        if (tabState.turnId === expectedTurnId) {
+          controlPollTimer = window.setTimeout(tick, 2000);
+        }
+      });
+    };
+    tick();
   }
 
   function handleQuietWindow(streamId?: string | null) {
@@ -468,49 +838,21 @@ export async function initBridge() {
           completedStreamIds.add(key);
           dispatchTurnEvent('stream_completed');
         }
+        clearTurnTimers();
+        stopControlPolling();
         updateUi();
       }
     }, 1000);
   }
 
-  // 页面关闭时使用 fetch keepalive 派发认证关闭事件
+  // 页面关闭时先进入持久化 Outbox，再用 keepalive 尽力发送一次；两条路径使用同一 event_id，后端幂等去重。
   window.addEventListener('pagehide', () => {
+    const closeEvent = closeCurrentTurn();
     const endpoint = getReadyEndpoint();
-    if (tabState.turnId && settings.bridgeToken && endpoint) {
-      const closeEvent: BrowserTurnEvent = {
-        schema_version: 1,
-        event_id: generateUuid(),
-        tab_instance_id: tabInstanceId,
-        observer_id: observerId,
-        tab_id: tabId,
-        sequence: ++sequence,
-        event: 'turn_closed',
-        workspace_id: endpoint.workspaceId,
-        conversation_id: tabState.conversationId,
-        turn_id: tabState.turnId,
-        request_id: tabState.requestId,
-        started_at: tabState.startedAt || Date.now(),
-        completed_at: Date.now(),
-        requested_model: tabState.requestedModel,
-        actual_model: tabState.actualModel,
-      };
-
-      if (endpoint) {
-        const url = `${endpoint.baseUrl.trim().replace(/\/+$/, '')}/internal/chatgpt-turn-event`;
-        try {
-          void fetch(url, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${settings.bridgeToken.trim()}`,
-            },
-            body: JSON.stringify(closeEvent),
-            keepalive: true,
-          });
-        } catch {
-          // 忽略关闭发送异常
-        }
-      }
+    if (closeEvent && settings.bridgeToken && endpoint) {
+      void postEvent(endpoint.baseUrl, { ...closeEvent, workspace_id: endpoint.workspaceId }, 1000, true).catch(() => {
+        // Outbox 已保留事件；页面卸载时 keepalive 失败无需再次阻塞。
+      });
     }
   });
 
@@ -527,20 +869,9 @@ export async function initBridge() {
     switch (data.type) {
       case 'URL_CHANGE': {
         const newConvId = data.payload?.conversationId || null;
-        if (newConvId && newConvId !== tabState.conversationId) {
-          if (tabState.turnId) {
-            dispatchTurnEvent('turn_closed', { completed_at: Date.now() });
-          }
+        if (newConvId !== tabState.conversationId) {
+          closeCurrentTurn();
           tabState.conversationId = newConvId;
-          tabState.turnId = null;
-          tabState.activeCaptureId = null;
-          tabState.requestId = null;
-          tabState.startedAt = null;
-          tabState.completedAt = null;
-          tabState.requestedModel = null;
-          tabState.actualModel = null;
-          tabState.state = 'idle';
-          completedStreamIds.clear();
           updateUi();
         }
         break;
@@ -549,7 +880,11 @@ export async function initBridge() {
         const { captureId, turnId, requestedModel, conversationId, startedAt } = data.payload || {};
         if (!turnId) return;
 
+        if (tabState.turnId === turnId) return;
+        closeCurrentTurn();
+
         completedStreamIds.clear();
+        if (settings.bridgeToken) tabState.bridgeMessage = null;
         tabState.turnId = turnId;
         tabState.activeCaptureId = captureId || null;
         tabState.startedAt = startedAt || Date.now();
@@ -563,6 +898,19 @@ export async function initBridge() {
 
         updateUi();
         dispatchTurnEvent('turn_started');
+        scheduleTurnTimers();
+        scheduleControlPolling();
+        break;
+      }
+      case 'TURN_ABORTED': {
+        const { captureId, turnId, reason } = data.payload || {};
+        if (captureId && tabState.activeCaptureId && captureId !== tabState.activeCaptureId) return;
+        if (turnId && tabState.turnId && turnId !== tabState.turnId) return;
+        if (!tabState.turnId) return;
+
+        tabState.bridgeMessage = `网页生成已中止${reason ? `: ${reason}` : ''}`;
+        closeCurrentTurn();
+        updateUi();
         break;
       }
       case 'SSE_CHUNK': {

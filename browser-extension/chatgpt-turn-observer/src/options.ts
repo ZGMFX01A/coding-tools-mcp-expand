@@ -1,4 +1,5 @@
 import { loadSettings, saveSettings } from './settings';
+import { normalizeObserverBaseUrl, validateObserverStatusPayload } from './observer-protocol';
 import type { BridgeMode } from './types';
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -51,7 +52,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!baseUrl) {
       return { ok: false, message: `${name}: 未配置地址` };
     }
-    const cleanUrl = `${baseUrl.trim().replace(/\/+$/, '')}/internal/chatgpt-turn-observer/status`;
+    const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
+    if (!normalizedBaseUrl) {
+      return { ok: false, message: `${name}: 地址为空` };
+    }
+    const cleanUrl = `${normalizedBaseUrl}/internal/chatgpt-turn-observer/status`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 4000);
 
@@ -70,7 +75,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
           jsonPayload = await resp.json();
         } catch {
-          // ignore
+          return { ok: false, message: `${name}: 状态响应不是有效 JSON` };
+        }
+        const statusCheck = validateObserverStatusPayload(jsonPayload);
+        if (!statusCheck.ok) {
+          return { ok: false, message: `${name}: 不是有效的 ChatGPT Turn Observer (${statusCheck.error})` };
         }
         return {
           ok: true,

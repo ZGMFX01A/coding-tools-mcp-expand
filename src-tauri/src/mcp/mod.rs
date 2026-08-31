@@ -5,7 +5,7 @@ pub mod server;
 pub mod turn_budget;
 
 pub use browser_turn::{
-    BrowserTurnContext, BrowserTurnEvent, BrowserTurnRegistry, BrowserTurnStatus,
+    BrowserTurnContext, BrowserTurnEvent, BrowserTurnEventOutcome, BrowserTurnRegistry, BrowserTurnStatus,
     CorrelationConfidence, TurnCorrelator, TurnIdentity,
 };
 pub use listener::{spawn_listener, ShutdownSender};

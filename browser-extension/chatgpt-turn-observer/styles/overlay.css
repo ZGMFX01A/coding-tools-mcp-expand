@@ -120,6 +120,10 @@
   background: #f59e0b;
 }
 
+.ct-turn-observer-status-dot.warning {
+  background: #f59e0b;
+}
+
 .ct-turn-observer-status-dot.failed {
   background: #ef4444;
 }
