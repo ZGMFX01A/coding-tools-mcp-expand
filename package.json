@@ -1,6 +1,6 @@
 {
   "name": "coding-tools-mcp-desktop",
-  "version": "0.1.30",
+  "version": "0.2.1",
   "description": "Coding Tools MCP desktop client",
   "type": "module",
   "scripts": {
@@ -14,7 +14,8 @@
     "extension:build": "npm --prefix browser-extension/chatgpt-turn-observer run build",
     "extension:test": "npm --prefix browser-extension/chatgpt-turn-observer test",
     "extension:check": "npm --prefix browser-extension/chatgpt-turn-observer run typecheck",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:sync": "node scripts/sync-release-version.mjs"
   },
   "license": "Apache-2.0",
   "dependencies": {

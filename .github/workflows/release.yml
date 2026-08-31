@@ -150,6 +150,8 @@ jobs:
           zip -r "../../../chatgpt-turn-observer-${RELEASE_VERSION}.zip" .
 
       - name: 上传浏览器扩展 ZIP
+
+      - name: 上传浏览器扩展 ZIP
         uses: actions/upload-artifact@v6
         with:
           name: browser-extension-zip
@@ -162,8 +164,12 @@ jobs:
       - build-universal-macos
       - build-browser-extension
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: 下载 Windows EXE
+      - uses: actions/checkout@v6
+
+      - name: 下载 Windows 产物
         uses: actions/download-artifact@v7
         with:
           name: windows-exe
@@ -181,16 +187,25 @@ jobs:
           name: browser-extension-zip
           path: dist/extension
 
-      - name: 创建 Release 并上传安装包与浏览器扩展
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          name: Coding Tools MCP ${{ inputs.release_tag || github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          files: |
-            dist/windows/**/*.exe
-            dist/windows/**/*.zip
-            dist/macos/**/*.dmg
-            dist/extension/**/*.zip
+      - name: 整理发布资产文件
+        run: |
+          mkdir -p release_assets
+          find dist -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.dmg" \) -exec cp {} release_assets/ \;
+          echo "=== 待发布的资产列表 ==="
+          ls -la release_assets/
+
+      - name: 发布或更新 Release 并上传安装包与浏览器扩展
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在，正在覆盖上传最新构建产物..."
+            gh release upload "$RELEASE_TAG" release_assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "Release $RELEASE_TAG 不存在，正在创建 Release 并上传产物..."
+            gh release create "$RELEASE_TAG" release_assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Coding Tools MCP $RELEASE_TAG" \
+              --generate-notes
+          fi
