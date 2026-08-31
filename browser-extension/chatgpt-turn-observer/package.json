@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-turn-observer",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Coding Tools ChatGPT Turn Observer Chrome Extension",
   "private": true,
   "type": "module",

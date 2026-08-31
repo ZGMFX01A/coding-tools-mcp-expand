@@ -36,6 +36,37 @@ function isNonRetryableClientStatus(status: number): boolean {
 const DEFAULT_TURN_WARNING_MS = 23 * 60 * 1000;
 const DEFAULT_TURN_HARD_STOP_MS = 25 * 60 * 1000;
 
+/**
+ * A budget stop belongs only to the turn that reached the limit.  Starting a
+ * different observed turn must always clear that terminal UI state.
+ */
+export function resetBudgetStatusForNewTurn(tabState: TabTurnState): void {
+  tabState.budgetStatus = 'normal';
+}
+
+export function startObservedTurn(
+  tabState: TabTurnState,
+  details: {
+    captureId?: string | null;
+    turnId: string;
+    requestedModel?: string | null;
+    conversationId?: string | null;
+    startedAt?: number;
+  },
+): void {
+  resetBudgetStatusForNewTurn(tabState);
+  tabState.turnId = details.turnId;
+  tabState.activeCaptureId = details.captureId || null;
+  tabState.startedAt = details.startedAt || Date.now();
+  tabState.completedAt = null;
+  tabState.requestedModel = details.requestedModel || null;
+  tabState.actualModel = null;
+  tabState.state = 'turn_starting';
+  if (details.conversationId) {
+    tabState.conversationId = details.conversationId;
+  }
+}
+
 export class BridgeOutbox {
   private queue: OutboxItem[] = [];
   private processingPromise: Promise<void> | null = null;
@@ -885,16 +916,7 @@ export async function initBridge() {
 
         completedStreamIds.clear();
         if (settings.bridgeToken) tabState.bridgeMessage = null;
-        tabState.turnId = turnId;
-        tabState.activeCaptureId = captureId || null;
-        tabState.startedAt = startedAt || Date.now();
-        tabState.completedAt = null;
-        tabState.requestedModel = requestedModel || null;
-        tabState.actualModel = null;
-        tabState.state = 'turn_starting';
-        if (conversationId) {
-          tabState.conversationId = conversationId;
-        }
+        startObservedTurn(tabState, { captureId, turnId, requestedModel, conversationId, startedAt });
 
         updateUi();
         dispatchTurnEvent('turn_started');
