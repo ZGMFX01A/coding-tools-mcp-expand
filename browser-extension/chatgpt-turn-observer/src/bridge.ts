@@ -33,8 +33,8 @@ function isNonRetryableClientStatus(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 409 || status === 422;
 }
 
-const DEFAULT_TURN_WARNING_MS = 25 * 60 * 1000;
-const DEFAULT_TURN_HARD_STOP_MS = 29 * 60 * 1000;
+const DEFAULT_TURN_WARNING_MS = 23 * 60 * 1000;
+const DEFAULT_TURN_HARD_STOP_MS = 25 * 60 * 1000;
 
 export class BridgeOutbox {
   private queue: OutboxItem[] = [];
@@ -733,14 +733,14 @@ export async function initBridge() {
     warningTimer = window.setTimeout(() => {
       if (tabState.turnId !== scheduledTurnId) return;
       tabState.budgetStatus = 'warning';
-      tabState.bridgeMessage = '本轮接近 29 分钟上限，将在到点自动停止';
+      tabState.bridgeMessage = '本轮接近 25 分钟上限，将在到点自动停止';
       updateUi();
     }, warnIn);
 
     hardStopTimer = window.setTimeout(() => {
       if (tabState.turnId !== scheduledTurnId) return;
       tabState.budgetStatus = 'stopped';
-      tabState.bridgeMessage = '本轮已达到 29 分钟上限，正在停止网页生成';
+      tabState.bridgeMessage = '本轮已达到 25 分钟上限，正在停止网页生成';
       closeCurrentTurn('turn_budget_hard_stop');
       updateUi();
     }, stopIn);

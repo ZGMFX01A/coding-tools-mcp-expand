@@ -311,19 +311,19 @@ pub fn is_wrap_up_verification_command(cmd: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AgentTurnBudgetConfig {
     pub enabled: bool,
-    /// 触发 25 分钟提醒的时间阈值
+    /// 触发 23 分钟提醒的时间阈值
     pub warning_after: Duration,
-    /// 触发 27 分钟收敛阶段（禁止 investigation 与外部工具）
+    /// 触发 24 分钟收敛阶段（禁止 investigation 与外部工具）
     pub wrap_up_after: Duration,
-    /// 触发 28 分钟收尾阶段（仅允许最小只读收尾工具）
+    /// 触发 24 分 30 秒收尾阶段（仅允许最小只读收尾工具）
     pub finalization_after: Duration,
-    /// 调度截止预留时间（默认 5s，在 29m - 5s = 28m55s 之后拒绝启动新工具）
+    /// 调度截止预留时间（默认 5s，在 25m - 5s = 24m55s 之后拒绝启动新工具）
     pub deadline_reserve: Duration,
-    /// 29 分钟硬停止时间阈值
+    /// 25 分钟硬停止时间阈值
     pub hard_stop_after: Duration,
     /// 早期（<20m）普通空闲重置阈值（默认 90s）
     pub early_idle_reset: Duration,
-    /// 中期（20m~25m）空闲重置阈值（默认 180s）
+    /// 中期（20m~23m）空闲重置阈值（默认 180s）
     pub mid_idle_reset: Duration,
     /// 平台单轮执行假定硬限制（默认 30m）
     pub platform_turn_limit: Duration,
@@ -339,10 +339,10 @@ impl Default for AgentTurnBudgetConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            warning_after: Duration::from_secs(25 * 60),
-            wrap_up_after: Duration::from_secs(27 * 60),
-            finalization_after: Duration::from_secs(28 * 60),
-            hard_stop_after: Duration::from_secs(29 * 60),
+            warning_after: Duration::from_secs(23 * 60),
+            wrap_up_after: Duration::from_secs(24 * 60),
+            finalization_after: Duration::from_secs(24 * 60 + 30),
+            hard_stop_after: Duration::from_secs(25 * 60),
             deadline_reserve: Duration::from_secs(5),
             early_idle_reset: Duration::from_secs(90),
             mid_idle_reset: Duration::from_secs(180),
@@ -1004,7 +1004,7 @@ impl AgentTurnBudgetManager {
                     .hard_stop_after
                     .saturating_sub(self.config.deadline_reserve);
 
-                // 1. HARD_STOP (>= 29m)
+                // 1. HARD_STOP (>= 25m)
                 if elapsed >= self.config.hard_stop_after {
                     state.hard_stopped_at.get_or_insert(now);
                     let snapshot = TurnBudgetSnapshot {
@@ -1038,7 +1038,7 @@ impl AgentTurnBudgetManager {
                         )),
                     )
                 } else if elapsed >= cutoff_point {
-                    // 2. DISPATCH_CUTOFF (28m55s ~ 29m)
+                    // 2. DISPATCH_CUTOFF (24m55s ~ 25m)
                     let snapshot = TurnBudgetSnapshot {
                         status: TurnBudgetStatus::DispatchCutoff,
                         elapsed_seconds: elapsed.as_secs(),
@@ -1210,7 +1210,7 @@ impl AgentTurnBudgetManager {
                         )
                     }
                 } else if elapsed >= self.config.warning_after {
-                    // 5. WARNING (25m ~ 27m): 允许所有工具，但记录 post_warning_investigation_attempt
+                    // 5. WARNING (23m ~ 24m): 允许所有工具，但记录 post_warning_investigation_attempt
                     state.active_calls += 1;
                     state.last_call_started_at = now;
                     let runtime_budget = cutoff_point.saturating_sub(elapsed);
@@ -1256,7 +1256,7 @@ impl AgentTurnBudgetManager {
                         },
                     )
                 } else {
-                    // 6. NORMAL (< 25m)
+                    // 6. NORMAL (< 23m)
                     state.active_calls += 1;
                     state.last_call_started_at = now;
                     let runtime_budget = cutoff_point.saturating_sub(elapsed);
@@ -1407,7 +1407,7 @@ impl AgentTurnBudgetManager {
         if emit_full_warning && snapshot.status == TurnBudgetStatus::Warning {
             prepend_content_text(
                 &mut result,
-                "[TURN BUDGET WARNING]\nThis agent turn has been using tools for about 25 minutes.\nStop expanding the task. Finish only the currently necessary work, then respond to the user with completed work, verification results, and remaining work.\n\n",
+                "[TURN BUDGET WARNING]\nThis agent turn has been using tools for about 23 minutes.\nStop expanding the task. Finish only the currently necessary work, then respond to the user with completed work, verification results, and remaining work.\n\n",
             );
         } else if snapshot.status == TurnBudgetStatus::Finalization || snapshot.status == TurnBudgetStatus::Urgent {
             prepend_content_text(

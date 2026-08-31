@@ -14,9 +14,9 @@ describe('observer protocol helpers', () => {
         ok: true,
         service: 'chatgpt_turn_observer',
         workspace_id: 'ws-1',
-        turn_budget: { warning_after_seconds: 1500, hard_stop_after_seconds: 1740 },
+        turn_budget: { warning_after_seconds: 1380, hard_stop_after_seconds: 1500 },
       }),
-    ).toMatchObject({ ok: true, workspaceId: 'ws-1', warningAfterMs: 1500000, hardStopAfterMs: 1740000 });
+    ).toMatchObject({ ok: true, workspaceId: 'ws-1', warningAfterMs: 1380000, hardStopAfterMs: 1500000 });
     expect(validateObserverStatusPayload({ ok: true, workspace_id: 'ws-1' }).ok).toBe(false);
     expect(
       validateObserverStatusPayload({ ok: true, service: 'other', workspace_id: 'ws-1' }).ok,

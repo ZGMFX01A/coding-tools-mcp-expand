@@ -9,7 +9,7 @@
 ## 核心价值与问题解决
 
 1. **彻底修复“旧对话 HardStop 污染新对话”的真实 Bug**：
-   - **痛点**：过去仅依赖 `_meta.openai/session` 启发式推断。当某长会话耗尽 29 分钟本地执行预算进入 HardStop 后，用户切换到新对话时，旧的 session 仍可能被复用，导致新对话首个工具调用直接被误杀。
+   - **痛点**：过去仅依赖 `_meta.openai/session` 启发式推断。当某长会话耗尽 25 分钟本地执行预算进入 HardStop 后，用户切换到新对话时，旧的 session 仍可能被复用，导致新对话首个工具调用直接被误杀。
    - **解决**：Observer 精确上报 `conversation_id` 与 `turn_id`。一旦用户切换对话或开启新一轮提问，Coding Tools 后端立即为新 Turn 初始化全新预算（0 秒耗时、Normal 阶段），彻底消除历史限制继承。
 2. **Turn 预算起点精确对其浏览器观测**：
    - 将预算计时起点从“服务端首次观测到工具调用的时刻 (`first_observed_tool_call`)”升级为“浏览器发起并观测到用户本轮生成开始的时刻 (`browser_observed_turn_start`)”。
@@ -107,7 +107,7 @@ npm run build
 
 - **Turn 计时器**：
   - 生成中显示毫秒/秒级实时计时。
-  - 单个流结束后进入 10 秒静默等待窗口，若无新流则停止计时并显示该轮总耗时。
+   - 单个流结束后进入 1 秒静默等待窗口，若无新流则停止计时并显示该轮总耗时。
 - **模型信息**：
   - 响应确认后显示 `模型: <actual_model>`（如 `o3-mini`、`gpt-4o`）。
   - 若正在路由或仅有请求参数，显示 `请求模型: <model>`、`实际模型: 检测中...`。
@@ -132,11 +132,11 @@ npm run build
   {
     "ok": true,
     "service": "chatgpt_turn_observer",
-    "version": "0.1.30",
+    "version": "0.2.3",
     "workspace_id": "my_workspace_id",
     "turn_budget": {
-      "warning_after_seconds": 1500,
-      "hard_stop_after_seconds": 1740
+      "warning_after_seconds": 1380,
+      "hard_stop_after_seconds": 1500
     }
   }
   ```

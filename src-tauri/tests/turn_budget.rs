@@ -359,7 +359,7 @@ fn test_dynamic_idle_reset_matrix() {
         }
     }
 
-    // 2. 中期 (20m~25m): 180s idle 重置
+    // 2. 中期 (20m~23m): 180s idle 重置
     {
         let d1 = manager.start_call("ws-1", Some("session-mid"), "read_file", false, &json!({}));
         if let CallDecision::Allowed { guard, .. } = d1 {
@@ -387,27 +387,41 @@ fn test_dynamic_idle_reset_matrix() {
         }
     }
 
-    // 3. 晚期 (>=25m Warning 阶段): 严禁普通 idle 重置
+    // 3. 晚期 (>=23m Warning 阶段): 严禁普通 idle 重置
     {
         let d1 = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
         if let CallDecision::Allowed { guard, .. } = d1 {
             drop(guard);
         }
-        // 推进到 26 分钟
-        for _ in 0..26 {
+        // 推进到 20 分钟，再跨过 23 分钟提醒阈值
+        for _ in 0..20 {
             clock.advance(Duration::from_secs(60));
             let d = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
             if let CallDecision::Allowed { guard, .. } = d {
                 drop(guard);
             }
         }
-        clock.advance(Duration::from_secs(200)); // 即使停顿 200s 也不重置
+        clock.advance(Duration::from_secs(200)); // 20m + 200s = 23m20s，即使停顿 200s 也不重置
         let d2 = manager.start_call("ws-1", Some("session-late"), "read_file", false, &json!({}));
         if let CallDecision::Allowed { guard, snapshot, .. } = d2 {
-            assert!(snapshot.elapsed_seconds >= 26 * 60);
+            assert!(snapshot.elapsed_seconds >= 23 * 60);
             drop(guard);
         }
     }
+}
+
+#[test]
+fn default_budget_uses_compacted_turn_window() {
+    let config = AgentTurnBudgetConfig::default();
+
+    assert_eq!(config.warning_after, Duration::from_secs(23 * 60));
+    assert_eq!(config.wrap_up_after, Duration::from_secs(24 * 60));
+    assert_eq!(config.finalization_after, Duration::from_secs(24 * 60 + 30));
+    assert_eq!(config.hard_stop_after, Duration::from_secs(25 * 60));
+    assert_eq!(
+        config.hard_stop_after - config.deadline_reserve,
+        Duration::from_secs(24 * 60 + 55),
+    );
 }
 
 #[test]
@@ -423,18 +437,18 @@ fn test_hard_stop_and_platform_isolation_recovery() {
         drop(guard);
     }
 
-    // 推进到 29:05 触发 HardStop
-    clock.advance(Duration::from_secs(29 * 60 + 5));
+    // 推进到 25:05 触发 HardStop
+    clock.advance(Duration::from_secs(25 * 60 + 5));
     let d_hs = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
     assert!(matches!(d_hs, CallDecision::Blocked { .. }));
 
-    // 推进 20s (至 29:25): 严禁在此刻重置！
+    // 推进 20s (至 25:25): 严禁在此刻重置！
     clock.advance(Duration::from_secs(20));
     let d_retry = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
     assert!(matches!(d_retry, CallDecision::Blocked { .. }));
 
     // 推进到 30m16s (超过 30m + 15s 隔离线): 必须成功重置为新 Turn
-    clock.advance(Duration::from_secs(46)); // 29m25s + 46s = 30m11s
+    clock.advance(Duration::from_secs(286)); // 25m25s + 286s = 30m11s
     clock.advance(Duration::from_secs(10)); // 30m21s
     let d_recovered = manager.start_call("ws-1", Some("session-hs"), "read_file", false, &json!({}));
     match d_recovered {
