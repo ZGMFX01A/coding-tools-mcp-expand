@@ -150,8 +150,6 @@ jobs:
           zip -r "../../../chatgpt-turn-observer-${RELEASE_VERSION}.zip" .
 
       - name: 上传浏览器扩展 ZIP
-
-      - name: 上传浏览器扩展 ZIP
         uses: actions/upload-artifact@v6
         with:
           name: browser-extension-zip
