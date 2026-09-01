@@ -10,6 +10,14 @@ export class TurnObserverOverlay {
   private onPositionChange?: (pos: { x: number; y: number }) => void;
   private onCollapsedChange?: (collapsed: boolean) => void;
   public onSettingsSaved?: () => void;
+  private lastState?: TabTurnState;
+  private requestedModelEl: HTMLSpanElement | null = null;
+  private responseModelEl: HTMLSpanElement | null = null;
+  private miniModelEl: HTMLSpanElement | null = null;
+  private timerValueEls: HTMLSpanElement[] = [];
+  private statusPillEl: HTMLSpanElement | null = null;
+  private statusDotEl: HTMLSpanElement | null = null;
+  private statusTextEl: HTMLSpanElement | null = null;
 
   // 计时器状态
   private timerInterval: number | null = null;
@@ -68,8 +76,9 @@ export class TurnObserverOverlay {
   }
 
   public updateState(state: TabTurnState) {
+    this.lastState = state;
     this.manageTimer(state);
-    this.render(state);
+    this.updateDisplay(state);
   }
 
   private manageTimer(state: TabTurnState) {
@@ -117,20 +126,24 @@ export class TurnObserverOverlay {
   }
 
   private updateTimerDisplay() {
-    if (!this.container) return;
-    const timeEl = this.container.querySelector('.ct-timer-val');
-    if (timeEl) {
-      timeEl.textContent = this.formatDuration(this.timerSeconds);
-    }
-    const miniTimeEl = this.container.querySelector('.ct-mini-timer');
-    if (miniTimeEl) {
-      miniTimeEl.textContent = this.formatDuration(this.timerSeconds);
-    }
+    const duration = this.formatDuration(this.timerSeconds);
+    for (const element of this.timerValueEls) element.textContent = duration;
   }
 
-  private render(state?: TabTurnState) {
+  private render(state?: TabTurnState, rebuild = false) {
     if (!this.container) return;
+    if (this.container.childElementCount > 0 && !rebuild) {
+      this.updateDisplay(state);
+      return;
+    }
     this.container.replaceChildren();
+    this.requestedModelEl = null;
+    this.responseModelEl = null;
+    this.miniModelEl = null;
+    this.timerValueEls = [];
+    this.statusPillEl = null;
+    this.statusDotEl = null;
+    this.statusTextEl = null;
 
     const actualModelText = state?.actualModel
       ? formatModelDisplayName(state.actualModel)
@@ -199,6 +212,7 @@ export class TurnObserverOverlay {
           : requestedModelText
         : actualModelText || '—';
       modelSpan.textContent = miniModelText;
+      this.miniModelEl = modelSpan;
       miniWrap.appendChild(modelSpan);
 
       const sep2 = document.createElement('span');
@@ -208,10 +222,12 @@ export class TurnObserverOverlay {
       const timerSpan = document.createElement('span');
       timerSpan.className = 'ct-mini-timer';
       timerSpan.textContent = durationText;
+      this.timerValueEls.push(timerSpan);
       miniWrap.appendChild(timerSpan);
 
       const statusDot = document.createElement('span');
       statusDot.className = `ct-turn-observer-status-dot ${statusClass}`;
+      this.statusDotEl = statusDot;
       miniWrap.appendChild(statusDot);
 
       const expandBtn = document.createElement('button');
@@ -266,10 +282,12 @@ export class TurnObserverOverlay {
 
       // Row 1: 请求模型
       const row1 = this.createRow('请求模型：', requestedRowValue);
+      this.requestedModelEl = row1.lastElementChild as HTMLSpanElement;
       card.appendChild(row1);
 
       // Row 2: 响应模型
       const row2 = this.createRow('响应模型：', responseRowValue);
+      this.responseModelEl = row2.lastElementChild as HTMLSpanElement;
       card.appendChild(row2);
 
       // Row 3: 本轮耗时
@@ -281,6 +299,7 @@ export class TurnObserverOverlay {
       const r3Val = document.createElement('span');
       r3Val.className = 'ct-turn-observer-value ct-timer-val';
       r3Val.textContent = durationText;
+      this.timerValueEls.push(r3Val);
       row3.appendChild(r3Label);
       row3.appendChild(r3Val);
       card.appendChild(row3);
@@ -296,11 +315,14 @@ export class TurnObserverOverlay {
       pill.className = 'ct-turn-observer-value ct-turn-observer-status-pill ct-clickable';
       pill.id = 'ct-status-pill';
       pill.title = `点击配置: ${state?.bridgeMessage || statusLabel}`;
+      this.statusPillEl = pill;
 
       const pDot = document.createElement('span');
       pDot.className = `ct-turn-observer-status-dot ${statusClass}`;
+      this.statusDotEl = pDot;
       const pText = document.createElement('span');
       pText.textContent = statusLabel;
+      this.statusTextEl = pText;
 
       pill.appendChild(pDot);
       pill.appendChild(pText);
@@ -312,6 +334,56 @@ export class TurnObserverOverlay {
     }
 
     this.bindEvents();
+  }
+
+  private updateDisplay(state?: TabTurnState) {
+    const actualModelText = state?.actualModel ? formatModelDisplayName(state.actualModel) : null;
+    const requestedModelText = state?.requestedModel ? formatModelDisplayName(state.requestedModel) : null;
+    const requestedRowValue = requestedModelText || '—';
+    const responseRowValue = actualModelText
+      ? actualModelText
+      : (state?.state === 'active' || state?.state === 'turn_starting') ? '检测中…' : '—';
+
+    let statusClass = 'idle';
+    let statusLabel = '待同步';
+    if (state?.bridgeStatus === 'synced') {
+      statusClass = 'synced';
+      statusLabel = '已同步';
+    } else if (state?.bridgeStatus === 'sending') {
+      statusClass = 'sending';
+      statusLabel = '发送中';
+    } else if (state?.bridgeStatus === 'failed') {
+      statusClass = 'failed';
+      statusLabel = '同步失败';
+    } else if (state?.bridgeStatus === 'not_configured') {
+      statusClass = 'failed';
+      statusLabel = '未配置 Token';
+    }
+    if (state?.budgetStatus === 'warning') {
+      statusClass = 'warning';
+      statusLabel = '即将自动停止';
+    } else if (state?.budgetStatus === 'stopped') {
+      statusClass = 'failed';
+      statusLabel = '已自动停止';
+    }
+
+    if (this.requestedModelEl) {
+      this.requestedModelEl.textContent = requestedRowValue;
+      this.requestedModelEl.title = requestedRowValue;
+    }
+    if (this.responseModelEl) {
+      this.responseModelEl.textContent = responseRowValue;
+      this.responseModelEl.title = responseRowValue;
+    }
+    if (this.miniModelEl) {
+      this.miniModelEl.textContent = requestedModelText
+        ? actualModelText ? `${requestedModelText} → ${actualModelText}` : requestedModelText
+        : actualModelText || '—';
+    }
+    if (this.statusDotEl) this.statusDotEl.className = `ct-turn-observer-status-dot ${statusClass}`;
+    if (this.statusTextEl) this.statusTextEl.textContent = statusLabel;
+    if (this.statusPillEl) this.statusPillEl.title = `点击配置: ${state?.bridgeMessage || statusLabel}`;
+    this.updateTimerDisplay();
   }
 
   private createRow(label: string, value: string): HTMLDivElement {
@@ -649,7 +721,7 @@ export class TurnObserverOverlay {
         this.isCollapsed = true;
         this.clampPosition();
         this.updatePositionStyle();
-        this.render();
+        this.render(this.lastState, true);
         this.onCollapsedChange?.(true);
       });
     }
@@ -661,7 +733,7 @@ export class TurnObserverOverlay {
         this.isCollapsed = false;
         this.clampPosition();
         this.updatePositionStyle();
-        this.render();
+        this.render(this.lastState, true);
         this.onCollapsedChange?.(false);
       });
     }

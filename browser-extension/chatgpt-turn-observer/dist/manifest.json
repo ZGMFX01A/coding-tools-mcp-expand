@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Coding Tools ChatGPT Turn Observer",
-  "version": "0.2.4",
+  "version": "0.3.1",
   "description": "Observes ChatGPT conversation boundaries and turn lifecycles for Coding Tools MCP.",
   "permissions": [
     "storage"

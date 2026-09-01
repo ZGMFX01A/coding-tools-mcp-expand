@@ -503,19 +503,46 @@ import {
   type QueuedWebSocketFrame = { raw: string; socket: WebSocket };
   const queuedWebSocketFrames: QueuedWebSocketFrame[] = [];
   let webSocketDrainTimer: number | null = null;
-  const WEBSOCKET_FRAMES_PER_TASK = 8;
+  let webSocketDraining = false;
+  const WEBSOCKET_DRAIN_BUDGET_MS = 8;
+
+  async function yieldToMainThread(): Promise<void> {
+    const scheduler = (globalThis as typeof globalThis & {
+      scheduler?: { yield?: () => Promise<void> };
+    }).scheduler;
+    if (scheduler?.yield) {
+      await scheduler.yield();
+      return;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  }
+
+  async function drainWebSocketFrames(): Promise<void> {
+    if (webSocketDraining) return;
+    webSocketDraining = true;
+    try {
+      let sliceStartedAt = performance.now();
+      const frames = queuedWebSocketFrames.splice(0);
+      for (const frame of frames) {
+        handleWebSocketText(frame.raw, frame.socket);
+        if (performance.now() - sliceStartedAt >= WEBSOCKET_DRAIN_BUDGET_MS) {
+          await yieldToMainThread();
+          sliceStartedAt = performance.now();
+        }
+      }
+    } finally {
+      webSocketDraining = false;
+      if (queuedWebSocketFrames.length > 0) scheduleWebSocketDrain();
+    }
+  }
 
   function scheduleWebSocketDrain(): void {
     if (webSocketDrainTimer !== null) return;
-    // A microtask runs before the browser can paint. Use a task and a bounded
-    // batch so a busy streaming socket cannot monopolize the page's main thread.
+    // A microtask runs before the browser can paint. Start on a task, then yield
+    // by elapsed execution time so large frames cannot monopolize the page.
     webSocketDrainTimer = window.setTimeout(() => {
       webSocketDrainTimer = null;
-      const frames = queuedWebSocketFrames.splice(0, WEBSOCKET_FRAMES_PER_TASK);
-      for (const frame of frames) {
-        handleWebSocketText(frame.raw, frame.socket);
-      }
-      if (queuedWebSocketFrames.length > 0) scheduleWebSocketDrain();
+      void drainWebSocketFrames();
     }, 0);
   }
 

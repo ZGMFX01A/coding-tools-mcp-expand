@@ -74,6 +74,9 @@ export class BridgeOutbox {
   private maxCapacity = 128;
   private onStatusChange?: (status: TabTurnState['bridgeStatus'], message: string | null) => void;
   private restored = false;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private persistenceTail: Promise<void> = Promise.resolve();
+  private readonly persistDelayMs = 750;
 
   constructor(
     private sendFn: (item: OutboxItem) => Promise<{ ok: boolean; status?: number; retryable: boolean; error?: string }>,
@@ -104,13 +107,33 @@ export class BridgeOutbox {
     }
   }
 
-  private async persist(): Promise<void> {
-    if (!this.persistence) return;
-    try {
-      await this.persistence.save(this.queue);
-    } catch {
-      // 发送链路仍按内存队列继续，下一次生命周期事件会再次尝试保存。
+  private persistNow(): Promise<void> {
+    if (!this.persistence) return Promise.resolve();
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
     }
+    const snapshot = this.queue.map((item) => ({ ...item, event: { ...item.event } }));
+    this.persistenceTail = this.persistenceTail.then(
+      () => this.persistence?.save(snapshot),
+      () => this.persistence?.save(snapshot),
+    ).catch(() => {
+      // 持久化不可用时仍保留内存队列，不阻断当前页面的观测。
+    });
+    return this.persistenceTail;
+  }
+
+  private schedulePersist(): void {
+    if (!this.persistence || this.persistTimer !== null) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      void this.persistNow();
+    }, this.persistDelayMs);
+  }
+
+  private persistFor(event: BrowserTurnEvent): Promise<void> | void {
+    if (isCriticalEvent(event.event)) return this.persistNow();
+    this.schedulePersist();
   }
 
   public enqueue(event: BrowserTurnEvent): boolean {
@@ -128,8 +151,7 @@ export class BridgeOutbox {
       attempts: 0,
       nextRetryAt: 0,
     });
-    // 立即启动持久化，不等待网络发送；页面在 pagehide 后可能很快被销毁。
-    void this.persist();
+    void this.persistFor(event);
     void this.process();
     return true;
   }
@@ -144,7 +166,7 @@ export class BridgeOutbox {
 
   public clear(): void {
     this.queue = [];
-    void this.persist();
+    void this.persistNow();
   }
 
   public process(): Promise<void> {
@@ -152,7 +174,6 @@ export class BridgeOutbox {
 
     const run = (async () => {
       await this.restore();
-      await this.persist();
       while (this.queue.length > 0) {
         const item = this.queue[0];
         const now = Date.now();
@@ -181,25 +202,25 @@ export class BridgeOutbox {
         if (result.ok) {
           // 发送成功，出队
           this.queue.shift();
-          await this.persist();
+          await this.persistFor(item.event);
           this.onStatusChange?.('synced', '已同步');
         } else if (!result.retryable) {
           // 不可重试的业务错误 (400, 403, 422)，直接出队并记录错误
           this.queue.shift();
-          await this.persist();
+          await this.persistFor(item.event);
           this.onStatusChange?.('failed', result.error || `HTTP ${result.status}`);
         } else {
           // 可重试错误 (网络连接断开、超时、5xx、429)
           if (item.attempts >= this.maxAttempts) {
             // 超过最大重试次数，出队丢弃
             this.queue.shift();
-            await this.persist();
+            await this.persistFor(item.event);
             this.onStatusChange?.('failed', `重试超限丢弃: ${result.error || '网络异常'}`);
           } else {
             // 指数退避：500ms, 1000ms, 2000ms, 4000ms, 最大 10s
             const backoffMs = Math.min(500 * Math.pow(2, item.attempts - 1), 10_000);
             item.nextRetryAt = Date.now() + backoffMs;
-            await this.persist();
+            await this.persistFor(item.event);
             this.onStatusChange?.('failed', `网络重试中 (${item.attempts}/${this.maxAttempts})`);
             setTimeout(() => void this.process(), backoffMs);
             break;
@@ -301,6 +322,7 @@ export async function initBridge() {
   let warningTimer: number | null = null;
   let hardStopTimer: number | null = null;
   let controlPollTimer: number | null = null;
+  let uiFrame: number | null = null;
   let controlPollInFlight = false;
   const completedStreamIds = new Set<string>();
 
@@ -322,7 +344,11 @@ export async function initBridge() {
         }
       );
     }
-    overlay.updateState(tabState);
+    if (uiFrame !== null) return;
+    uiFrame = window.requestAnimationFrame(() => {
+      uiFrame = null;
+      overlay?.updateState(tabState);
+    });
   }
 
   updateUi();
@@ -947,6 +973,7 @@ export async function initBridge() {
         }
 
         let stateChanged = false;
+        let uiChanged = false;
         if (requestId && requestId !== tabState.requestId) {
           tabState.requestId = requestId;
         }
@@ -970,6 +997,7 @@ export async function initBridge() {
         }
 
         if (isStreamDone) {
+          uiChanged = tabState.state !== 'stream_idle';
           tabState.state = 'stream_idle';
           const streamKey = requestId || captureId || 'sse_stream';
           if (!completedStreamIds.has(streamKey)) {
@@ -978,6 +1006,7 @@ export async function initBridge() {
           }
           handleQuietWindow(streamKey);
         } else {
+          uiChanged = tabState.state !== 'active';
           tabState.state = 'active';
         }
 
@@ -985,7 +1014,7 @@ export async function initBridge() {
           dispatchTurnEvent('turn_updated');
         }
 
-        updateUi();
+        if (stateChanged || uiChanged) updateUi();
         break;
       }
       case 'WS_FRAME': {
@@ -1000,6 +1029,7 @@ export async function initBridge() {
         }
 
         let stateChanged = false;
+        let uiChanged = false;
         if (requestId && requestId !== tabState.requestId) {
           tabState.requestId = requestId;
         }
@@ -1022,6 +1052,7 @@ export async function initBridge() {
         }
 
         if (isStreamDone) {
+          uiChanged = tabState.state !== 'stream_idle';
           tabState.state = 'stream_idle';
           const streamKey = requestId || captureId || 'ws_stream';
           if (!completedStreamIds.has(streamKey)) {
@@ -1030,6 +1061,7 @@ export async function initBridge() {
           }
           handleQuietWindow(streamKey);
         } else {
+          uiChanged = tabState.state !== 'active';
           tabState.state = 'active';
         }
 
@@ -1037,7 +1069,7 @@ export async function initBridge() {
           dispatchTurnEvent('turn_updated');
         }
 
-        updateUi();
+        if (stateChanged || uiChanged) updateUi();
         break;
       }
     }

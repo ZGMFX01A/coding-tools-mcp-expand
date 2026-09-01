@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { BridgeOutbox, type OutboxItem } from '../src/bridge';
 import { type BrowserTurnEvent } from '../src/types';
 
@@ -20,6 +20,10 @@ describe('BridgeOutbox real queue behavior and retry logic', () => {
     requested_model: 'gpt-4o',
     actual_model: null,
   };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('dequeues item when sendFn succeeds with 200', async () => {
     const sendFn = vi.fn().mockResolvedValue({ ok: true, status: 200, retryable: false });
@@ -144,5 +148,41 @@ describe('BridgeOutbox real queue behavior and retry logic', () => {
     expect(persistence.load).toHaveBeenCalledTimes(1);
     expect(sendFn).toHaveBeenCalledTimes(1);
     expect(saved.at(-1)).toEqual([]);
+  });
+
+  it('batches persistence for ordinary stream updates while retaining the final queue state', async () => {
+    vi.useFakeTimers();
+    const saved: OutboxItem[][] = [];
+    const persistence = {
+      load: vi.fn().mockResolvedValue([]),
+      save: vi.fn(async (items: readonly OutboxItem[]) => {
+        saved.push([...items]);
+      }),
+    };
+    const sendFn = vi.fn().mockResolvedValue({ ok: true, status: 200, retryable: false });
+    const outbox = new BridgeOutbox(sendFn, undefined, persistence);
+
+    outbox.enqueue({ ...sampleEvent, event: 'turn_updated' });
+    await outbox.process();
+
+    expect(persistence.save).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(749);
+    expect(persistence.save).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(saved.at(-1)).toEqual([]);
+  });
+
+  it('persists critical lifecycle events immediately', async () => {
+    const persistence = {
+      load: vi.fn().mockResolvedValue([]),
+      save: vi.fn().mockResolvedValue(undefined),
+    };
+    const sendFn = vi.fn().mockResolvedValue({ ok: false, status: 500, retryable: true });
+    const outbox = new BridgeOutbox(sendFn, undefined, persistence);
+
+    outbox.enqueue(sampleEvent);
+    await outbox.process();
+
+    expect(persistence.save).toHaveBeenCalled();
   });
 });
