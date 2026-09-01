@@ -460,6 +460,9 @@ import {
   }
 
   function handleWebSocketText(raw: string, socket?: WebSocket): void {
+    // ChatGPT keeps several backend sockets busy even when no turn is being
+    // observed. Avoid decoding their frames unless there is a capture to match.
+    if (pendingLiveCaptures.size === 0) return;
     const evidenceItems = parseWebSocketFrame(raw);
     for (const item of evidenceItems) {
       const pending = pendingCaptureFor(item);
@@ -497,6 +500,31 @@ import {
     }
   }
 
+  type QueuedWebSocketFrame = { raw: string; socket: WebSocket };
+  const queuedWebSocketFrames: QueuedWebSocketFrame[] = [];
+  let webSocketDrainTimer: number | null = null;
+  const WEBSOCKET_FRAMES_PER_TASK = 8;
+
+  function scheduleWebSocketDrain(): void {
+    if (webSocketDrainTimer !== null) return;
+    // A microtask runs before the browser can paint. Use a task and a bounded
+    // batch so a busy streaming socket cannot monopolize the page's main thread.
+    webSocketDrainTimer = window.setTimeout(() => {
+      webSocketDrainTimer = null;
+      const frames = queuedWebSocketFrames.splice(0, WEBSOCKET_FRAMES_PER_TASK);
+      for (const frame of frames) {
+        handleWebSocketText(frame.raw, frame.socket);
+      }
+      if (queuedWebSocketFrames.length > 0) scheduleWebSocketDrain();
+    }, 0);
+  }
+
+  function enqueueWebSocketFrame(raw: string, socket: WebSocket): void {
+    if (pendingLiveCaptures.size === 0) return;
+    queuedWebSocketFrames.push({ raw, socket });
+    scheduleWebSocketDrain();
+  }
+
   const ProxyWebSocket = function (
     this: WebSocket,
     url: string | URL,
@@ -510,7 +538,7 @@ import {
       try {
         socket.addEventListener('message', (event: MessageEvent) => {
           if (typeof event.data === 'string') {
-            queueMicrotask(() => handleWebSocketText(event.data, socket));
+            enqueueWebSocketFrame(event.data, socket);
           }
         });
         const onSocketEnd = () => {

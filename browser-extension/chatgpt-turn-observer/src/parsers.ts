@@ -404,23 +404,26 @@ export function parseWebSocketFrame(raw: string): WebSocketRouteEvidence[] {
       terminal: false,
       visited: 0,
     };
+    let itemEvidence: RouteEvidence = { ...EMPTY_ROUTE_EVIDENCE };
 
+    // WebSocket payloads can be frequent and large. Decode every SSE data line only
+    // once, then use that parsed value for both correlation and model evidence.
     for (const line of encodedItem.split(/\r?\n/)) {
       if (!line.startsWith('data:')) continue;
       const payload = line.slice(5).trim();
       if (!payload) continue;
       if (payload === '[DONE]') {
         correlation.terminal = true;
+        itemEvidence = mergeEvidence(itemEvidence, { isStreamDone: true });
         continue;
       }
-      try {
-        collectCorrelation(safeJsonParse(payload), correlation);
-      } catch {
-        // 忽略
-      }
+
+      const parsedPayload = safeJsonParse(payload);
+      if (!parsedPayload) continue;
+      collectCorrelation(parsedPayload, correlation);
+      itemEvidence = walkRecordForModelEvidence(parsedPayload, itemEvidence);
     }
 
-    const itemEvidence = parseSseChunk(encodedItem);
     if (itemEvidence.conversationId && !correlation.conversationIds.includes(itemEvidence.conversationId)) {
       correlation.conversationIds.push(itemEvidence.conversationId);
     }
