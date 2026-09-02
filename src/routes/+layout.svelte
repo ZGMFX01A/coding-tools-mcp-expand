@@ -16,7 +16,6 @@
   import { getLastWorkspaceId } from "$lib/api/settings";
   import { actionsRuntimeStates, mcpRuntimeStates, workspaces } from "$lib/stores/app";
   import { showToast } from "$lib/stores/toast";
-  import { startUiMemoryGuard } from "$lib/ui-memory-guard";
   import type { RuntimeState } from "$lib/types";
 
   let { children } = $props();
@@ -83,7 +82,6 @@
   }
 
   onMount(() => {
-    const stopGuard = startUiMemoryGuard();
     void (async () => {
       await refreshWorkspaces();
       const path = $page.url.pathname;
@@ -96,9 +94,6 @@
         }
       }
     })();
-    return () => {
-      stopGuard();
-    };
   });
 </script>
 

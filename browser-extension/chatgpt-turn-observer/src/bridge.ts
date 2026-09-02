@@ -67,6 +67,35 @@ export function startObservedTurn(
   }
 }
 
+/**
+ * Apply a URL-derived conversation ID without treating a new conversation's
+ * route assignment as navigation away from its active turn. ChatGPT starts a
+ * new conversation before an ID exists, then changes the URL while the same
+ * response is still streaming.
+ */
+export function applyConversationRouteChange(
+  tabState: TabTurnState,
+  newConversationId: string | null,
+  closeCurrentTurn: () => unknown,
+  reportConversationResolved: () => unknown = () => undefined,
+): boolean {
+  if (newConversationId === tabState.conversationId) return false;
+
+  const isActiveNewConversationResolution =
+    tabState.turnId !== null &&
+    tabState.conversationId === null &&
+    newConversationId !== null;
+
+  if (!isActiveNewConversationResolution) {
+    closeCurrentTurn();
+  }
+  tabState.conversationId = newConversationId;
+  if (isActiveNewConversationResolution) {
+    reportConversationResolved();
+  }
+  return true;
+}
+
 export class BridgeOutbox {
   private queue: OutboxItem[] = [];
   private processingPromise: Promise<void> | null = null;
@@ -926,9 +955,12 @@ export async function initBridge() {
     switch (data.type) {
       case 'URL_CHANGE': {
         const newConvId = data.payload?.conversationId || null;
-        if (newConvId !== tabState.conversationId) {
-          closeCurrentTurn();
-          tabState.conversationId = newConvId;
+        if (applyConversationRouteChange(
+          tabState,
+          newConvId,
+          closeCurrentTurn,
+          () => dispatchTurnEvent('conversation_resolved'),
+        )) {
           updateUi();
         }
         break;
