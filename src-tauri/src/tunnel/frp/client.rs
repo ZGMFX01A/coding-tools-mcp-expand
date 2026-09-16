@@ -862,23 +862,23 @@ fn extract_frpc_from_tar_gz(
 fn frp_release_asset() -> AppResult<(&'static str, &'static str)> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        Ok(("frp_0.61.2_windows_amd64.zip", "frpc.exe"))
+        Ok(("frp_0.70.1_windows_amd64.zip", "frpc.exe"))
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        Ok(("frp_0.61.2_linux_amd64.tar.gz", "frpc"))
+        Ok(("frp_0.70.1_linux_amd64.tar.gz", "frpc"))
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        Ok(("frp_0.61.2_linux_arm64.tar.gz", "frpc"))
+        Ok(("frp_0.70.1_linux_arm64.tar.gz", "frpc"))
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        Ok(("frp_0.61.2_darwin_amd64.tar.gz", "frpc"))
+        Ok(("frp_0.70.1_darwin_amd64.tar.gz", "frpc"))
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        Ok(("frp_0.61.2_darwin_arm64.tar.gz", "frpc"))
+        Ok(("frp_0.70.1_darwin_arm64.tar.gz", "frpc"))
     }
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),

@@ -16,7 +16,7 @@ pub(crate) use client::{
 pub(crate) use client::{cached_frpc_path, download_frpc_to_cache};
 pub use client::{resolve_frpc, spawn_frpc};
 
-const FRP_VERSION: &str = "0.61.2";
+const FRP_VERSION: &str = "0.70.1";
 pub(crate) const VERSION: &str = FRP_VERSION;
 
 #[allow(dead_code)]
