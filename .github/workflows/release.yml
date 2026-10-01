@@ -10,6 +10,11 @@ on:
         description: "要创建或更新的 Release 标签，例如 v0.1.22"
         required: true
         type: string
+      skip_tests:
+        description: "跳过本次发布的测试"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -47,6 +52,7 @@ jobs:
         run: npm run check
 
       - name: 运行 Rust 测试
+        if: ${{ !inputs.skip_tests }}
         working-directory: src-tauri
         run: cargo test
 
@@ -99,6 +105,7 @@ jobs:
         run: npm run check
 
       - name: 运行 Rust 测试
+        if: ${{ !inputs.skip_tests }}
         working-directory: src-tauri
         run: cargo test
 
@@ -135,6 +142,7 @@ jobs:
         run: npm ci
 
       - name: 运行扩展测试与类型检查
+        if: ${{ !inputs.skip_tests }}
         working-directory: browser-extension/chatgpt-turn-observer
         run: |
           npm test

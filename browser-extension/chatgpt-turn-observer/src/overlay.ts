@@ -58,15 +58,24 @@ export class TurnObserverOverlay {
     this.position.y = Math.max(10, Math.min(this.position.y, maxY));
   }
 
+  private handleDocumentReady = () => this.mount();
+
   private mount() {
     if (this.container) return;
+    // Content scripts run at document_start, before the parser creates body.
+    const body = document.body;
+    if (!body) {
+      document.addEventListener('DOMContentLoaded', this.handleDocumentReady, { once: true });
+      return;
+    }
+    document.removeEventListener('DOMContentLoaded', this.handleDocumentReady);
 
     this.container = document.createElement('div');
     this.container.className = 'ct-turn-observer-root';
     this.updatePositionStyle();
 
-    document.body.appendChild(this.container);
-    this.render();
+    body.appendChild(this.container);
+    this.render(this.lastState);
   }
 
   private updatePositionStyle() {
@@ -776,6 +785,7 @@ export class TurnObserverOverlay {
   }
 
   public destroy() {
+    document.removeEventListener('DOMContentLoaded', this.handleDocumentReady);
     this.stopTimerLoop();
     window.removeEventListener('resize', this.handleResize);
     if (this.container) {
