@@ -145,7 +145,7 @@ async fn serve(
         "full".into(),
         policy.permission_mode.clone(),
     ));
-    let tools: Vec<Value> = tools::list_tools()
+    let tools: Vec<Value> = tools::registry::list_tools_for_context(&ctx)
         .into_iter()
         .filter(|tool| {
             tool.get("name")

@@ -161,12 +161,22 @@ impl WorkspaceError {
             "NOT_FOUND" => Some("Use list_files to locate the file in workspace."),
             "IS_DIRECTORY" => Some("Specify a file path instead of a directory."),
             "NOT_A_DIRECTORY" => Some("Specify a valid directory path."),
-            "BINARY_FILE" => Some("Binary files cannot be read with text tools; use view_image if it is an image."),
+            "BINARY_FILE" => Some(
+                "Binary files cannot be read with text tools; use view_image if it is an image.",
+            ),
             "UNSUPPORTED_ENCODING" => Some("File must be valid UTF-8 text."),
-            "ABSOLUTE_PATH_DENIED" | "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE" => Some("Keep target path within the configured workspace root."),
-            "PATCH_CONTEXT_NOT_FOUND" => Some("Read the current file and regenerate patch with fresh context lines."),
-            "PATCH_CONTEXT_AMBIGUOUS" => Some("Include additional unchanged surrounding lines to make the hunk unique."),
-            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION" => Some("Set confirm=true to proceed with dangerous operations."),
+            "ABSOLUTE_PATH_DENIED" | "PATH_OUTSIDE_WORKSPACE" | "SYMLINK_ESCAPE" => {
+                Some("Keep target path within the configured workspace root.")
+            }
+            "PATCH_CONTEXT_NOT_FOUND" => {
+                Some("Read the current file and regenerate patch with fresh context lines.")
+            }
+            "PATCH_CONTEXT_AMBIGUOUS" => {
+                Some("Include additional unchanged surrounding lines to make the hunk unique.")
+            }
+            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION" => {
+                Some("Set confirm=true to proceed with dangerous operations.")
+            }
             _ => None,
         }
     }
@@ -520,7 +530,7 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
     } else {
         vec![json!({
             "type": "text",
-            "text": render_tool_text(tool_name, args, &structured)
+            "text": bounded_model_text(render_tool_text(tool_name, args, &structured))
         })]
     };
     json!({
@@ -538,21 +548,18 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
 
     match tool_name {
         "read_file" => {
-            let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
-            if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
-                let start_line = payload.get("start_line").and_then(Value::as_u64).unwrap_or(1);
-                let end_line = payload.get("end_line").and_then(Value::as_u64).unwrap_or(0);
-                let total_lines = payload.get("total_lines").and_then(Value::as_u64).unwrap_or(0);
-                let next_start = payload.get("next_start_line").and_then(Value::as_u64);
-                let hint = if let Some(ns) = next_start {
-                    format!("; continue with read_file(start_line={ns})")
-                } else {
-                    "; content truncated".to_string()
-                };
-                format!("[Showing lines {start_line}-{end_line} of {total_lines}{hint}]\n{content}")
-            } else {
-                content.to_string()
-            }
+            let content = payload["content"].as_str().unwrap_or("");
+            let start = payload["start_line"].as_u64().unwrap_or(1);
+            let end = payload["end_line"].as_u64().unwrap_or(0);
+            let total = payload["total_lines"].as_u64().unwrap_or(0);
+            let revision = payload["revision"].as_str().unwrap_or("unknown");
+            let hint = payload["next_start_line"]
+                .as_u64()
+                .map(|n| format!("; continue with read_file(start_line={n})"))
+                .unwrap_or_default();
+            format!(
+                "[Showing lines {start}-{end} of {total}; revision={revision}{hint}]\n{content}"
+            )
         }
         "list_dir" | "list_files" => {
             let entries = payload.get("entries").or_else(|| payload.get("files"));
@@ -574,7 +581,9 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                             lines.push(path.to_string());
                         }
                     }
-                    if payload.get("truncated").and_then(Value::as_bool) == Some(true) || arr.len() > 200 {
+                    if payload.get("truncated").and_then(Value::as_bool) == Some(true)
+                        || arr.len() > 200
+                    {
                         lines.push(format!(
                             "... results truncated (showing {} of {} items); use continuation to fetch more.",
                             lines.len().min(arr.len()),
@@ -599,7 +608,9 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                         let preview = m.get("preview").and_then(Value::as_str).unwrap_or("");
                         lines.push(format!("{p}:{line}: {preview}"));
                     }
-                    if payload.get("truncated").and_then(Value::as_bool) == Some(true) || matches.len() > 100 {
+                    if payload.get("truncated").and_then(Value::as_bool) == Some(true)
+                        || matches.len() > 100
+                    {
                         let total = payload
                             .get("total_matches")
                             .and_then(Value::as_u64)
@@ -616,8 +627,11 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                 "No matches found.".to_string()
             }
         }
-        "apply_patch" | "patch_check" => {
-            let dry_run = payload.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+        "apply_patch" | "apply_changes" | "patch_check" => {
+            let dry_run = payload
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let prefix = if dry_run {
                 "Patch validated"
             } else {
@@ -628,15 +642,25 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                 .and_then(Value::as_array)
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let summary = payload.get("summary").and_then(Value::as_str).unwrap_or("").trim();
+            let summary = payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if summary.is_empty() {
                 format!("{prefix} to {affected} file(s).")
             } else {
-                format!("{prefix} to {affected} file(s).\n{summary}")
+                format!(
+                    "{prefix} to {affected} file(s).\n{summary}\n{}",
+                    payload["affected_files"]
+                )
             }
         }
         "exec_command" => {
-            let status = payload.get("status").and_then(Value::as_str).unwrap_or("unknown");
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let mut header = vec![format!("Status: {status}")];
             if let Some(code) = payload.get("exit_code").and_then(Value::as_i64) {
                 header.push(format!("exit code {code}"));
@@ -674,21 +698,32 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                     .or_else(|| payload.get("output_ref"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                format!("{content}\n[more: read_output(output_ref=\"{ref_id}\", offset={next_offset})]")
+                format!(
+                    "{content}\n[more: read_output(output_ref=\"{ref_id}\", offset={next_offset})]"
+                )
             } else {
                 content.to_string()
             }
         }
         "git_status" => {
-            let branch = payload.get("branch").and_then(Value::as_str).unwrap_or("detached");
+            let branch = payload
+                .get("branch")
+                .and_then(Value::as_str)
+                .unwrap_or("detached");
             let mut lines = vec![format!("## {branch}")];
             if let Some(entries) = payload.get("entries").and_then(Value::as_array) {
                 if entries.is_empty() {
                     lines.push("Working tree clean.".to_string());
                 } else {
                     for entry in entries {
-                        let idx = entry.get("index_status").and_then(Value::as_str).unwrap_or(" ");
-                        let wt = entry.get("worktree_status").and_then(Value::as_str).unwrap_or(" ");
+                        let idx = entry
+                            .get("index_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or(" ");
+                        let wt = entry
+                            .get("worktree_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or(" ");
                         let p = entry.get("path").and_then(Value::as_str).unwrap_or("");
                         lines.push(format!("{idx}{wt} {p}"));
                     }
@@ -696,9 +731,11 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
             }
             lines.join("\n")
         }
-        "git_diff" => {
-            payload.get("diff").and_then(Value::as_str).unwrap_or("No diff.").to_string()
-        }
+        "git_diff" => payload
+            .get("diff")
+            .and_then(Value::as_str)
+            .unwrap_or("No diff.")
+            .to_string(),
         "git_log" => {
             if let Some(commits) = payload.get("commits").and_then(Value::as_array) {
                 if commits.is_empty() {
@@ -716,9 +753,11 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
                 "No commits found.".to_string()
             }
         }
-        "git_show" => {
-            payload.get("content").and_then(Value::as_str).unwrap_or("No output.").to_string()
-        }
+        "git_show" => payload
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("No output.")
+            .to_string(),
         _ => {
             if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
                 summary.to_string()
@@ -729,6 +768,19 @@ pub fn render_tool_text(tool_name: &str, _args: &Value, payload: &Value) -> Stri
             }
         }
     }
+}
+
+fn bounded_model_text(mut text: String) -> String {
+    const LIMIT: usize = 2 * 1_048_576 + 65_536;
+    if text.len() > LIMIT {
+        let mut end = LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[Model text truncated; use structuredContent or narrow the request.]");
+    }
+    text
 }
 
 fn render_tool_error(payload: &Value) -> String {
@@ -767,11 +819,34 @@ fn render_tool_error(payload: &Value) -> String {
             .and_then(Value::as_str)
         {
             lines.push(format!("Retry: {hint}"));
-        } else if let Some(sug) = e.get("details").and_then(|d| d.get("suggestion")).and_then(Value::as_str) {
+        } else if let Some(sug) = e
+            .get("details")
+            .and_then(|d| d.get("suggestion"))
+            .and_then(Value::as_str)
+        {
             lines.push(format!("Suggested action: {sug}"));
+        }
+        if let Some(index) = e["details"]["hunk_index"].as_u64() {
+            lines.push(format!("Failed hunk: {index}"));
+        }
+        if let Some(candidates) = e["details"]["candidate_lines"].as_array() {
+            if !candidates.is_empty() {
+                lines.push(format!(
+                    "Candidate lines: {}",
+                    e["details"]["candidate_lines"]
+                ));
+            }
+        }
+        if let Some(nearby) = e["details"]["nearby_lines"].as_array() {
+            for line in nearby.iter().take(10) {
+                lines.push(format!(
+                    "{}: {}",
+                    line["line"],
+                    line["content"].as_str().unwrap_or("")
+                ));
+            }
         }
     }
 
     lines.join("\n")
 }
-

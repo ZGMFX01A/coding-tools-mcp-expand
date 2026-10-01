@@ -9,6 +9,7 @@ use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 
 pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let _mutation = ctx.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
     let ws = &ctx.workspace;
     let patch = args
         .get("patch")
@@ -21,7 +22,8 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let confirm = args
         .get("confirm")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || ctx.policy.skip_permission_gates();
 
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.is_empty() {
@@ -39,7 +41,9 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     if !confirm {
         if let Some(path) = file_patches
             .iter()
-            .find(|file| file.is_deleted && is_critical_file(&file.path))
+            .find(|file| {
+                (file.is_deleted || file.move_to.is_some()) && is_critical_file(&file.path)
+            })
             .map(|file| file.path.as_str())
         {
             return Err(dangerous_operation(format!(
@@ -49,27 +53,46 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     }
 
     let mut affected = Vec::new();
-    let mut summaries = Vec::new();
     let mut staged: HashMap<String, Option<String>> = HashMap::new();
+    let mut baseline = HashMap::new();
+    let mut permissions = HashMap::new();
+    let mut block_counts = HashMap::<String, usize>::new();
 
     for fp in &file_patches {
         ws.reject_unsafe_text(&fp.path)?;
-        let resolved = if fp.is_new_file {
-            ws.resolve_for_write(&fp.path)?
-        } else {
-            ws.resolve_existing(&fp.path)?
-        };
+        let resolved = ws.resolve_for_write(&fp.path)?;
         ws.reject_write_symlink(&fp.path)?;
 
-        let original = if fp.is_new_file {
+        let before = super::changes::read_optional(&resolved.path)?;
+        baseline
+            .entry(resolved.display.clone())
+            .or_insert(before.clone());
+        *block_counts.entry(resolved.display.clone()).or_default() += 1;
+        if !fp.is_new_file && staged.get(&resolved.display) == Some(&None) {
+            return Err(WorkspaceError::not_found(format!(
+                "File removed by an earlier patch block: {}",
+                fp.path
+            )));
+        }
+        if !fp.is_new_file && before.is_none() && !staged.contains_key(&resolved.display) {
+            return Err(WorkspaceError::not_found(format!(
+                "File not found: {}",
+                fp.path
+            )));
+        }
+        let original = if fp.is_new_file || fp.is_deleted {
             // An Add File envelope is replacement content even when an earlier
             // Delete File for the same path exists in this transaction.
             String::new()
-        } else if resolved.existed {
-            fs::read_to_string(&resolved.path)
-                .map_err(|_| WorkspaceError::not_found(format!("File not found: {}", fp.path)))?
-        } else if fp.is_new_file || fp.is_deleted {
-            String::new()
+        } else if let Some(Some(text)) = staged.get(&resolved.display) {
+            text.clone()
+        } else if let Some(bytes) = before {
+            String::from_utf8(bytes).map_err(|_| WorkspaceError::Tool {
+                code: "UNSUPPORTED_ENCODING",
+                message: "Patch updates require UTF-8".into(),
+                category: "validation",
+                retryable: false,
+            })?
         } else {
             return Err(patch_failed(format!("File not found: {}", fp.path)));
         };
@@ -77,30 +100,134 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         if fp.is_deleted {
             staged.insert(resolved.display.clone(), None);
             affected.push(json!({ "path": resolved.display, "operation": "delete" }));
-            summaries.push(format!("D {}", resolved.display));
             continue;
         }
 
-        let updated = apply_hunks(&original, &fp.hunks)?;
-        let op = if resolved.existed { "update" } else { "add" };
-        staged.insert(resolved.display.clone(), Some(updated));
-        affected.push(json!({ "path": resolved.display, "operation": op }));
-        summaries.push(format!(
-            "{} {}",
-            if op == "add" { "A" } else { "M" },
-            resolved.display
-        ));
+        let (updated, evidence) = super::patch_match::apply(&original, &fp.hunks)?;
+        let output_path = if let Some(destination) = &fp.move_to {
+            ws.reject_write_symlink(destination)?;
+            ws.reject_protected_write_path(destination)?;
+            let target = ws.resolve_for_write(destination)?;
+            if target.existed || baseline.contains_key(&target.display) {
+                return Err(patch_failed(
+                    "Move destination already exists or is touched by this request",
+                ));
+            }
+            baseline.insert(target.display.clone(), None);
+            let source_permissions = permissions.get(&resolved.display).cloned().or_else(|| {
+                fs::metadata(&resolved.path)
+                    .ok()
+                    .map(|meta| meta.permissions())
+            });
+            if let Some(mode) = source_permissions {
+                permissions.insert(target.display.clone(), mode);
+            }
+            staged.insert(resolved.display.clone(), None);
+            affected.push(super::changes::metadata(
+                &resolved.display,
+                "delete",
+                None,
+                json!([]),
+            ));
+            target.display
+        } else {
+            resolved.display.clone()
+        };
+        let op = if fp.move_to.is_some() || !resolved.existed {
+            "add"
+        } else {
+            "update"
+        };
+        let mut metadata = super::changes::metadata(
+            &output_path,
+            op,
+            Some(updated.as_bytes()),
+            evidence["changed_ranges"].clone(),
+        );
+        metadata["match_quality"] = evidence["match_quality"].clone();
+        metadata["already_applied_hunks"] = evidence["already_applied_hunks"].clone();
+        affected.push(metadata);
+        staged.insert(output_path.clone(), Some(updated));
     }
 
+    // One final revision per path. Repeated blocks use staged contents, while
+    // their merged range is measured against the original transaction baseline.
+    let mut final_files = std::collections::BTreeMap::<String, Value>::new();
+    for evidence in affected {
+        let path = evidence["path"].as_str().unwrap().to_string();
+        let updated = staged[&path].as_ref().map(|s| s.as_bytes());
+        let original = baseline[&path].as_deref();
+        let operation = if updated.is_none() {
+            "delete"
+        } else if original.is_none() {
+            "add"
+        } else {
+            "update"
+        };
+        let ranges = if block_counts.get(&path).copied().unwrap_or(0) > 1 {
+            final_changed_range(original.unwrap_or_default(), updated.unwrap_or_default())
+        } else {
+            evidence
+                .get("changed_ranges")
+                .cloned()
+                .unwrap_or_else(|| json!([]))
+        };
+        let mut metadata = super::changes::metadata(&path, operation, updated, ranges);
+        if let Some(quality) = evidence.get("match_quality") {
+            let grades = ["exact", "trailing_ws", "indent"];
+            let rank = |q: &Value| {
+                grades
+                    .iter()
+                    .position(|v| Some(*v) == q.as_str())
+                    .unwrap_or(0)
+            };
+            let previous = final_files
+                .get(&path)
+                .map(|v| rank(&v["match_quality"]))
+                .unwrap_or(0);
+            metadata["match_quality"] = json!(grades[previous.max(rank(quality))]);
+        }
+        metadata["already_applied_hunks"] = evidence
+            .get("already_applied_hunks")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        final_files.insert(path, metadata);
+    }
+    let affected = final_files.into_values().collect::<Vec<_>>();
+    let summaries = affected
+        .iter()
+        .map(|file| {
+            format!(
+                "{} {}",
+                match file["operation"].as_str() {
+                    Some("add") => "A",
+                    Some("delete") => "D",
+                    _ => "M",
+                },
+                file["path"].as_str().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
     let files_created = affected_paths(&affected, "add");
     let files_modified = affected_paths(&affected, "update");
     let files_deleted = affected_paths(&affected, "delete");
 
+    let staged_bytes = staged
+        .iter()
+        .map(|(path, text)| (path.clone(), text.as_ref().map(|s| s.as_bytes().to_vec())))
+        .collect::<HashMap<_, _>>();
+    let changed = staged_bytes
+        .iter()
+        .any(|(path, bytes)| baseline.get(path) != Some(bytes));
     if !dry_run {
-        let _transaction_backups = commit_staged(ws, &staged)?;
+        if changed {
+            commit_transaction(ws, &staged_bytes, &baseline, &permissions)?;
+        }
         let change_id = Uuid::new_v4().simple().to_string();
         return Ok(tool_ok(json!({
             "dry_run": false,
+            "workspace_changed": changed,
+            "already_applied": !changed,
             "clean": true,
             "change_id": change_id,
             "summary": summaries.join("\n"),
@@ -115,6 +242,8 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
 
     Ok(tool_ok(json!({
         "dry_run": true,
+        "workspace_changed": false,
+        "already_applied": !changed,
         "preflight": true,
         "clean": true,
         "summary": summaries.join("\n"),
@@ -136,21 +265,42 @@ pub fn patch_check(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     Ok(result)
 }
 
+fn final_changed_range(original: &[u8], updated: &[u8]) -> Value {
+    let old = super::changes::normalize_lf(&String::from_utf8_lossy(original));
+    let new = super::changes::normalize_lf(&String::from_utf8_lossy(updated));
+    let old = old.split_terminator('\n').collect::<Vec<_>>();
+    let new = new.split_terminator('\n').collect::<Vec<_>>();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    if prefix == old.len() && prefix == new.len() {
+        return json!([]);
+    }
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    json!([{"hunk_index":0,"old_start_line":prefix+1,"old_end_line":old.len()-suffix,"new_start_line":prefix+1,"new_end_line":new.len()-suffix}])
+}
+
 #[derive(Debug)]
 struct FilePatch {
     path: String,
     hunks: Vec<Hunk>,
     is_new_file: bool,
     is_deleted: bool,
+    move_to: Option<String>,
 }
 
 #[derive(Debug)]
-struct Hunk {
-    lines: Vec<HunkLine>,
+pub(super) struct Hunk {
+    pub(super) lines: Vec<HunkLine>,
 }
 
 #[derive(Debug)]
-enum HunkLine {
+pub(super) enum HunkLine {
+    Anchor(String),
+    EndOfFile,
     Context(String),
     Add(String),
     Remove(String),
@@ -184,6 +334,7 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
                 hunks: Vec::new(),
                 is_new_file: line.contains("/dev/null"),
                 is_deleted: false,
+                move_to: None,
             });
         } else if line.starts_with("+++ ") {
             if let Some(ref mut f) = current {
@@ -202,6 +353,20 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
                 }
             }
             current_hunk = Some(Hunk { lines: Vec::new() });
+            if line.starts_with("@@") {
+                let anchor = line
+                    .trim_start_matches("@@")
+                    .trim()
+                    .trim_end_matches("@@")
+                    .trim();
+                if !anchor.is_empty() && !anchor.starts_with('-') {
+                    current_hunk
+                        .as_mut()
+                        .unwrap()
+                        .lines
+                        .push(HunkLine::Anchor(anchor.into()));
+                }
+            }
         } else if let Some(ref mut hunk) = current_hunk {
             if let Some(rest) = line.strip_prefix('+') {
                 hunk.lines.push(HunkLine::Add(rest.to_string()));
@@ -229,27 +394,33 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
     let mut files = Vec::new();
     let mut current: Option<FilePatch> = None;
     let mut current_hunk: Option<Hunk> = None;
-
-    for raw_line in patch.lines() {
-        let line = raw_line.trim_end_matches('\r');
+    let mut ended = false;
+    for raw in patch.lines() {
+        let line = raw.trim_end_matches('\r');
         if line == "*** Begin Patch" {
             continue;
         }
         if line == "*** End Patch" {
             finish_codex_file(&mut files, &mut current, &mut current_hunk);
+            ended = true;
             continue;
         }
-
+        if ended {
+            if !line.trim().is_empty() {
+                return Err(patch_failed("Unexpected text after End Patch"));
+            }
+            continue;
+        }
         let header = line
             .strip_prefix("*** Add File: ")
-            .map(|path| (path, true, false))
+            .map(|p| (p, true, false))
             .or_else(|| {
                 line.strip_prefix("*** Update File: ")
-                    .map(|path| (path, false, false))
+                    .map(|p| (p, false, false))
             })
             .or_else(|| {
                 line.strip_prefix("*** Delete File: ")
-                    .map(|path| (path, false, true))
+                    .map(|p| (p, false, true))
             });
         if let Some((path, is_new_file, is_deleted)) = header {
             finish_codex_file(&mut files, &mut current, &mut current_hunk);
@@ -258,42 +429,70 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
                 hunks: Vec::new(),
                 is_new_file,
                 is_deleted,
+                move_to: None,
             });
             if is_new_file {
                 current_hunk = Some(Hunk { lines: Vec::new() });
             }
             continue;
         }
-
+        if let Some(destination) = line.strip_prefix("*** Move to: ") {
+            let file = current
+                .as_mut()
+                .ok_or_else(|| patch_failed("Move to requires Update File"))?;
+            if file.is_new_file || file.is_deleted || file.move_to.is_some() {
+                return Err(patch_failed("Move to requires one Update File"));
+            }
+            file.move_to = Some(parse_diff_path(destination));
+            continue;
+        }
         if line.starts_with("@@") {
             if let Some(hunk) = current_hunk.take() {
-                if let Some(ref mut file) = current {
+                if let Some(file) = current.as_mut() {
                     file.hunks.push(hunk);
                 }
             }
-            current_hunk = Some(Hunk { lines: Vec::new() });
+            let anchor = line
+                .trim_start_matches("@@")
+                .trim()
+                .trim_end_matches("@@")
+                .trim();
+            let mut lines = Vec::new();
+            if !anchor.is_empty() && !anchor.starts_with('-') {
+                lines.push(HunkLine::Anchor(anchor.into()));
+            }
+            current_hunk = Some(Hunk { lines });
             continue;
         }
-
-        let Some(file) = current.as_ref() else {
-            continue;
-        };
+        let file = current
+            .as_ref()
+            .ok_or_else(|| patch_failed("Expected a file header"))?;
         if file.is_deleted {
+            if !line.is_empty() {
+                return Err(patch_failed("Delete File must not contain hunks"));
+            }
             continue;
         }
         let hunk = current_hunk.get_or_insert_with(|| Hunk { lines: Vec::new() });
-        if let Some(rest) = line.strip_prefix('+') {
-            hunk.lines.push(HunkLine::Add(rest.to_string()));
-        } else if let Some(rest) = line.strip_prefix('-') {
-            hunk.lines.push(HunkLine::Remove(rest.to_string()));
-        } else if let Some(rest) = line.strip_prefix(' ') {
-            hunk.lines.push(HunkLine::Context(rest.to_string()));
+        if line == "*** End of File" {
+            hunk.lines.push(HunkLine::EndOfFile);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix('+') {
+            hunk.lines.push(HunkLine::Add(value.into()));
+        } else if let Some(value) = line.strip_prefix('-') {
+            hunk.lines.push(HunkLine::Remove(value.into()));
+        } else if let Some(value) = line.strip_prefix(' ') {
+            hunk.lines.push(HunkLine::Context(value.into()));
         } else if line.is_empty() {
             hunk.lines.push(HunkLine::Context(String::new()));
+        } else {
+            return Err(patch_failed("Invalid patch hunk line"));
         }
     }
-
-    finish_codex_file(&mut files, &mut current, &mut current_hunk);
+    if !ended {
+        return Err(patch_failed("Missing End Patch"));
+    }
     Ok(files)
 }
 
@@ -332,236 +531,57 @@ fn parse_diff_path(raw: &str) -> String {
     path.replace('\\', "/")
 }
 
-fn strip_bom(text: &str) -> (bool, &str) {
-    if let Some(stripped) = text.strip_prefix('\u{feff}') {
-        (true, stripped)
-    } else {
-        (false, text)
-    }
-}
-
+#[cfg(test)]
 fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError> {
-    let (has_bom, text_without_bom) = strip_bom(original);
-    let line_ending = if text_without_bom.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let had_trailing_newline = text_without_bom.ends_with('\n');
-    let mut lines: Vec<String> = if text_without_bom.is_empty() {
-        Vec::new()
-    } else {
-        text_without_bom
-            .split_terminator('\n')
-            .map(|line| line.trim_end_matches('\r').to_string())
-            .collect()
-    };
-    let mut offset: i64 = 0;
-
-    for hunk in hunks {
-        let hunk_old: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                HunkLine::Context(s) | HunkLine::Remove(s) => Some(s.clone()),
-                HunkLine::Add(_) => None,
-            })
-            .collect();
-
-        let matches = find_all_hunk_positions(&lines, &hunk_old);
-        if matches.is_empty() {
-            return Err(WorkspaceError::ToolDetails {
-                code: "PATCH_CONTEXT_NOT_FOUND",
-                message: "Hunk context did not match file content.".into(),
-                category: "validation",
-                retryable: true,
-                details: json!({
-                    "match_count": 0,
-                    "retry_hint": "Read the current file and regenerate this hunk with current context."
-                }),
-            });
-        }
-        if matches.len() > 1 {
-            return Err(WorkspaceError::ToolDetails {
-                code: "PATCH_CONTEXT_AMBIGUOUS",
-                message: format!(
-                    "Patch context matched {} locations; add more context.",
-                    matches.len()
-                ),
-                category: "validation",
-                retryable: true,
-                details: json!({
-                    "match_count": matches.len(),
-                    "retry_hint": "Include additional unchanged context lines to make this hunk unique."
-                }),
-            });
-        }
-
-        let pos = matches[0];
-        let mut idx = pos;
-        for hl in &hunk.lines {
-            match hl {
-                HunkLine::Context(_) => idx += 1,
-                HunkLine::Remove(_) => {
-                    if idx < lines.len() {
-                        lines.remove(idx);
-                    }
-                }
-                HunkLine::Add(s) => {
-                    lines.insert(idx, s.clone());
-                    idx += 1;
-                }
-            }
-        }
-        offset += 0; // reserved for future fuzzy offset
-        let _ = offset;
-    }
-    let mut output = lines.join(line_ending);
-    if !output.is_empty() && (had_trailing_newline || text_without_bom.is_empty()) {
-        output.push_str(line_ending);
-    }
-    if has_bom {
-        output.insert(0, '\u{feff}');
-    }
-    Ok(output)
+    super::patch_match::apply(original, hunks).map(|v| v.0)
 }
 
-fn find_all_hunk_positions(lines: &[String], pattern: &[String]) -> Vec<usize> {
-    if pattern.is_empty() {
-        return vec![0];
-    }
-    if pattern.len() > lines.len() {
-        return vec![];
-    }
-    let mut matches = Vec::new();
-    for i in 0..=lines.len() - pattern.len() {
-        if lines[i..i + pattern.len()] == *pattern {
-            matches.push(i);
-        }
-    }
-    matches
-}
-
-fn commit_staged(
-    ws: &Workspace,
-    staged: &HashMap<String, Option<String>>,
-) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
-    let staged_bytes = staged
-        .iter()
-        .map(|(path, content)| {
-            (
-                path.clone(),
-                content.as_ref().map(|value| value.as_bytes().to_vec()),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    commit_staged_bytes(ws, &staged_bytes)
-}
-
-pub(crate) fn commit_staged_bytes(
+pub(crate) fn commit_transaction(
     ws: &Workspace,
     staged: &HashMap<String, Option<Vec<u8>>>,
+    baseline: &HashMap<String, Option<Vec<u8>>>,
+    permissions: &HashMap<String, fs::Permissions>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
-    let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-    let mut temporary_files = HashMap::new();
-    for (rel, content) in staged {
-        ws.reject_protected_write_path(rel)?;
-        let resolved = if content.is_none() {
-            ws.resolve_existing(rel)?
-        } else {
-            ws.resolve_for_write(rel)?
-        };
-        let path = resolved.path.clone();
-        backups.insert(
-            path.clone(),
-            if path.exists() && path.is_file() {
-                Some(fs::read(&path).unwrap_or_default())
-            } else {
-                None
-            },
-        );
-        if let Some(bytes) = content {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|err| patch_failed(err.to_string()))?;
-            }
-            let temp = path.with_file_name(format!(
-                ".{}.harness-stage-{}",
-                path.file_name().and_then(|v| v.to_str()).unwrap_or("file"),
-                Uuid::new_v4().simple()
-            ));
-            if let Err(err) = fs::write(&temp, bytes) {
-                cleanup_temporary_files(temporary_files.values());
-                restore_backups(&backups);
-                return Err(patch_failed(format!("Failed to stage file: {err}")));
-            }
-            temporary_files.insert(path.clone(), temp);
-        }
-    }
-
-    for (rel, content) in staged {
-        let resolved = if content.is_none() {
-            ws.resolve_existing(rel)?
-        } else {
-            ws.resolve_for_write(rel)?
-        };
-        let path = resolved.path;
-        let result = if content.is_some() {
-            let temp = temporary_files
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| patch_failed("Staged file is missing"));
-            match temp {
-                Ok(temp) => replace_file(&temp, &path),
-                Err(error) => Err(std::io::Error::other(error.to_string())),
-            }
-        } else if path.exists() && path.is_file() {
-            fs::remove_file(&path)
-        } else {
-            Ok(())
-        };
-        if let Err(err) = result {
-            cleanup_temporary_files(temporary_files.values());
-            restore_backups(&backups);
-            return Err(patch_failed(format!("Failed to write file: {err}")));
-        }
-    }
-    cleanup_temporary_files(temporary_files.values());
-    Ok(backups)
+    super::transaction::commit(ws, staged, baseline, permissions)
 }
 
-fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
-    for (path, data) in backups {
-        match data {
-            None => {
-                let _ = fs::remove_file(path);
-            }
-            Some(bytes) => {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(path, bytes);
-            }
-        }
-    }
-}
-
-fn replace_file(temp: &PathBuf, path: &PathBuf) -> Result<(), std::io::Error> {
+pub(crate) fn replace_file(
+    temp: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), std::io::Error> {
     #[cfg(windows)]
     {
-        if path.exists() {
-            fs::remove_file(path)?;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let from = temp
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let to = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
         }
+        .map_err(|_| std::io::Error::last_os_error())
     }
-    fs::rename(temp, path)
-}
-
-fn cleanup_temporary_files<'a>(paths: impl Iterator<Item = &'a PathBuf>) {
-    for path in paths {
-        let _ = fs::remove_file(path);
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, path)
     }
 }
 
-fn is_critical_file(path: &str) -> bool {
+pub(crate) fn is_critical_file(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let first = normalized.split('/').next().unwrap_or("");
     if matches!(first, ".git" | ".github") {
@@ -750,4 +770,3 @@ mod tests {
         assert_eq!(val["code"], "PATCH_CONTEXT_AMBIGUOUS");
     }
 }
-

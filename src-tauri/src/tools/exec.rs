@@ -49,29 +49,14 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             object.insert("child_process".into(), Value::Bool(false));
             object.insert("transport_ok".into(), Value::Bool(true));
             object.insert("command_ok".into(), Value::Bool(true));
+            object.insert("workspace_may_have_changed".into(), Value::Bool(false));
         }
         return Ok(tool_ok(result));
     }
     let timeout_ms = args
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(30_000);
-    let effective_timeout_ms = if let Some(budget_ms) = args.get("_runtime_budget_ms").and_then(Value::as_u64) {
-        let capped = timeout_ms.min(budget_ms);
-        if capped < timeout_ms {
-            crate::tunnel::append_profile_log(
-                &ctx.workspace_id,
-                "mcp-requests.log",
-                &format!(
-                    "[turn-budget] exec-timeout-capped cmd='{}' requested={}ms effective={}ms",
-                    cmd, timeout_ms, capped
-                ),
-            );
-        }
-        capped
-    } else {
-        timeout_ms
-    };
+        .unwrap_or(300_000);
     let max_output = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -79,7 +64,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     let yield_ms = args
         .get("yield_time_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(1000)
+        .unwrap_or(10_000)
         .min(30_000);
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");
@@ -89,7 +74,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             ctx,
             cmd,
             &workdir.path,
-            Duration::from_millis(effective_timeout_ms),
+            Duration::from_millis(timeout_ms),
             Duration::from_millis(yield_ms),
             max_output,
             tty,
@@ -102,10 +87,13 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         Ok(mut out) => {
             if let Some(object) = out.as_object_mut() {
                 object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
-                object.insert("sandbox_enforced".into(), Value::Bool(false));
+                let enforced = object
+                    .get("sandbox_enforced")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 object.insert(
                     "execution_boundary".into(),
-                    Value::String("policy_only".into()),
+                    Value::String(if enforced { "landlock" } else { "policy_only" }.into()),
                 );
                 object.insert("child_process".into(), Value::Bool(true));
             }
@@ -268,11 +256,12 @@ async fn run_command(
     {
         // CREATE_NO_WINDOW (0x08000000)：子进程若为控制台程序则不创建新控制台窗口，
         // 避免调用 cmd / powershell 等命令时弹出置顶的 conhost 窗口
-        command
-            .as_std_mut()
-            .creation_flags(0x08000000);
+        command.as_std_mut().creation_flags(0x08000000);
     }
 
+    let permit = ctx.sessions.reserve()?;
+    let mut sandbox = super::mutation::configure(ctx, &mut command)?;
+    let sandbox_enforced = sandbox.enforced;
     let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
         code: "COMMAND_SPAWN_FAILED",
         message: format!("Failed to start command: {e}"),
@@ -286,13 +275,25 @@ async fn run_command(
     })?;
 
     let session = ctx.sessions.insert(ExecSession::new_with_mode(child, tty));
+    session.attach_permit(permit);
+    session.attach_command_temp(sandbox.temporary.take());
+    session
+        .set_mutation_capability(!sandbox_enforced || !ctx.mutation_policy.write_paths.is_empty());
     session.spawn_readers().await;
     let deadline = start + limit;
+    // Start the monitor before writing stdin, which can block on a full pipe.
+    spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
 
     if yield_time.is_zero() {
         let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
-        return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
+        return Ok(merge_exec_result(
+            snapshot,
+            start,
+            cmd,
+            cwd,
+            true,
+            sandbox_enforced,
+        ));
     }
 
     if !tty && !stdin_text.is_empty() {
@@ -321,15 +322,29 @@ async fn run_command(
         if session.has_exited() {
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
-            return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
+            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
+            return Ok(merge_exec_result(
+                snapshot,
+                start,
+                cmd,
+                cwd,
+                false,
+                sandbox_enforced,
+            ));
         }
         if !tty && Instant::now() >= deadline {
             session.mark_termination_reason("timeout");
             session.kill_and_wait().await;
             session.refresh_status().await;
             session.wait_for_readers().await;
-            let snapshot = session.snapshot(max_output);
+            let snapshot = merge_exec_result(
+                session.snapshot(max_output),
+                start,
+                cmd,
+                cwd,
+                false,
+                sandbox_enforced,
+            );
             // Snapshot is embedded; schedule eviction so abandoned timeouts do not linger.
             schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
             return Err(WorkspaceError::ToolDetails {
@@ -347,15 +362,21 @@ async fn run_command(
         }
         if Instant::now() - start >= yield_time || tty {
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
-            return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
+            return Ok(merge_exec_result(
+                snapshot,
+                start,
+                cmd,
+                cwd,
+                true,
+                sandbox_enforced,
+            ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
 /// How long a timed-out / background session stays readable before map eviction.
-const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn spawn_timeout_monitor(
     sessions: Arc<SessionStore>,
@@ -363,14 +384,20 @@ fn spawn_timeout_monitor(
     deadline: Instant,
 ) {
     tauri::async_runtime::spawn(async move {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining).await;
-        session.refresh_status().await;
-        if !session.has_exited() {
-            session.mark_termination_reason("timeout");
-            session.kill_and_wait().await;
+        loop {
             session.refresh_status().await;
-            session.wait_for_readers().await;
+            if session.has_exited() {
+                session.wait_for_readers().await;
+                break;
+            }
+            if Instant::now() >= deadline {
+                session.mark_termination_reason("timeout");
+                session.kill_and_wait().await;
+                session.refresh_status().await;
+                session.wait_for_readers().await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // Keep the session briefly so clients can still read_output / probe status.
         schedule_session_eviction(sessions, session.session_id.clone());
@@ -485,8 +512,15 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         object.insert("resolved_cwd".into(), json!(cwd.display().to_string()));
         object.insert("execution_mode".into(), json!("direct"));
         object.insert("filesystem_scope".into(), json!("workspace"));
-        object.insert("sandbox_enforced".into(), Value::Bool(false));
-        object.insert("execution_boundary".into(), json!("policy_only"));
+        let enforced = object
+            .get("sandbox_enforced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        object.insert("sandbox_enforced".into(), Value::Bool(enforced));
+        object.insert(
+            "execution_boundary".into(),
+            json!(if enforced { "landlock" } else { "policy_only" }),
+        );
         object.insert("child_process".into(), Value::Bool(true));
         object.insert("transport_ok".into(), Value::Bool(true));
         object.insert("command_ok".into(), Value::Bool(false));
@@ -507,7 +541,9 @@ fn merge_exec_result(
     command: &str,
     cwd: &Path,
     keep_session: bool,
+    sandbox_enforced: bool,
 ) -> Value {
+    snapshot["sandbox_enforced"] = json!(sandbox_enforced);
     if let Some(obj) = snapshot.as_object_mut() {
         let duration_ms = start.elapsed().as_millis();
         obj.insert("command".into(), json!(command));
@@ -858,17 +894,25 @@ mod tests {
         std::env::set_var("MY_OPENAI_KEY", "sk-12345678901234567890");
         let parent = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
-        let ctx = ToolContext::for_test(parent.path().to_path_buf(), harness.path().to_path_buf()).expect("context");
+        let ctx = ToolContext::for_test(parent.path().to_path_buf(), harness.path().to_path_buf())
+            .expect("context");
 
         #[cfg(windows)]
         let cmd = "cmd /c echo SECRET=%CODING_TOOLS_TEST_SECRET%";
         #[cfg(not(windows))]
         let cmd = r#"python3 -c "import os; print('SECRET=' + os.environ.get('CODING_TOOLS_TEST_SECRET', ''))""#;
 
-        let output = call_tool(&ctx, "exec_command", &json!({ "cmd": cmd, "timeout_ms": 10_000, "yield_time_ms": 10_000 }));
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({ "cmd": cmd, "timeout_ms": 10_000, "yield_time_ms": 10_000 }),
+        );
         assert_eq!(output["command_ok"], true, "{output}");
         let stdout = output["stdout"].as_str().unwrap_or_default();
-        assert!(!stdout.contains("should_not_leak"), "Secret must be scrubbed: {stdout}");
+        assert!(
+            !stdout.contains("should_not_leak"),
+            "Secret must be scrubbed: {stdout}"
+        );
     }
 }
 
@@ -1008,10 +1052,7 @@ pub fn build_child_env(
 
     if let Some(extra) = extra_env {
         for (key, val) in extra {
-            if !is_sensitive_env_name(key)
-                && !is_risky_env_name(key)
-                && !is_sensitive_value(val)
-            {
+            if !is_sensitive_env_name(key) && !is_risky_env_name(key) && !is_sensitive_value(val) {
                 result.insert(key.clone(), val.clone());
             }
         }
@@ -1184,4 +1225,3 @@ mod env_tests {
         }
     }
 }
-

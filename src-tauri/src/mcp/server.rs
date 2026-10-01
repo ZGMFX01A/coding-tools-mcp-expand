@@ -6,7 +6,7 @@ use crate::mcp::protocol::{
     detect_request_context, negotiate_legacy_version, shape_result, MODERN_PROTOCOL_VERSIONS,
 };
 use crate::tools::{
-    call_tool, list_tools_for_profile, wrap_mcp_tool_result, SharedToolContext, ToolContext,
+    call_tool, wrap_mcp_tool_result, SharedToolContext, ToolContext,
     Workspace,
 };
 use crate::workspace::AuthConfig;
@@ -34,7 +34,7 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
         "notifications/initialized" | "notifications/cancelled" => return Value::Null,
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
-            let mut tools = list_tools_for_profile(&state.tool_profile);
+            let mut tools = crate::tools::registry::list_tools_for_context(state);
             if let Some(ref external_mgr) = state.external_mcp {
                 let external_tools = tauri::async_runtime::block_on(
                     external_mgr.get_aggregated_tools(&state.workspace_id),
@@ -71,7 +71,7 @@ pub fn initialize_result(protocol_version: &str) -> Value {
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence. Prefer apply_changes with read_file revision and original line numbers for structured edits. Use apply_patch when exact context is convenient. A repeated-call failure requires changing arguments or repairing the workspace; idempotency_key names one exact successful write request."
     })
 }
 
@@ -92,157 +92,20 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
 
-    let openai_session = params
-        .get("_meta")
-        .and_then(|meta| meta.get("openai/session"))
-        .and_then(Value::as_str);
-
-    let mut args = tool_arguments(name, params);
-    if !args.is_object() {
-        args = serde_json::json!({});
-    }
-
-    let is_external = if let Some(ref external_mgr) = state.external_mcp {
-        tauri::async_runtime::block_on(external_mgr.find_tool_entry(&state.workspace_id, name))
-    } else {
-        None
-    };
-
-    let decision = if let Some(session) = openai_session.map(str::trim).filter(|s| !s.is_empty()) {
-        let now = state.turn_budget.clock().now();
-        let (_confidence, identity) = state.turn_correlator.correlate(
-            &state.workspace_id,
-            session,
-            &state.turn_registry,
-            now,
-        );
-        state.turn_budget.start_call_with_identity(
-            identity,
-            name,
-            is_external.is_some(),
-            &args,
-        )
-    } else {
-        // 缺少 session 时，绑定至该工作区专属的稳定 fallback 预算桶，确保连续调用累计消耗预算，且不同工作区物理隔离。
-        let fallback_id = format!("unmanaged_ws_{}", state.workspace_id);
-        let identity = crate::mcp::browser_turn::TurnIdentity::WorkspaceFallback {
-            workspace_id: state.workspace_id.clone(),
-            fallback_id,
-        };
-        state.turn_budget.start_call_with_identity(
-            identity,
-            name,
-            is_external.is_some(),
-            &args,
-        )
-    };
-
-    match decision {
-        crate::mcp::turn_budget::CallDecision::Blocked {
-            snapshot,
-            error_payload,
-            content_text,
-        }
-        | crate::mcp::turn_budget::CallDecision::Restricted {
-            snapshot,
-            error_payload,
-            content_text,
-        } => {
-            return Ok(state.turn_budget.build_blocked_result(
-                &snapshot,
-                &error_payload,
-                &content_text,
-            ));
-        }
-        crate::mcp::turn_budget::CallDecision::Allowed {
-            guard,
-            runtime_budget,
-            snapshot,
-            emit_full_warning,
-            ..
-        } => {
-            args["_runtime_budget_ms"] = serde_json::json!(runtime_budget.as_millis() as u64);
-
-            // 检查是否为外部 stdio MCP 工具
-            if is_external.is_some() {
-                if let Some(ref external_mgr) = state.external_mcp {
-                    let res = tauri::async_runtime::block_on(
-                        external_mgr.call_external_tool_with_budget(
-                            &state.workspace_id,
-                            name,
-                            &args,
-                            Some(runtime_budget),
-                        ),
-                    );
-                    drop(guard);
-                    return match res {
-                        Ok(val) => {
-                            Ok(state
-                                .turn_budget
-                                .decorate_allowed_result(val, &snapshot, emit_full_warning))
-                        }
-                        Err(err_msg) => Err(serde_json::json!({
-                            "code": -32603,
-                            "message": format!("外部工具调用失败: {err_msg}")
-                        })),
-                    };
-                }
-            }
-
-            let canonical_name = crate::tools::registry::canonical_tool_name(name);
-            let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
-            if !known.iter().any(|n| n == &canonical_name) {
-                drop(guard);
-                return Err(serde_json::json!({
-                    "code": -32602,
-                    "message": format!("Unknown tool: {name}"),
-                    "data": { "reason": "unknown_tool" }
-                }));
-            }
-
-            let structured = call_tool(state.as_ref(), canonical_name, &args);
-            let wrapped = wrap_mcp_tool_result(canonical_name, &args, structured);
-            drop(guard);
-            Ok(state
-                .turn_budget
-                .decorate_allowed_result(wrapped, &snapshot, emit_full_warning))
-        }
-        crate::mcp::turn_budget::CallDecision::Unmanaged => {
-            let args = tool_arguments(name, params);
-
-            // 检查是否为外部 stdio MCP 工具
-            if let Some(ref external_mgr) = state.external_mcp {
-                let is_external = tauri::async_runtime::block_on(
-                    external_mgr.find_tool_entry(&state.workspace_id, name),
-                );
-                if is_external.is_some() {
-                    let res = tauri::async_runtime::block_on(
-                        external_mgr.call_external_tool(&state.workspace_id, name, &args),
-                    );
-                    return match res {
-                        Ok(val) => Ok(val),
-                        Err(err_msg) => Err(serde_json::json!({
-                            "code": -32603,
-                            "message": format!("外部工具调用失败: {err_msg}")
-                        })),
-                    };
-                }
-            }
-
-            let canonical_name = crate::tools::registry::canonical_tool_name(name);
-            let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
-            if !known.iter().any(|n| n == &canonical_name) {
-                return Err(serde_json::json!({
-                    "code": -32602,
-                    "message": format!("Unknown tool: {name}"),
-                    "data": { "reason": "unknown_tool" }
-                }));
-            }
-
-            let structured = call_tool(state.as_ref(), canonical_name, &args);
-            Ok(wrap_mcp_tool_result(canonical_name, &args, structured))
+    let args = tool_arguments(name, params);
+    if let Some(ref manager) = state.external_mcp {
+        if tauri::async_runtime::block_on(manager.find_tool_entry(&state.workspace_id, name)).is_some() {
+            return crate::tools::event_log::observe_result(name, || tauri::async_runtime::block_on(manager.call_external_tool(&state.workspace_id, name, &args)))
+                .map_err(|message| serde_json::json!({"code": -32603, "message": message}));
         }
     }
+    let canonical = crate::tools::registry::canonical_tool_name(name);
+    let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
+    if !known.contains(&canonical) {
+        return Err(serde_json::json!({"code": -32602, "message": format!("Unknown tool: {name}"), "data": {"reason": "unknown_tool"}}));
+    }
+    let structured = call_tool(state.as_ref(), canonical, &args);
+    Ok(wrap_mcp_tool_result(canonical, &args, structured))
 }
 
 fn tool_arguments(name: &str, params: &Value) -> Value {

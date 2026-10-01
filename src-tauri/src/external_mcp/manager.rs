@@ -143,17 +143,6 @@ impl ExternalMcpManager {
         public_tool_name: &str,
         arguments: &Value,
     ) -> Result<Value, String> {
-        self.call_external_tool_with_budget(workspace_id, public_tool_name, arguments, None).await
-    }
-
-    /// 执行外部工具转发调用，支持传入 runtime_budget 限制
-    pub async fn call_external_tool_with_budget(
-        &self,
-        workspace_id: &str,
-        public_tool_name: &str,
-        arguments: &Value,
-        runtime_budget: Option<std::time::Duration>,
-    ) -> Result<Value, String> {
         let tool_entry = self
             .find_tool_entry(workspace_id, public_tool_name)
             .await
@@ -167,7 +156,7 @@ impl ExternalMcpManager {
         };
 
         instance
-            .call_tool_with_budget(&tool_entry.original_name, arguments, runtime_budget)
+            .call_tool(&tool_entry.original_name, arguments)
             .await
     }
 

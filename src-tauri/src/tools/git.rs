@@ -98,7 +98,10 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 
 pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let unstaged = args.get("unstaged").and_then(Value::as_bool).unwrap_or(true);
+    let unstaged = args
+        .get("unstaged")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let context = args
         .get("context_lines")
         .and_then(Value::as_u64)
@@ -139,24 +142,88 @@ pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     if staged {
         chunks.push(run_git_diff(ws.root(), context, &path_filters, true)?);
     }
+    let mut extra_warnings = Vec::new();
+    if args
+        .get("include_untracked")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        let mut command_args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+        command_args.extend(path_filters.iter().map(String::as_str));
+        let listed = run_git(ws.root(), &command_args, Duration::from_secs(10))?;
+        if !listed.success {
+            return Err(git_error(&listed.stderr));
+        }
+        let names = listed
+            .stdout
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if names.len() > 100 {
+            extra_warnings.push("untracked file limit reached");
+        }
+        for name in names.into_iter().take(100) {
+            if chunks.iter().map(String::len).sum::<usize>() >= max_bytes {
+                extra_warnings.push("untracked diff truncated");
+                break;
+            }
+            ws.reject_write_symlink(name)?;
+            let resolved = ws.resolve_existing(name)?;
+            if !resolved.path.is_file()
+                || std::fs::metadata(&resolved.path)
+                    .map(|m| m.len())
+                    .unwrap_or(u64::MAX)
+                    > 1_048_576
+            {
+                extra_warnings.push("large untracked file omitted");
+                continue;
+            }
+            let unified = format!("--unified={context}");
+            let diff = run_git(
+                ws.root(),
+                &[
+                    "diff",
+                    "--no-index",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    &unified,
+                    "--",
+                    "/dev/null",
+                    name,
+                ],
+                Duration::from_secs(10),
+            )?;
+            if diff.exit_code > 1 || diff.exit_code < 0 {
+                return Err(git_error(&diff.stderr));
+            }
+            chunks.push(diff.stdout);
+        }
+    }
     let mut combined = chunks.join("\n");
     if !combined.is_empty() && !combined.ends_with('\n') {
         combined.push('\n');
     }
-    let truncated = combined.len() > max_bytes;
-    let diff_text = if truncated {
+    let truncated = combined.len() > max_bytes
+        || extra_warnings
+            .iter()
+            .any(|s| s.contains("limit") || s.contains("truncated") || s.contains("omitted"));
+    let output_cut = combined.len() > max_bytes;
+    let diff_text = if output_cut {
         String::from_utf8_lossy(&combined.as_bytes()[..max_bytes]).into_owned()
     } else {
         combined
     };
     let files = parse_diff_files(&diff_text);
     let has_more = truncated;
+    if truncated {
+        extra_warnings.push("diff truncated");
+    }
     let mut payload = json!({
         "diff": diff_text,
         "files": files,
         "truncated": truncated,
         "has_more": has_more,
-        "warnings": if truncated { vec!["diff truncated"] } else { vec![] }
+        "warnings": extra_warnings
     });
     if has_more {
         payload["continuation"] = json!({
@@ -242,7 +309,11 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     }
     let truncated = commits.len() > max_count;
     let has_more = truncated;
-    let next_skip = if has_more { Some(skip + max_count) } else { None };
+    let next_skip = if has_more {
+        Some(skip + max_count)
+    } else {
+        None
+    };
     let mut payload = json!({
         "is_repo": true,
         "ref": ref_name,
@@ -374,7 +445,10 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line_arg = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line_arg = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_u64)
@@ -446,10 +520,7 @@ fn parse_git_blame_porcelain(output: &str) -> Vec<Value> {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         if parts.len() >= 3 && commit_re.is_match(parts[0]) {
             current = serde_json::Map::new();
-            current.insert(
-                "commit".into(),
-                json!(parts[0].trim_start_matches('^')),
-            );
+            current.insert("commit".into(), json!(parts[0].trim_start_matches('^')));
             if parts[1].chars().all(|c| c.is_ascii_digit()) {
                 current.insert("original_line".into(), json!(parts[1].parse::<i64>().ok()));
             }
@@ -498,9 +569,17 @@ struct GitOutput {
     stderr: String,
 }
 
-fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
+fn run_git(
+    cwd: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let output = cmd
         .output()
         .map_err(|e| git_error(&format!("git not available: {e}")))?;

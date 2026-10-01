@@ -14,41 +14,78 @@ use serde_json::{json, Value};
 const SESSION_STREAM_TOTAL_BUDGET_BYTES: usize = 1_048_576;
 const SESSION_HEAD_DIVISOR: usize = 8;
 const SESSION_HEAD_BUFFER_BYTES: usize = SESSION_STREAM_TOTAL_BUDGET_BYTES / SESSION_HEAD_DIVISOR;
-const SESSION_TAIL_BUFFER_BYTES: usize = SESSION_STREAM_TOTAL_BUDGET_BYTES - SESSION_HEAD_BUFFER_BYTES;
+const SESSION_TAIL_BUFFER_BYTES: usize =
+    SESSION_STREAM_TOTAL_BUDGET_BYTES - SESSION_HEAD_BUFFER_BYTES;
 
-#[derive(Default)]
 pub struct SessionStore {
+    slots: Arc<tokio::sync::Semaphore>,
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
 }
 
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        }
+    }
+}
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&self, session: ExecSession) -> Arc<ExecSession> {
-        let arc = Arc::new(session);
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .insert(arc.session_id.clone(), arc.clone());
-        arc
-    }
-
-    pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| WorkspaceError::Tool {
-                code: "SESSION_NOT_FOUND",
-                message: format!("Session not found: {session_id}"),
-                category: "not_found",
-                retryable: false,
+    pub fn reserve(&self) -> Result<tokio::sync::OwnedSemaphorePermit, WorkspaceError> {
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| WorkspaceError::Tool {
+                code: "COMMAND_LIMIT",
+                message: "At most 16 commands may run concurrently; wait for an active command"
+                    .into(),
+                category: "runtime",
+                retryable: true,
             })
     }
-
+    fn prune(sessions: &mut HashMap<String, Arc<ExecSession>>) {
+        sessions.retain(|_, session| {
+            session
+                .finished_at
+                .lock()
+                .expect("finish lock")
+                .is_none_or(|at| at.elapsed().as_secs() < 300)
+        });
+        let mut completed = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                session
+                    .finished_at
+                    .lock()
+                    .expect("finish lock")
+                    .map(|at| (id.clone(), at))
+            })
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|v| v.1);
+        let excess = completed.len().saturating_sub(32);
+        for (id, _) in completed.into_iter().take(excess) {
+            sessions.remove(&id);
+        }
+    }
+    pub fn insert(&self, session: ExecSession) -> Arc<ExecSession> {
+        let arc = Arc::new(session);
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        Self::prune(&mut sessions);
+        sessions.insert(arc.session_id.clone(), arc.clone());
+        arc
+    }
+    pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        Self::prune(&mut sessions);
+        sessions.get(session_id).cloned().ok_or_else(|| WorkspaceError::ToolDetails {
+            code:"SESSION_NOT_FOUND",message:format!("Session not found: {session_id}; completed output is retained for 300 seconds and the last 32 commands"),category:"not_found",retryable:false,
+            details:json!({"completed_command_ttl_seconds":300,"max_retained_output_commands":32,"recovery_hint":"Start the command again and use its returned session_id"})
+        })
+    }
     pub fn remove(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -72,6 +109,10 @@ pub struct ExecSession {
     stdout_dropped_bytes: Mutex<usize>,
     stderr_dropped_bytes: Mutex<usize>,
     pub started_at: Instant,
+    finished_at: Mutex<Option<Instant>>,
+    spawn_permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    command_temp: Mutex<Option<super::mutation::CommandTempDir>>,
+    workspace_may_have_changed: Mutex<bool>,
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
     termination_reason: Mutex<Option<String>>,
@@ -102,6 +143,10 @@ impl ExecSession {
             stdout_dropped_bytes: Mutex::new(0),
             stderr_dropped_bytes: Mutex::new(0),
             started_at: Instant::now(),
+            finished_at: Mutex::new(None),
+            spawn_permit: Mutex::new(None),
+            command_temp: Mutex::new(None),
+            workspace_may_have_changed: Mutex::new(true),
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
@@ -109,6 +154,18 @@ impl ExecSession {
         }
     }
 
+    pub(crate) fn attach_permit(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        *self.spawn_permit.lock().expect("permit lock") = Some(permit);
+    }
+    pub(crate) fn attach_command_temp(&self, directory: Option<super::mutation::CommandTempDir>) {
+        *self.command_temp.lock().expect("command temp lock") = directory;
+    }
+    pub(crate) fn set_mutation_capability(&self, allowed: bool) {
+        *self
+            .workspace_may_have_changed
+            .lock()
+            .expect("mutation lock") = allowed;
+    }
     pub async fn spawn_readers(self: &Arc<Self>) {
         let stdout = {
             let mut guard = self.child.lock().await;
@@ -164,7 +221,10 @@ impl ExecSession {
                         *self.stdout_total.lock().expect("stdout_total lock") += n;
                         let dropped = trim_buffer(&mut data, SESSION_TAIL_BUFFER_BYTES);
                         if dropped > 0 {
-                            *self.stdout_dropped_bytes.lock().expect("stdout_dropped lock") += dropped;
+                            *self
+                                .stdout_dropped_bytes
+                                .lock()
+                                .expect("stdout_dropped lock") += dropped;
                         }
                     } else {
                         {
@@ -179,7 +239,10 @@ impl ExecSession {
                         *self.stderr_total.lock().expect("stderr_total lock") += n;
                         let dropped = trim_buffer(&mut data, SESSION_TAIL_BUFFER_BYTES);
                         if dropped > 0 {
-                            *self.stderr_dropped_bytes.lock().expect("stderr_dropped lock") += dropped;
+                            *self
+                                .stderr_dropped_bytes
+                                .lock()
+                                .expect("stderr_dropped lock") += dropped;
                         }
                     }
                 }
@@ -215,10 +278,26 @@ impl ExecSession {
     fn record_exit_status(&self, status: std::process::ExitStatus) {
         *self.exit_code.lock().expect("exit_code lock") = status.code();
         self.exited.store(true, Ordering::Release);
+        self.finished_at
+            .lock()
+            .expect("finish lock")
+            .get_or_insert_with(Instant::now);
+        self.spawn_permit.lock().expect("permit lock").take();
+        self.command_temp.lock().expect("command temp lock").take();
         *self.stdin_open.lock().expect("stdin_open lock") = false;
         let mut reason = self.termination_reason.lock().expect("termination lock");
         if reason.is_none() {
-            *reason = Some("exited".into());
+            let natural_reason = "exited";
+            #[cfg(unix)]
+            let natural_reason = {
+                use std::os::unix::process::ExitStatusExt;
+                if status.signal().is_some() {
+                    "crashed"
+                } else {
+                    natural_reason
+                }
+            };
+            *reason = Some(natural_reason.into());
         }
     }
 
@@ -261,11 +340,29 @@ impl ExecSession {
         let stderr_head = self.stderr_head.lock().expect("stderr_head lock").clone();
         let stdout_total = *self.stdout_total.lock().expect("stdout_total lock");
         let stderr_total = *self.stderr_total.lock().expect("stderr_total lock");
-        let stdout_dropped = *self.stdout_dropped_bytes.lock().expect("stdout_dropped lock");
-        let stderr_dropped = *self.stderr_dropped_bytes.lock().expect("stderr_dropped lock");
+        let stdout_dropped = *self
+            .stdout_dropped_bytes
+            .lock()
+            .expect("stdout_dropped lock");
+        let stderr_dropped = *self
+            .stderr_dropped_bytes
+            .lock()
+            .expect("stderr_dropped lock");
 
-        let stdout = truncate_head_tail(&stdout_head, &stdout_tail, stdout_total, stdout_dropped, max_output_bytes);
-        let stderr = truncate_head_tail(&stderr_head, &stderr_tail, stderr_total, stderr_dropped, max_output_bytes);
+        let stdout = truncate_head_tail(
+            &stdout_head,
+            &stdout_tail,
+            stdout_total,
+            stdout_dropped,
+            max_output_bytes,
+        );
+        let stderr = truncate_head_tail(
+            &stderr_head,
+            &stderr_tail,
+            stderr_total,
+            stderr_dropped,
+            max_output_bytes,
+        );
         let exit_code = *self.exit_code.lock().expect("exit_code lock");
         let termination_reason = self
             .termination_reason
@@ -285,10 +382,12 @@ impl ExecSession {
         };
         json!({
             "session_id": self.session_id,
+            "workspace_may_have_changed": *self.workspace_may_have_changed.lock().expect("mutation lock"),
             "interactive": self.interactive,
             "stdin_open": *self.stdin_open.lock().expect("stdin_open lock"),
             "status": status,
             "termination_reason": reason,
+            "operation_outcome": match reason { "running"=>"running", "timeout"=>"timeout", "spawn_failed"=>"spawn_error", "killed"|"crashed"=>"signal", _ if exit_code==Some(0)=>"exited_0", _=>"exited_nonzero" },
             "recoverable": matches!(reason, "timeout" | "killed" | "spawn_failed" | "server_restart"),
             "suggestion": match reason {
                 "timeout" => "读取保留输出，调整 timeout_ms 后重试",
@@ -429,6 +528,11 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     let has_more = next_offset.is_some();
     let mut payload = json!({
         "output_ref": output_ref,
+        "session_id": session_id,
+        "termination_reason": session.snapshot(1)["termination_reason"],
+        "operation_outcome": session.snapshot(1)["operation_outcome"],
+        "exit_code": session.snapshot(1)["exit_code"],
+        "workspace_may_have_changed": session.snapshot(1)["workspace_may_have_changed"],
         "stream_output_ref": format!("session:{session_id}:{stream}"),
         "stream": stream,
         "offset": buffer_offset,
@@ -582,7 +686,7 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     }
 
     if evicted {
-        store.remove(session_id);
+        // Completed output remains available through the retention window.
     }
 
     Ok(tool_ok(payload))
@@ -685,14 +789,17 @@ mod tests {
             session.read_stream(&chunk[..], false).await;
         }
 
-        let stdout_retained = session.stdout_head.lock().unwrap().len() + session.stdout.lock().unwrap().len();
-        let stderr_retained = session.stderr_head.lock().unwrap().len() + session.stderr.lock().unwrap().len();
+        let stdout_retained =
+            session.stdout_head.lock().unwrap().len() + session.stdout.lock().unwrap().len();
+        let stderr_retained =
+            session.stderr_head.lock().unwrap().len() + session.stderr.lock().unwrap().len();
         let total_process_retained = stdout_retained + stderr_retained;
 
         assert_eq!(stdout_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES);
         assert_eq!(stderr_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES);
-        assert_eq!(total_process_retained, SESSION_STREAM_TOTAL_BUDGET_BYTES * 2);
+        assert_eq!(
+            total_process_retained,
+            SESSION_STREAM_TOTAL_BUDGET_BYTES * 2
+        );
     }
 }
-
-

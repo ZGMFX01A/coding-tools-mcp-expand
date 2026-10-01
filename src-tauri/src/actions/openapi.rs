@@ -49,7 +49,11 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
                     "description": "Tool execution result",
                     "content": {
                         "application/json": {
-                            "schema": { "$ref": "#/components/schemas/ToolExecutionResponse" }
+                            "schema": {"type":"object","properties":{
+                                "ok":{"type":"boolean"},"tool":{"type":"string"},
+                                "structured_content":crate::tools::registry::output_schema(name),
+                                "content":{"type":"array","items":{"$ref":"#/components/schemas/ContentPart"}},
+                                "is_error":{"type":"boolean"}},"required":["ok","tool","is_error"],"additionalProperties":true}
                         }
                     }
                 },

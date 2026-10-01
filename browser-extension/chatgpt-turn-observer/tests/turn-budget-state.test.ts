@@ -16,7 +16,6 @@ function stateWithStoppedBudget(): TabTurnState {
     state: 'idle',
     bridgeStatus: 'synced',
     bridgeMessage: '本轮已达到 25 分钟上限，正在停止网页生成',
-    budgetStatus: 'stopped',
     lastActiveAt: Date.now(),
   };
 }
@@ -33,7 +32,6 @@ describe('turn budget UI state', () => {
       startedAt: 123,
     });
 
-    expect(state.budgetStatus).toBe('normal');
     expect(state.turnId).toBe('new-turn');
     expect(state.conversationId).toBe('new-conversation');
     expect(state.state).toBe('turn_starting');
@@ -50,7 +48,6 @@ describe('turn budget UI state', () => {
     state.requestedModel = 'gpt-5.6-thinking';
     state.actualModel = 'gpt-5.6-sol';
     state.state = 'active';
-    state.budgetStatus = 'normal';
 
     const changed = applyConversationRouteChange(
       state,

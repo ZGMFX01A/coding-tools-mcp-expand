@@ -1,8 +1,6 @@
 export interface ObserverStatusCheck {
   ok: boolean;
   workspaceId?: string;
-  warningAfterMs?: number;
-  hardStopAfterMs?: number;
   error?: string;
 }
 
@@ -40,22 +38,5 @@ export function validateObserverStatusPayload(value: unknown): ObserverStatusChe
     return { ok: false, error: '状态响应缺少 workspace_id' };
   }
 
-  const budget = payload.turn_budget;
-  const warningSeconds = budget && typeof budget === 'object'
-    ? (budget as Record<string, unknown>).warning_after_seconds
-    : undefined;
-  const hardStopSeconds = budget && typeof budget === 'object'
-    ? (budget as Record<string, unknown>).hard_stop_after_seconds
-    : undefined;
-
-  return {
-    ok: true,
-    workspaceId: payload.workspace_id,
-    warningAfterMs: typeof warningSeconds === 'number' && Number.isFinite(warningSeconds) && warningSeconds > 0
-      ? warningSeconds * 1000
-      : undefined,
-    hardStopAfterMs: typeof hardStopSeconds === 'number' && Number.isFinite(hardStopSeconds) && hardStopSeconds > 0
-      ? hardStopSeconds * 1000
-      : undefined,
-  };
+  return { ok: true, workspaceId: payload.workspace_id };
 }

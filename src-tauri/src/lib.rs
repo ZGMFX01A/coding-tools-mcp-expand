@@ -4,6 +4,7 @@ mod actions;
 mod app_state;
 mod auth;
 mod commands;
+pub mod cli;
 mod data;
 mod error;
 pub mod external_mcp;

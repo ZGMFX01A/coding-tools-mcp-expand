@@ -1,4 +1,9 @@
 pub mod context;
+pub mod changes;
+pub mod reliability;
+pub mod event_log;
+pub mod mutation;
+mod runtime_state;
 pub mod dispatch;
 pub mod exec;
 pub mod file;
@@ -10,6 +15,8 @@ pub mod policy;
 pub mod registry;
 pub mod session;
 pub mod workspace;
+mod patch_match;
+mod transaction;
 
 pub use context::{SharedToolContext, ToolContext};
 /// 唯一工具执行入口；MCP 与 Actions 必须调用此函数，不得分叉实现。

@@ -18,7 +18,10 @@ pub struct ToolContext {
     pub sessions: Arc<SessionStore>,
     pub workspace_id: String,
     pub external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
-    pub turn_budget: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>,
+    pub mutation_lock: Arc<Mutex<()>>,
+    pub reliability: Arc<crate::tools::reliability::Reliability>,
+    _runtime: Arc<crate::tools::runtime_state::RuntimeState>,
+    pub mutation_policy: crate::tools::mutation::MutationPolicy,
     pub turn_registry: Arc<crate::mcp::BrowserTurnRegistry>,
     pub turn_correlator: Arc<crate::mcp::TurnCorrelator>,
 }
@@ -114,6 +117,8 @@ impl ToolContext {
         external_mcp: Option<crate::external_mcp::SharedExternalMcpManager>,
     ) -> Self {
         let root = workspace.root().to_path_buf();
+        let mutation_policy = crate::tools::mutation::MutationPolicy::from_env(&workspace);
+        let runtime = crate::tools::runtime_state::get(&root, &permission_mode, &tool_profile);
         Self {
             workspace,
             auth,
@@ -122,20 +127,16 @@ impl ToolContext {
             permission_mode,
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             default_cwd: Mutex::new(root),
-            sessions: Arc::new(SessionStore::new()),
+            sessions: runtime.sessions.clone(),
             workspace_id,
             external_mcp,
-            turn_budget: Arc::new(crate::mcp::turn_budget::AgentTurnBudgetManager::new(
-                crate::mcp::turn_budget::AgentTurnBudgetConfig::default(),
-            )),
+            mutation_lock: runtime.mutation_lock.clone(),
+            reliability: runtime.reliability.clone(),
+            _runtime: runtime,
+            mutation_policy,
             turn_registry: Arc::new(crate::mcp::BrowserTurnRegistry::default()),
             turn_correlator: Arc::new(crate::mcp::TurnCorrelator::default()),
         }
-    }
-
-    pub fn with_turn_budget_manager(mut self, manager: Arc<crate::mcp::turn_budget::AgentTurnBudgetManager>) -> Self {
-        self.turn_budget = manager;
-        self
     }
 
     pub fn with_turn_registry_and_correlator(

@@ -267,27 +267,11 @@ Coding Tools MCP 负责启动和管理本机已有的 stdio MCP 服务，将其�
 3. 点击 **测试连接**（会自动检测本地命令或文件是否存在），确认无误后保存配置。
 4. 网页端 Agent 连接后将在 `tools/list` 中看到 `fast-context__fast_context_search` 工具，即可直接进行中大型代码库的自然语言语义搜索。
 
-## Agent Turn Budget（单轮执行预算与超时保护）
+## 上游能力同步与对话计时
 
-ChatGPT 网页端对话存在大约 30 分钟的单轮回复超时上限。若 Agent 在单轮内长时间发散调用工具（如大量搜索代码、死循环排查），会导致整轮回复在 30 分钟时被网页端硬性中断丢弃，从而丢失当前轮次的所有代码修改与进展记录。
+已同步 xyTom/coding-tools-mcp v0.5.0 及发布后的本地事件日志：新增版本校验的 `apply_changes`、补丁定位与修改证据、幂等回放、重复失败保护、命令终态统计、未跟踪文件差异和工具输出契约。详见 [同步清单与用法](docs/upstream-sync-v0.5.md)。
 
-Coding Tools MCP 内置了 **Agent Turn Budget** 状态机，根据服务端单调时钟与浏览器感知事件进行分级预算约束：
-
-```text
- 0m                25m               27m             28m           28m55s+
- ├──────────────────┼─────────────────┼───────────────┼──────────────┤
-  NORMAL 阶段       WARNING 阶段      WRAP_UP 阶段    FINALIZATION   HARD STOP
-  (全工具正常开放)  (提示加快任务收尾) (禁止探索发散,  (仅允许只读确认 (彻底阻断工具,
-                                       限完成修改验证) 和环境清理)    强制输出答复)
-```
-
-- **0 ~ 25m (NORMAL)**：所有文件、代码、命令工具完全正常放行；
-- **25m ~ 27m (WARNING)**：在工具调用元数据 `_meta.coding-tools/agentTurnBudget` 中附加告警提示，引导 Agent 规划收尾；
-- **27m ~ 28m (WRAP_UP / SoftWrap)**：立即**禁止**所有探索/发散型工具（`search_text`、`grep`、`list_files` 等），仅允许执行最后修改（`apply_patch`）和安全只读验证（`git_status`、`git_diff`、验证类 `exec_command`）；
-- **28m ~ 28m55s (FINALIZATION)**：进入最后确认期，禁止任何修改和复杂命令，仅允许只读事实确认与资源清理；
-- **28m55s+ (HARD STOP)**：彻底阻断一切后续工具调用，返回结构化强制答复指令，迫使 Agent 立即向用户提交已完成工作与交接，确保任务进度安全落盘。
-
-当未配置扩展或缺少会话标识时，系统将自动进入工作区保守预算（`WorkspaceFallback`），同一工作区多次无会话调用累计计算预算，不同工作区物理隔离。
+项目自身不再按对话时长告警、限制工具或停止网页生成。Observer 仅观察、显示计时并上报事件；普通命令和网络请求保留各自运行超时。
 
 ## ChatGPT Turn Observer（伴生浏览器扩展）
 
@@ -300,7 +284,7 @@ Coding Tools MCP 内置了 **Agent Turn Budget** 状态机，根据服务端单�
 1. **精准感知用户发送与生成流**：
    - 监听用户真正点击发送或新建 Turn（严格校验 user 角色与动作白名单，自动过滤复制打点、历史消息回放和翻页等非 Turn 请求）；
    - 通过流式 SSE 与 WebSocket 解析提取实际生效模型（如 `o3-mini`, `gpt-4o`, `gpt-5.6` 等）；
-2. **网页端与桌面端双向联动**：
+2. **网页观察与事件同步**：
    - 在 ChatGPT 网页端提供轻量可拖拽、可折叠的 **实时状态悬浮窗 (Overlay)**，实时显示当前轮次计时、生效模型、本地/公网同步状态；
    - 通过本地 HTTP / 远程公网 HTTPS Bridge 将 `turn_started`、`turn_updated`、`stream_completed`、`turn_closed` 事件安全推送到桌面端 MCP 引擎；
 3. **高可靠与安全架构**：

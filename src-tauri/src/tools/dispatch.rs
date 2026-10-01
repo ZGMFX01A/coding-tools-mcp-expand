@@ -53,11 +53,7 @@ fn policy_tool_err(err: PolicyError) -> Value {
             "移除未加引号的 shell 操作符；引号内的程序参数可以保留",
         )
     } else {
-        (
-            "policy",
-            "policy_rejected",
-            "根据错误信息修正参数后重试",
-        )
+        ("policy", "policy_rejected", "根据错误信息修正参数后重试")
     };
     tool_err(WorkspaceError::ToolDetails {
         code,
@@ -78,6 +74,15 @@ fn policy_tool_err(err: PolicyError) -> Value {
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
+    super::event_log::observe(name, || {
+        ctx.reliability.run(name, &effective_args, || {
+            call_tool_inner(ctx, name, &effective_args)
+        })
+    })
+}
+
+fn call_tool_inner(ctx: &ToolContext, name: &str, args: &Value) -> Value {
+    let effective_args = args.clone();
     if let Err(e) = validate_tool_arguments_for_workspace(
         name,
         &effective_args,
@@ -152,6 +157,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "search_text" | "grep_text" | "grep" => file::search_text(ws, &effective_args),
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
+        "apply_changes" => super::changes::apply_changes(ctx, &effective_args),
         "exec_command" => exec::exec_command(ctx, &effective_args),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
@@ -225,7 +231,8 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         output = attach_harness_status(ctx, output, task_id.is_none());
     }
     if let Some(task_id) = task_id.as_deref() {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
+        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true)
+            && output.get("command_ok").and_then(Value::as_bool) != Some(false);
         let _ = ctx.harness.record_event(
             task_id,
             "operation_finished",
@@ -238,7 +245,8 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         }
     }
     if let Some(operation) = operation {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
+        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true)
+            && output.get("command_ok").and_then(Value::as_bool) != Some(false);
         let _ = ctx.harness.record_operation(
             Some(&operation.id),
             task_id.as_deref(),
@@ -296,6 +304,17 @@ fn apply_default_cwd(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                 );
             }
         }
+        "apply_changes" => {
+            if let Some(changes) = effective.get_mut("changes").and_then(Value::as_array_mut) {
+                for change in changes {
+                    for field in ["path", "to"] {
+                        if let Some(path) = change[field].as_str() {
+                            change[field] = Value::String(prefix_relative_path(&base, path));
+                        }
+                    }
+                }
+            }
+        }
         "apply_patch" | "patch_check" => {
             if let Some(patch) = effective.get("patch").and_then(Value::as_str) {
                 effective["patch"] = Value::String(prefix_patch_paths(&base, patch));
@@ -320,7 +339,14 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
     patch
         .lines()
         .map(|line| {
-            for marker in ["--- a/", "+++ b/"] {
+            for marker in [
+                "--- a/",
+                "+++ b/",
+                "*** Add File: ",
+                "*** Update File: ",
+                "*** Delete File: ",
+                "*** Move to: ",
+            ] {
                 if let Some(path) = line.strip_prefix(marker) {
                     return format!("{marker}{base}/{path}");
                 }
@@ -334,7 +360,7 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
         "exec_command" => true,
-        "apply_patch" => !args
+        "apply_patch" | "apply_changes" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false),
@@ -343,7 +369,10 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
 }
 
 fn standalone_operation(name: &str) -> bool {
-    matches!(name, "patch_check" | "apply_patch" | "exec_command")
+    matches!(
+        name,
+        "patch_check" | "apply_patch" | "apply_changes" | "exec_command"
+    )
 }
 
 fn should_log_operation(name: &str) -> bool {
@@ -409,7 +438,10 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
 }
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
-    let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
+    let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile)
+        .into_iter()
+        .filter(|name| *name != "request_permissions" || ctx.policy.skip_permission_gates())
+        .collect::<Vec<_>>();
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
@@ -424,26 +456,36 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "auth_type": ctx.auth.auth_type,
         "endpoint_path": "/mcp",
         "tools": tools,
-        "tool_count": tools.len()
+        "tool_count": tools.len(),
+        "upstream_revision": "9d2c179cb307a7121bf7a83420d9d4f7815afb45",
+        "conversation_timeout_enabled": false,
+        "completed_command_ttl_seconds": 300,
+        "max_retained_output_commands": 32,
+        "reliability": ctx.reliability.diagnostics(),
+        "workspace_mutation_policy": ctx.mutation_policy.payload(&ctx.permission_mode),
+        "event_journal_enabled": super::event_log::configured().is_some_and(|j|j.enabled())
     })))
 }
 
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    let mutation = ctx.mutation_policy.payload(&ctx.permission_mode);
+    let enforced = mutation["enforced"] == true;
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
         "network_allowed": ctx.policy.network_allowed(),
-        "landlock_enabled": false,
+        "workspace_mutation_policy": mutation,
+        "landlock_enabled": enforced,
         "filesystem_sandbox": {
-            "available": false,
-            "enforced": false,
+            "available": super::mutation::landlock_abi() >= 3,
+            "enforced": enforced,
             "default_scope": "workspace",
             "host_scope_available": false
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
         "workspace_exec_available": true,
-        "workspace_exec_sandbox_enforced": false,
-        "workspace_exec_boundary": "policy_only",
+        "workspace_exec_sandbox_enforced": enforced,
+        "workspace_exec_boundary": if enforced {"landlock"} else {"policy_only"},
         "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "workspace_local_entries": {
             "enabled": ctx.policy.workspace_local_entries,
@@ -452,7 +494,7 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         },
         // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
-        "warnings": ["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]
+        "warnings": if enforced {vec![]} else {vec!["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]}
     })))
 }
 

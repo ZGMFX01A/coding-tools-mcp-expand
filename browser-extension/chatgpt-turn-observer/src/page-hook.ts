@@ -9,9 +9,7 @@ import {
   type WebSocketRouteEvidence,
 } from './parsers';
 import {
-  CT_OBSERVER_CONTROL_SOURCE,
   CT_OBSERVER_MESSAGE_SOURCE,
-  type PageHookControlMessage,
   type PageHookMessage,
 } from './types';
 
@@ -92,9 +90,7 @@ import {
   }
 
   const pendingLiveCaptures = new Map<string, PendingLiveCapture>();
-  const activeRequestControllers = new Map<string, AbortController>();
   const socketCaptures = new Map<WebSocket, Set<string>>();
-  const targetSockets = new Set<WebSocket>();
   const PENDING_CAPTURE_TTL_MS = 10 * 60 * 1000;
 
   const seenUserMessageIds = new Set<string>();
@@ -183,31 +179,6 @@ import {
     pendingLiveCaptures.delete(pending.captureId);
   }
 
-  // Bridge 在预算到点或用户离开页面时通过 postMessage 请求 MAIN world 中止实际请求。
-  window.addEventListener('message', (event) => {
-    if (event.source !== window || event.origin !== window.location.origin || window.location.origin === 'null') {
-      return;
-    }
-    const data = event.data as PageHookControlMessage | undefined;
-    if (!data || data.source !== CT_OBSERVER_CONTROL_SOURCE || data.type !== 'STOP_TURN') return;
-
-    const captureId = data.payload?.captureId || null;
-    const turnId = data.payload?.turnId || null;
-    for (const [id, controller] of activeRequestControllers) {
-      const pending = pendingLiveCaptures.get(id);
-      if ((!captureId && !turnId) || (captureId && id === captureId) || (turnId && pending?.turnId === turnId)) {
-        controller.abort();
-      }
-    }
-    for (const socket of targetSockets) {
-      try {
-        socket.close(4000, data.payload?.reason || 'turn stopped');
-      } catch {
-        // 忽略已关闭的 WebSocket
-      }
-    }
-  });
-
   // 3. Fetch Hook (严格判定新用户 Turn，非新 Turn 绝不注册 Live Capture)
   const nativeFetch = window.fetch;
 
@@ -228,24 +199,6 @@ import {
       }
     }
     return null;
-  }
-
-  function addStopSignal(
-    input: RequestInfo | URL,
-    init: RequestInit | undefined,
-    stopController: AbortController,
-  ): RequestInit {
-    const existingSignal =
-      init?.signal ||
-      (typeof Request !== 'undefined' && input instanceof Request ? input.signal : undefined);
-    if (existingSignal) {
-      if (existingSignal.aborted) {
-        stopController.abort();
-      } else {
-        existingSignal.addEventListener('abort', () => stopController.abort(), { once: true });
-      }
-    }
-    return { ...(init || {}), signal: stopController.signal };
   }
 
   async function inspectFetch(
@@ -274,33 +227,26 @@ import {
 
     const captureId = generateUuid();
     const startedAt = Date.now();
-    const stopController = new AbortController();
-    activeRequestControllers.set(captureId, stopController);
-    const requestInit = addStopSignal(input, init, stopController);
 
     const bodyPromise = requestBody(input, init);
     const correlationPromise = bodyPromise.then((raw) => {
       if (!raw) {
-        activeRequestControllers.delete(captureId);
         return null;
       }
       const correlation = parseConversationCorrelation(raw);
       if (!correlation) {
-        activeRequestControllers.delete(captureId);
         return null;
       }
 
       // 严格检查是否为真正的新用户发送且未被重放
       if (!correlation.isNewUserTurn) {
         debugLog('Non-turn request observed, short-circuited', { action: correlation.action });
-        activeRequestControllers.delete(captureId);
         return null;
       }
 
       if (correlation.inputMessageId) {
         if (seenUserMessageIds.has(correlation.inputMessageId)) {
           debugLog('MessageId replayed, short-circuited', { msgId: correlation.inputMessageId });
-          activeRequestControllers.delete(captureId);
           return null;
         }
         markUserMessageIdSeen(correlation.inputMessageId);
@@ -331,14 +277,13 @@ import {
 
     let response: Response;
     try {
-      response = await target.call(receiver, input as RequestInfo, requestInit);
+      response = await target.call(receiver, input as RequestInfo, init);
     } catch (err) {
       void correlationPromise.then((ctx) => {
         if (ctx) {
           const pending = pendingLiveCaptures.get(captureId);
           if (pending) reportTurnAborted(pending, 'request_failed');
         }
-        activeRequestControllers.delete(captureId);
       });
       throw err;
     }
@@ -349,7 +294,6 @@ import {
           const pending = pendingLiveCaptures.get(captureId);
           if (pending) reportTurnAborted(pending, `http_${response.status}`);
         }
-        activeRequestControllers.delete(captureId);
       });
       return response;
     }
@@ -364,7 +308,6 @@ import {
 
           void correlationPromise.then((ctx) => {
             if (!ctx) {
-              activeRequestControllers.delete(captureId);
               return;
             }
             const boundTurnId = ctx.turnId;
@@ -414,8 +357,6 @@ import {
               } catch {
                 const pending = pendingLiveCaptures.get(captureId);
                 if (pending) reportTurnAborted(pending, 'stream_read_failed');
-              } finally {
-                activeRequestControllers.delete(captureId);
               }
             })();
           });
@@ -425,7 +366,6 @@ import {
               const pending = pendingLiveCaptures.get(captureId);
               if (pending) reportTurnAborted(pending, 'stream_body_missing');
             }
-            activeRequestControllers.delete(captureId);
           });
         }
       } catch {
@@ -434,7 +374,6 @@ import {
             const pending = pendingLiveCaptures.get(captureId);
             if (pending) reportTurnAborted(pending, 'stream_clone_failed');
           }
-          activeRequestControllers.delete(captureId);
         });
       }
     }
@@ -561,7 +500,6 @@ import {
     const socket = Reflect.construct(nativeWebSocket, protocols !== undefined ? [url, protocols] : [url]);
 
     if (isTargetWs(targetUrl)) {
-      targetSockets.add(socket);
       try {
         socket.addEventListener('message', (event: MessageEvent) => {
           if (typeof event.data === 'string') {
@@ -569,7 +507,6 @@ import {
           }
         });
         const onSocketEnd = () => {
-          targetSockets.delete(socket);
           const captures = socketCaptures.get(socket);
           socketCaptures.delete(socket);
           if (!captures) return;

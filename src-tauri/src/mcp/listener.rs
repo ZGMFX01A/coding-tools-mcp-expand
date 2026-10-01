@@ -7,7 +7,6 @@ use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
@@ -167,7 +166,6 @@ async fn serve(
         .route("/oauth/token", post(oauth_token_post))
         .route("/internal/chatgpt-turn-event", post(post_chatgpt_turn_event))
         .route("/internal/chatgpt-turn-observer/status", get(get_chatgpt_turn_observer_status))
-        .route("/internal/chatgpt-turn-observer/control", get(get_chatgpt_turn_observer_control))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -503,7 +501,7 @@ async fn post_chatgpt_turn_event(
             .into_response();
     }
 
-    let now = state.mcp.turn_budget.clock().now();
+    let now = std::time::Instant::now();
     let outcome = state
         .mcp
         .turn_registry
@@ -547,75 +545,7 @@ async fn get_chatgpt_turn_observer_status(
             "service": "chatgpt_turn_observer",
             "version": env!("CARGO_PKG_VERSION"),
             "workspace_id": state.workspace_id,
-            "turn_budget": {
-                "warning_after_seconds": state.mcp.turn_budget.config().warning_after.as_secs(),
-                "hard_stop_after_seconds": state.mcp.turn_budget.config().hard_stop_after.as_secs(),
-            },
-        })),
-    )
-        .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct ObserverControlQuery {
-    observer_id: String,
-    tab_instance_id: String,
-    tab_id: u64,
-    turn_id: String,
-}
-
-async fn get_chatgpt_turn_observer_control(
-    State(state): State<ListenerState>,
-    headers: HeaderMap,
-    Query(query): Query<ObserverControlQuery>,
-) -> Response {
-    if let Some(err_resp) = verify_observer_token(&state, &headers) {
-        return err_resp;
-    }
-
-    let context = state.mcp.turn_registry.get_turn_context_by_instance(
-        &state.workspace_id,
-        &query.observer_id,
-        &query.tab_instance_id,
-    );
-    let Some(context) = context else {
-        return (StatusCode::OK, Json(json!({ "ok": true, "command": null }))).into_response();
-    };
-
-    if context.tab_id != query.tab_id
-        || context.turn_id != query.turn_id
-        || matches!(
-            context.status,
-            crate::mcp::browser_turn::BrowserTurnStatus::Stale
-                | crate::mcp::browser_turn::BrowserTurnStatus::CompletedByNextTurn
-                | crate::mcp::browser_turn::BrowserTurnStatus::Closed
-        )
-    {
-        return (StatusCode::OK, Json(json!({ "ok": true, "command": null }))).into_response();
-    }
-
-    let elapsed = state
-        .mcp
-        .turn_budget
-        .clock()
-        .now()
-        .saturating_duration_since(context.effective_started_at);
-    let budget = state.mcp.turn_budget.config();
-    let command = if elapsed >= budget.hard_stop_after {
-        Some("stop_turn")
-    } else if elapsed >= budget.warning_after {
-        Some("warn")
-    } else {
-        None
-    };
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "command": command,
-            "turn_id": context.turn_id,
-            "elapsed_seconds": elapsed.as_secs(),
+            "conversation_timeout_enabled": false,
         })),
     )
         .into_response()

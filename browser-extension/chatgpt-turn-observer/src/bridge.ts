@@ -8,8 +8,6 @@ import {
   type BrowserTurnEvent,
   type EventKind,
   type ObserverSettings,
-  type PageHookControlMessage,
-  CT_OBSERVER_CONTROL_SOURCE,
   type PageHookMessage,
   type TabTurnState,
 } from './types';
@@ -33,16 +31,6 @@ function isNonRetryableClientStatus(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 409 || status === 422;
 }
 
-const DEFAULT_TURN_WARNING_MS = 23 * 60 * 1000;
-const DEFAULT_TURN_HARD_STOP_MS = 25 * 60 * 1000;
-
-/**
- * A budget stop belongs only to the turn that reached the limit.  Starting a
- * different observed turn must always clear that terminal UI state.
- */
-export function resetBudgetStatusForNewTurn(tabState: TabTurnState): void {
-  tabState.budgetStatus = 'normal';
-}
 
 export function startObservedTurn(
   tabState: TabTurnState,
@@ -54,7 +42,6 @@ export function startObservedTurn(
     startedAt?: number;
   },
 ): void {
-  resetBudgetStatusForNewTurn(tabState);
   tabState.turnId = details.turnId;
   tabState.activeCaptureId = details.captureId || null;
   tabState.startedAt = details.startedAt || Date.now();
@@ -322,10 +309,6 @@ export async function initBridge() {
   let remoteWorkspaceId: string | null = null;
   let localHandshakeDone = false;
   let remoteHandshakeDone = false;
-  let localWarningAfterMs = DEFAULT_TURN_WARNING_MS;
-  let localHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
-  let remoteWarningAfterMs = DEFAULT_TURN_WARNING_MS;
-  let remoteHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
   let handshakePromise: Promise<void> | null = null;
   let handshakeRevision = 0;
 
@@ -342,17 +325,12 @@ export async function initBridge() {
     state: 'idle',
     bridgeStatus: settings.bridgeToken ? 'idle' : 'not_configured',
     bridgeMessage: settings.bridgeToken ? null : '未配置 Token',
-    budgetStatus: 'normal',
     lastActiveAt: Date.now(),
   };
 
   let overlay: TurnObserverOverlay | null = null;
   let quietTimer: number | null = null;
-  let warningTimer: number | null = null;
-  let hardStopTimer: number | null = null;
-  let controlPollTimer: number | null = null;
   let uiFrame: number | null = null;
-  let controlPollInFlight = false;
   const completedStreamIds = new Set<string>();
 
   function updateUi() {
@@ -397,8 +375,6 @@ export async function initBridge() {
   async function queryStatus(baseUrl: string, timeoutMs = 2000): Promise<{
     ok: boolean;
     workspaceId?: string;
-    warningAfterMs?: number;
-    hardStopAfterMs?: number;
     status?: number;
   }> {
     const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
@@ -420,8 +396,6 @@ export async function initBridge() {
           ? {
               ok: true,
               workspaceId: check.workspaceId,
-              warningAfterMs: check.warningAfterMs,
-              hardStopAfterMs: check.hardStopAfterMs,
             }
           : { ok: false, status: resp.status };
       }
@@ -448,10 +422,6 @@ export async function initBridge() {
     localHandshakeDone = false;
     remoteWorkspaceId = null;
     remoteHandshakeDone = false;
-    localWarningAfterMs = DEFAULT_TURN_WARNING_MS;
-    localHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
-    remoteWarningAfterMs = DEFAULT_TURN_WARNING_MS;
-    remoteHardStopAfterMs = DEFAULT_TURN_HARD_STOP_MS;
 
     handshakePromise = (async () => {
       if (!token) return;
@@ -469,8 +439,6 @@ export async function initBridge() {
       if (localResult.ok && localResult.workspaceId) {
         localWorkspaceId = localResult.workspaceId;
         localHandshakeDone = true;
-        localWarningAfterMs = localResult.warningAfterMs || DEFAULT_TURN_WARNING_MS;
-        localHardStopAfterMs = localResult.hardStopAfterMs || DEFAULT_TURN_HARD_STOP_MS;
       } else {
         localWorkspaceId = null;
         localHandshakeDone = false;
@@ -479,8 +447,6 @@ export async function initBridge() {
       if (remoteResult.ok && remoteResult.workspaceId) {
         remoteWorkspaceId = remoteResult.workspaceId;
         remoteHandshakeDone = true;
-        remoteWarningAfterMs = remoteResult.warningAfterMs || DEFAULT_TURN_WARNING_MS;
-        remoteHardStopAfterMs = remoteResult.hardStopAfterMs || DEFAULT_TURN_HARD_STOP_MS;
       } else {
         remoteWorkspaceId = null;
         remoteHandshakeDone = false;
@@ -734,18 +700,7 @@ export async function initBridge() {
     return event;
   }
 
-  function clearTurnTimers(): void {
-    if (warningTimer !== null) {
-      clearTimeout(warningTimer);
-      warningTimer = null;
-    }
-    if (hardStopTimer !== null) {
-      clearTimeout(hardStopTimer);
-      hardStopTimer = null;
-    }
-  }
-
-  function resetTurnState(budgetStatus: 'normal' | 'warning' | 'stopped' = 'normal'): void {
+  function resetTurnState(): void {
     tabState.turnId = null;
     tabState.activeCaptureId = null;
     tabState.requestId = null;
@@ -754,161 +709,16 @@ export async function initBridge() {
     tabState.requestedModel = null;
     tabState.actualModel = null;
     tabState.state = 'idle';
-    tabState.budgetStatus = budgetStatus;
     completedStreamIds.clear();
-    clearTurnTimers();
-    stopControlPolling();
   }
 
-  function requestPageHookStop(reason: string): void {
-    const targetOrigin = window.location.origin;
-    if (!targetOrigin || targetOrigin === 'null') return;
-    const message: PageHookControlMessage = {
-      source: CT_OBSERVER_CONTROL_SOURCE,
-      type: 'STOP_TURN',
-      payload: {
-        captureId: tabState.activeCaptureId,
-        turnId: tabState.turnId,
-        reason,
-      },
-    };
-    try {
-      window.postMessage(message, targetOrigin);
-    } catch {
-      // 页面即将终止或 origin 不可用时，仍由 turn_closed 事件告知后端。
-    }
-  }
-
-  function closeCurrentTurn(reason?: string): BrowserTurnEvent | null {
+  function closeCurrentTurn(): BrowserTurnEvent | null {
     if (!tabState.turnId) return null;
-    if (reason) requestPageHookStop(reason);
-
     const completedAt = Date.now();
     tabState.completedAt = completedAt;
     const event = dispatchTurnEvent('turn_closed', { completed_at: completedAt });
-    resetTurnState(reason === 'turn_budget_hard_stop' ? 'stopped' : 'normal');
+    resetTurnState();
     return event;
-  }
-
-  function getTurnBudgetDurations(): { warningAfterMs: number; hardStopAfterMs: number } {
-    if (settings.bridgeMode === 'local') {
-      return { warningAfterMs: localWarningAfterMs, hardStopAfterMs: localHardStopAfterMs };
-    }
-    if (settings.bridgeMode === 'remote') {
-      return { warningAfterMs: remoteWarningAfterMs, hardStopAfterMs: remoteHardStopAfterMs };
-    }
-    if (localHandshakeDone) {
-      return { warningAfterMs: localWarningAfterMs, hardStopAfterMs: localHardStopAfterMs };
-    }
-    if (remoteHandshakeDone) {
-      return { warningAfterMs: remoteWarningAfterMs, hardStopAfterMs: remoteHardStopAfterMs };
-    }
-    return { warningAfterMs: DEFAULT_TURN_WARNING_MS, hardStopAfterMs: DEFAULT_TURN_HARD_STOP_MS };
-  }
-
-  function scheduleTurnTimers(): void {
-    clearTurnTimers();
-    if (!tabState.turnId || !tabState.startedAt) return;
-
-    const scheduledTurnId = tabState.turnId;
-    const startedAt = tabState.startedAt;
-    const { warningAfterMs, hardStopAfterMs } = getTurnBudgetDurations();
-    const warnIn = Math.max(0, startedAt + warningAfterMs - Date.now());
-    const stopIn = Math.max(0, startedAt + hardStopAfterMs - Date.now());
-
-    warningTimer = window.setTimeout(() => {
-      if (tabState.turnId !== scheduledTurnId) return;
-      tabState.budgetStatus = 'warning';
-      tabState.bridgeMessage = '本轮接近 25 分钟上限，将在到点自动停止';
-      updateUi();
-    }, warnIn);
-
-    hardStopTimer = window.setTimeout(() => {
-      if (tabState.turnId !== scheduledTurnId) return;
-      tabState.budgetStatus = 'stopped';
-      tabState.bridgeMessage = '本轮已达到 25 分钟上限，正在停止网页生成';
-      closeCurrentTurn('turn_budget_hard_stop');
-      updateUi();
-    }, stopIn);
-  }
-
-  async function queryTurnControl(baseUrl: string, turnId: string): Promise<{ command?: string; reason?: string } | null> {
-    const normalizedBaseUrl = normalizeObserverBaseUrl(baseUrl);
-    if (!normalizedBaseUrl || !settings.bridgeToken.trim()) return null;
-
-    const query = new URLSearchParams({
-      observer_id: observerId,
-      tab_instance_id: tabInstanceId,
-      tab_id: String(tabId),
-      turn_id: turnId,
-    });
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1500);
-    try {
-      const resp = await fetch(`${normalizedBaseUrl}/internal/chatgpt-turn-observer/control?${query.toString()}`, {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${settings.bridgeToken.trim()}` },
-        signal: controller.signal,
-      });
-      if (!resp.ok) return null;
-      const data = await resp.json() as { ok?: boolean; command?: unknown; reason?: unknown };
-      if (data.ok !== true) return null;
-      return {
-        command: typeof data.command === 'string' ? data.command : undefined,
-        reason: typeof data.reason === 'string' ? data.reason : undefined,
-      };
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function pollTurnControl(expectedTurnId: string): Promise<void> {
-    if (controlPollInFlight || tabState.turnId !== expectedTurnId) return;
-    const endpoint = getReadyEndpoint();
-    if (!endpoint) return;
-
-    controlPollInFlight = true;
-    try {
-      const command = await queryTurnControl(endpoint.baseUrl, expectedTurnId);
-      if (tabState.turnId !== expectedTurnId || !command) return;
-      if (command.command === 'warn') {
-        tabState.budgetStatus = 'warning';
-        tabState.bridgeMessage = '后端报告本轮接近时间上限';
-        updateUi();
-      } else if (command.command === 'stop_turn') {
-        tabState.budgetStatus = 'stopped';
-        tabState.bridgeMessage = '后端已通知停止网页生成';
-        closeCurrentTurn('turn_budget_hard_stop');
-        updateUi();
-      }
-    } finally {
-      controlPollInFlight = false;
-    }
-  }
-
-  function stopControlPolling(): void {
-    if (controlPollTimer !== null) {
-      clearTimeout(controlPollTimer);
-      controlPollTimer = null;
-    }
-  }
-
-  function scheduleControlPolling(): void {
-    stopControlPolling();
-    if (!tabState.turnId) return;
-
-    const expectedTurnId = tabState.turnId;
-    const tick = () => {
-      if (tabState.turnId !== expectedTurnId) return;
-      void pollTurnControl(expectedTurnId).finally(() => {
-        if (tabState.turnId === expectedTurnId) {
-          controlPollTimer = window.setTimeout(tick, 2000);
-        }
-      });
-    };
-    tick();
   }
 
   function handleQuietWindow(streamId?: string | null) {
@@ -924,8 +734,6 @@ export async function initBridge() {
           completedStreamIds.add(key);
           dispatchTurnEvent('stream_completed');
         }
-        clearTurnTimers();
-        stopControlPolling();
         updateUi();
       }
     }, 1000);
@@ -978,8 +786,6 @@ export async function initBridge() {
 
         updateUi();
         dispatchTurnEvent('turn_started');
-        scheduleTurnTimers();
-        scheduleControlPolling();
         break;
       }
       case 'TURN_ABORTED': {

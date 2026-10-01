@@ -123,13 +123,11 @@ export interface TabTurnState {
   state: TurnLifecycleState;
   bridgeStatus: BridgeStatus;
   bridgeMessage: string | null;
-  budgetStatus?: 'normal' | 'warning' | 'stopped';
   lastActiveAt: number;
 }
 
 /** postMessage 从 MAIN world 到 ISOLATED world 的通信消息体 */
 export const CT_OBSERVER_MESSAGE_SOURCE = 'CT_TURN_OBSERVER_PAGE_HOOK';
-export const CT_OBSERVER_CONTROL_SOURCE = 'CT_TURN_OBSERVER_BRIDGE';
 
 export interface PageHookMessage {
   source: typeof CT_OBSERVER_MESSAGE_SOURCE;
@@ -147,16 +145,5 @@ export interface PageHookMessage {
     reason?: string;
     url?: string;
     startedAt?: number;
-  };
-}
-
-/** 从 ISOLATED world 发往 MAIN world 的受控终止消息。 */
-export interface PageHookControlMessage {
-  source: typeof CT_OBSERVER_CONTROL_SOURCE;
-  type: 'STOP_TURN';
-  payload: {
-    captureId?: string | null;
-    turnId?: string | null;
-    reason?: string;
   };
 }

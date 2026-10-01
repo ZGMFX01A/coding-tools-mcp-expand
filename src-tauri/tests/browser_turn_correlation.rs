@@ -4,10 +4,6 @@ use std::time::{Duration, Instant};
 use coding_tools_mcp_desktop_lib::mcp::browser_turn::{
     BrowserTurnEvent, BrowserTurnEventKind, BrowserTurnRegistry, CorrelationConfidence, TurnCorrelator, TurnIdentity,
 };
-use coding_tools_mcp_desktop_lib::mcp::turn_budget::{
-    AgentTurnBudgetConfig, AgentTurnBudgetManager, BudgetClock, CallDecision, TurnBudgetStatus,
-};
-use serde_json::json;
 
 struct TestClock {
     now: std::sync::atomic::AtomicU64,
@@ -30,7 +26,7 @@ impl TestClock {
     }
 }
 
-impl coding_tools_mcp_desktop_lib::mcp::turn_budget::BudgetClock for TestClock {
+impl TestClock {
     fn now(&self) -> Instant {
         let ms = self.now.load(std::sync::atomic::Ordering::SeqCst);
         self.base + Duration::from_millis(ms)

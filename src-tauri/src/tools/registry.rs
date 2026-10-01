@@ -209,6 +209,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
         false,
     ),
+    ("apply_changes", "Apply structured changes", "Atomically create, write, edit, delete, move or copy files. Existing files require their SHA-256 read_file revision; edit line numbers refer to the original file.", false, true, false),
     (
         "apply_patch",
         "Apply patch",
@@ -332,6 +333,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "search_text",
     "grep_text",
     "apply_patch",
+    "apply_changes",
     "exec_command",
     "write_stdin",
     "kill_session",
@@ -385,6 +387,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "grep_text",
     "grep",
     "apply_patch",
+    "apply_changes",
     "patch_check",
     "exec_command",
     "write_stdin",
@@ -413,6 +416,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "history_session_checkpoint",
     "history_session_validate",
     "apply_patch",
+    "apply_changes",
     "exec_command",
     "write_stdin",
     "kill_session",
@@ -503,6 +507,7 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                     "title": title,
                     "description": description,
                     "inputSchema": input_schema(name),
+                    "outputSchema": output_schema(name),
                     "annotations": {
                         "title": title,
                         "readOnlyHint": read_only,
@@ -728,10 +733,12 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["query"],
             "additionalProperties": false
         }),
+        "apply_changes" => super::changes::input_schema(),
         "apply_patch" => json!({
             "type": "object",
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
+                "idempotency_key": {"type":"string","minLength":1,"maxLength":128},
                 "dry_run": { "type": "boolean", "default": false },
                 "confirm": { "type": "boolean", "default": false },
                 "reason": { "type": "string", "default": "" }
@@ -752,9 +759,9 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "cmd": { "type": "string", "minLength": 1 },
                 "workdir": { "type": "string", "default": "." },
-                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 30000 },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 300000 },
                 "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
-                "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
+                "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 10000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
                 "confirm": { "type": "boolean", "default": false },
@@ -810,6 +817,7 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "paths": { "type": "array", "items": { "type": "string" }, "default": [] },
+                "include_untracked": {"type":"boolean","default":true},
                 "staged": { "type": "boolean", "default": false },
                 "unstaged": { "type": "boolean", "default": true },
                 "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 3 },
@@ -856,7 +864,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "tool_name": {
                     "type": "string",
-                    "enum": ["exec_command", "apply_patch"]
+                    "enum": ["exec_command", "apply_patch", "apply_changes"]
                 },
                 "permission": {
                     "type": "string",
@@ -867,8 +875,7 @@ pub fn input_schema(name: &str) -> Value {
                         "sensitive_env",
                         "shell_expansion",
                         "inline_script",
-                        "privileged_executable",
-                        "write_generated_or_ignored"
+                        "privileged_executable"
                     ]
                 },
                 "reason": { "type": "string", "minLength": 1 },
@@ -916,6 +923,134 @@ pub fn input_schema(name: &str) -> Value {
     }
 }
 
+/// Each tool advertises its actual structured fields; errors share the `ok`/`error` contract.
+pub fn output_schema(name: &str) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert("ok".into(), json!({"type":"boolean"}));
+    properties.insert(
+        "error".into(),
+        json!({"type":"object","properties":{
+        "code":{"type":"string"},"message":{"type":"string"},"category":{"type":"string"},
+        "retryable":{"type":"boolean"},"details":{"type":"object"}},"required":["code","message"]}),
+    );
+    let fields: &[(&str, &str)] = match name {
+        "read_file" => &[
+            ("path", "string"),
+            ("content", "string"),
+            ("revision", "string"),
+            ("revision_algorithm", "string"),
+            ("start_line", "integer"),
+            ("end_line", "integer"),
+            ("total_lines", "integer"),
+            ("truncated", "boolean"),
+        ],
+        "apply_patch" | "apply_changes" | "patch_check" => &[
+            ("dry_run", "boolean"),
+            ("affected_files", "array"),
+            ("workspace_changed", "boolean"),
+            ("already_applied", "boolean"),
+            ("summary", "string"),
+            ("files_created", "array"),
+            ("files_modified", "array"),
+            ("files_deleted", "array"),
+        ],
+        "exec_command" | "write_stdin" | "kill_session" => &[
+            ("session_id", "string"),
+            ("status", "string"),
+            ("stdout", "string"),
+            ("stderr", "string"),
+            ("operation_outcome", "string"),
+            ("transport_ok", "boolean"),
+            ("elapsed_ms", "integer"),
+            ("output_refs", "object"),
+        ],
+        "read_output" => &[
+            ("output_ref", "string"),
+            ("content", "string"),
+            ("offset", "integer"),
+            ("total_stream_bytes", "integer"),
+            ("has_more", "boolean"),
+        ],
+        "list_dir" => &[
+            ("path", "string"),
+            ("entries", "array"),
+            ("truncated", "boolean"),
+        ],
+        "list_files" => &[("files", "array"), ("truncated", "boolean")],
+        "search_text" | "grep_text" => &[
+            ("matches", "array"),
+            ("total_matches", "integer"),
+            ("truncated", "boolean"),
+        ],
+        "git_diff" => &[
+            ("diff", "string"),
+            ("files", "array"),
+            ("truncated", "boolean"),
+        ],
+        "git_status" => &[
+            ("entries", "array"),
+            ("clean", "boolean"),
+            ("branch", "string"),
+        ],
+        "git_log" => &[("commits", "array"), ("is_repo", "boolean")],
+        "git_show" => &[("diff", "string"), ("content", "string")],
+        "git_blame" => &[("lines", "array")],
+        "server_info" => &[
+            ("server", "string"),
+            ("version", "string"),
+            ("workspace", "string"),
+            ("tools", "array"),
+            ("tool_count", "integer"),
+            ("reliability", "object"),
+        ],
+        "get_default_cwd" | "set_default_cwd" => &[
+            ("default_cwd", "string"),
+            ("resolved_cwd", "string"),
+            ("workspace", "string"),
+        ],
+        "view_image" => &[
+            ("mime_type", "string"),
+            ("base64", "string"),
+            ("width", "integer"),
+            ("height", "integer"),
+        ],
+        "request_permissions" => &[("status", "string"), ("constraints", "object")],
+        "check_exec_environment" | "exec_health_check" => {
+            &[("workspace", "string"), ("filesystem_sandbox", "object")]
+        }
+        "history_session_bootstrap" | "history_session_checkpoint" => &[
+            ("session_key", "string"),
+            ("current_path", "string"),
+            ("path", "string"),
+            ("status", "string"),
+        ],
+        "history_session_validate" => &[("status", "string"), ("valid", "boolean")],
+        "history_session_search" => &[("matches", "array"), ("truncated", "boolean")],
+        "history_session_read" => &[
+            ("content", "string"),
+            ("path", "string"),
+            ("content_hash", "string"),
+            ("has_more", "boolean"),
+        ],
+        _ => &[
+            ("status", "string"),
+            ("summary", "string"),
+            ("next_actions", "array"),
+        ],
+    };
+    for (field, kind) in fields {
+        properties.insert((*field).into(), json!({"type":kind}));
+    }
+    json!({"type":"object","properties":properties,"required":["ok"],"additionalProperties":true})
+}
+
+pub fn list_tools_for_context(ctx: &super::context::ToolContext) -> Vec<Value> {
+    list_tools_for_profile(&ctx.tool_profile)
+        .into_iter()
+        .filter(|tool| tool["name"] != "request_permissions" || ctx.policy.skip_permission_gates())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -931,7 +1066,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 27);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
