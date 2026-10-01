@@ -242,21 +242,22 @@ mod tests {
     #[test]
     fn journal_is_bounded_exclusive_and_recovers_partial_final_records() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = ToolEventJournal::open(dir.path(), 512).unwrap();
-        assert!(ToolEventJournal::open(dir.path(), 512).is_err());
+        let journal_dir = dir.path().join("journal");
+        let journal = ToolEventJournal::open(&journal_dir, 512).unwrap();
+        assert!(ToolEventJournal::open(&journal_dir, 512).is_err());
         for i in 0..30 {
             journal.record(&json!({"event":"tool_finished","index":i}));
         }
         assert!(journal.enabled());
-        for entry in fs::read_dir(dir.path()).unwrap().flatten() {
+        for entry in fs::read_dir(&journal_dir).unwrap().flatten() {
             assert!(entry.metadata().unwrap().len() <= 512);
         }
         drop(journal);
-        let path = dir.path().join("events.jsonl");
+        let path = journal_dir.join("events.jsonl");
         let mut file = open_private(&path).unwrap();
         file.write_all(b"partial").unwrap();
         drop(file);
-        let journal = ToolEventJournal::open(dir.path(), 512).unwrap();
+        let journal = ToolEventJournal::open(&journal_dir, 512).unwrap();
         journal.record(&json!({"event":"tool_started"}));
         let text = fs::read_to_string(path).unwrap();
         assert!(text.contains("partial\n{") || !text.contains("partial"));
